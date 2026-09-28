@@ -16,6 +16,24 @@ function apiError(e: any, fb = 'Request failed') {
   return (e?.message as string) || fb
 }
 
+/* Read a JSON value out of localStorage without ever throwing. A raw
+ * `JSON.parse(localStorage.getItem(x) || '{}')` in a render body blows up on one
+ * truncated or hand-edited value, and a throw during render is what produces
+ * the "blank white screen, nothing clickable" report. A bad value is dropped so
+ * it cannot keep breaking the next load. */
+function safeStorageJSON<T>(key: string, fallback: T): T {
+  let raw: string | null = null
+  try { raw = localStorage.getItem(key) } catch { return fallback }
+  if (!raw) return fallback
+  try {
+    const parsed = JSON.parse(raw)
+    return (parsed ?? fallback) as T
+  } catch {
+    try { localStorage.removeItem(key) } catch { /* private mode */ }
+    return fallback
+  }
+}
+
 
 /* UPI deep-link: encodes the shop's UPI ID so scanning the QR opens the
    student's UPI app with the amount filled in. Amount is left to the payer
@@ -85,7 +103,7 @@ function PortalHome() {
   const navigate = useNavigate()
   const { install, canInstall, installed } = usePwaInstall()
   const [loggedIn, setLoggedIn] = useState(false)
-  const vendor = JSON.parse(localStorage.getItem('vendor_user') || '{}')
+  const vendor = safeStorageJSON<Record<string, any>>('vendor_user', {})
 
   useEffect(() => {
     setLoggedIn(!!localStorage.getItem('vendor_token'))
@@ -640,7 +658,7 @@ function VendorMobileApp() {
   const [showDuesQr, setShowDuesQr] = useState(false)
   const [payingDues, setPayingDues] = useState(false)
   const [showAgentGuide, setShowAgentGuide] = useState(false)
-  const vendor = JSON.parse(localStorage.getItem('vendor_user') || '{}')
+  const vendor = safeStorageJSON<Record<string, any>>('vendor_user', {})
 
   /* ─── Instant-first load: last-known dashboard is cached on-device so the
      app paints orders/shop immediately on open instead of a blank "Loading

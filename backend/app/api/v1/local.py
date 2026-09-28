@@ -3,7 +3,7 @@ API routes backed by Supabase Postgres (the only database).
 """
 from fastapi import APIRouter, HTTPException, Depends, Header, Request
 from pydantic import BaseModel, EmailStr, Field, field_validator
-from datetime import datetime
+from datetime import datetime, timezone
 import asyncio
 import re
 import secrets
@@ -52,6 +52,42 @@ MAX_LINE_QUANTITY = 99
 # the point where a new payment proof means anything. Admins may bypass this
 # (the admin tools annotate any order).
 _AWAITING_PAYMENT_STATUSES = ("Pending", "Pending Payment", "Pending Acceptance")
+
+# How recent an UNPAID UPI order must be to be settled by a bank credit that
+# carries no matching UTR claim (tier 2 of ``/sms/match`` — see
+# ``_sms_match_core``). A lunch-rush payment lands within a couple of minutes;
+# anything older is a stale row that a same-amount credit could otherwise pick
+# up, so it is forced into manual review instead.
+BANK_MATCH_WINDOW_MINUTES = 90
+
+# Orders whose status can be settled by verified bank evidence. Anything outside
+# this set is already terminal (Delivered / Cancelled / Completed …) and must
+# never be moved by a replayed or mis-routed credit SMS.
+BANK_SETTLEABLE_STATUSES = ("Pending Payment", "Pending", "Pending Acceptance")
+
+
+def _order_age_minutes(order: dict) -> float | None:
+    """Minutes since ``order['created_at']``; ``None`` when it can't be read.
+
+    SQLite stores IST wall-clock ("2026-09-17 10:00:00") while Supabase stores
+    UTC ISO-8601, so both shapes are normalised here — the same two formats the
+    portal's ``toDate`` understands. An unparseable timestamp is deliberately
+    reported as ``None`` so the caller refuses to guess and sends the credit to
+    manual review.
+    """
+    raw = str((order or {}).get("created_at") or "").strip()
+    if not raw:
+        return None
+    iso = raw
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", raw):
+        iso = raw.replace(" ", "T") + "+05:30"
+    try:
+        placed = datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    if placed.tzinfo is None:
+        placed = placed.replace(tzinfo=KOLKATA_TZ)
+    return (datetime.now(timezone.utc) - placed).total_seconds() / 60
 
 # Payment verification is UTR-ONLY: the student pastes the UPI transaction
 # reference (a string stored in the database) and the shop's bank credit SMS
@@ -990,6 +1026,49 @@ async def order(order_id: str, current_user: dict = Depends(get_current_local_us
     return result
 
 
+@router.get("/orders/{order_id}/payment")
+async def order_payment_status(order_id: str, current_user: dict = Depends(get_current_local_user)):
+    """Everything the student's payment portal needs about one order's payment.
+
+    The portal polls this while a payment is in flight so the page can switch
+    from "waiting for the bank" to "payment verified ✓" the moment the phone
+    bot confirms the credit — no page reload and no guessing from the order
+    status alone. The UTR itself is never returned (it is a bank reference, not
+    the student's to re-read); only whether one is on file.
+
+    Ownership is enforced exactly like ``GET /orders/{order_id}``: a valid token
+    is required and only the owning student (or an admin) may read it.
+    """
+    result = await _db(db.get_order, order_id)
+    is_parent = False
+    if not result:
+        result = await _db(db.get_parent_order, order_id)
+        is_parent = bool(result)
+    if not result:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if current_user.get("role") != "admin" and not _same_student(current_user, result):
+        raise HTTPException(status_code=403, detail="You can only view your own orders")
+
+    payment = None
+    try:
+        payment = await _db(db.get_payment_by_order_id, order_id)
+    except Exception as e:
+        logger.warning(f"payment status lookup failed for {order_id}: {e}")
+
+    return {
+        "order_id": order_id,
+        "order_status": result.get("status"),
+        "payment_method": result.get("payment_method"),
+        "amount": result.get("total"),
+        "is_parent": is_parent,
+        "payment_status": (payment or {}).get("status"),
+        "payment_method_recorded": (payment or {}).get("method"),
+        # A UTR is stored as proof for the admin/bot, but it is never echoed
+        # back — only the fact that one is on file.
+        "utr_saved": bool(str((payment or {}).get("utr_number") or "").strip()),
+    }
+
+
 @router.post("/orders")
 async def add_order(data: LocalOrderCreate, current_user: dict = Depends(get_current_local_user)):
     payload = data.model_dump()
@@ -1550,24 +1629,57 @@ async def sms_match(data: LocalSmsMatch, request: Request, x_agent_key: Optional
     and amount **on-device** and sends only the minimal proof here — the raw
     bank SMS text never leaves the phone.
 
-    Requires one saved UTR claim at the shop identified by ``phone``, with
-    both order and payment amounts equal to ``amount``. Marks it
-    **Completed** (paid and settled), and fires the shopkeeper's WhatsApp
-    notification.
+    This is the website↔bot join: an order placed in the student portal is
+    settled here the moment the shop's bank credits the money, and the result
+    is reflected in both the student and the admin portal (see
+    ``_sms_match_core`` for the two matching tiers and the fail-closed rules).
     """
     # Agent auth: fail closed. Only the Android agent (which holds the shared
     # key) may submit bank SMS — an unset key must NOT mean "everyone is the
     # agent", because this endpoint can mark an order paid.
     _require_agent_key(x_agent_key, request)
+    # Bound how many orders ONE agent key may settle in an hour. The shared key
+    # lives in a phone's SharedPreferences and is pasted into every shop's
+    # device, so a leaked copy would otherwise be an unlimited "mark any order
+    # paid" primitive. A real shop never settles 60 orders an hour, and the
+    # budget is per shop, so a busy campus does not lock itself out.
+    if not rate_allow(
+        "bank_match", str(data.phone or "")[-10:], max_attempts=60, window_sec=3600
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many payment matches from this shop — please try again in a little while.",
+        )
     return await _sms_match_core(data)
 
 
 async def _sms_match_core(data: LocalSmsMatch) -> dict:
     """Shared matching logic behind ``/sms/match``.
 
-    Only the agent-authenticated route calls this now — the portal-side UTR
-    confirmation path (``_confirm_order_via_utr``, with its SMS + same-amount
-    verification) was removed from the student payment flow.
+    This is the bridge between the website and the phone bot: an order is
+    created on the portal, the student pays the UPI QR, the shop's bank credits
+    the money, the Android agent forwards the credit — and the order flips to
+    **Completed** here so the student and admin portals both see it paid.
+
+    It matches in two tiers, strongest evidence first, and fails closed
+    whenever the evidence is ambiguous:
+
+    **Tier 1 — the UTR claim.** Exactly one payment row carries this UTR, it
+    belongs to an order at *this* shop, and both the order total and the
+    payment amount equal the credited amount. Strongest proof: the student told
+    us the reference and the bank confirmed the same reference.
+
+    **Tier 2 — the credit itself.** No UTR was claimed (the checkout QR flow
+    never asks the student to type one, so most orders land here). The credit
+    is matched against this shop's *unpaid* UPI orders by amount, and accepted
+    only when exactly ONE such order exists, it is recent
+    (``BANK_MATCH_WINDOW_MINUTES``) and its payment row is still open. The bank
+    UTR is then stamped onto that row, so the same credit can never settle a
+    second order.
+
+    Anything else — no match, two possible orders, a COD order, another shop,
+    an already-settled payment, a stale order — is refused with 409 and left
+    for the admin. Amount alone never picks a customer out of a crowd.
     """
     utr = (data.utr or "").strip().upper()
     if not utr:
@@ -1583,19 +1695,97 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
             raise HTTPException(status_code=404, detail="No shop found matching this phone number")
 
         orders = await _db(db.list_orders_by_shop, shop["id"])
-        # Amount alone is not an identity: require exactly one saved UTR claim.
-        payments = await _db(db.list_payments)
-        claims = [p for p in payments if str(p.get("utr_number") or "").strip().upper() == utr]
-        if len(claims) != 1:
-            raise HTTPException(status_code=409, detail="Payment needs review: no unique saved UTR match")
-        payment = claims[0]
-        order = next((o for o in orders if o["id"] == payment.get("order_id")), None)
-        if (not order or order.get("status") != "Pending Payment"
-                or str(order.get("payment_method") or "").upper() not in ("UPI", "MANUAL UTR")
-                or payment.get("status") == "Success"
-                or abs(float(order.get("total") or 0) - amount) >= 0.01
-                or abs(float(payment.get("amount") or 0) - amount) >= 0.01):
-            raise HTTPException(status_code=409, detail="Payment proof does not match this shop's pending UPI order")
+        payments = await _db(db.list_payments) or []
+        # One pass builds the order→payment index tier 2 needs, so a same-amount
+        # credit never costs N extra round-trips to the database.
+        #
+        # BUG FIX: ``list_payments()`` returns rows NEWEST-FIRST (both stores
+        # order by created_at DESC / rowid DESC). A plain dict comprehension lets
+        # the LAST assignment win, which silently kept the OLDEST payment row for
+        # an order — disagreeing with ``get_payment_by_order_id``, which takes the
+        # newest. An order carrying two payment rows (a retried checkout, or one
+        # that was cancelled and re-recorded) was therefore judged on a dead
+        # payment intent: a stale "Cancelled" row made the bot refuse a
+        # legitimate payment, and a stale "Pending" row could let it settle one
+        # that was already closed. ``setdefault`` keeps the FIRST row seen — the
+        # newest — matching the rest of the codebase.
+        payment_by_order: dict[str, dict] = {}
+        for p in payments:
+            row_order_id = str(p.get("order_id") or "")
+            if row_order_id:
+                payment_by_order.setdefault(row_order_id, p)
+        claims = [
+            p for p in payments
+            if str(p.get("utr_number") or "").strip().upper() == utr
+        ]
+
+        payment = None
+        order = None
+        if len(claims) == 1:
+            # ── Tier 1: a student-claimed UTR ──
+            payment = claims[0]
+            order = next((o for o in orders if o["id"] == payment.get("order_id")), None)
+            if payment.get("status") == "Success":
+                raise HTTPException(
+                    status_code=409,
+                    detail="This payment is already settled — nothing left to verify.",
+                )
+            if (not order or order.get("status") != "Pending Payment"
+                    or str(order.get("payment_method") or "").upper() not in ("UPI", "MANUAL UTR")
+                    or abs(float(order.get("total") or 0) - amount) >= 0.01
+                    or abs(float(payment.get("amount") or 0) - amount) >= 0.01):
+                raise HTTPException(status_code=409, detail="Payment proof does not match this shop's pending UPI order")
+        elif len(claims) > 1:
+            # The same reference was claimed on more than one order — exactly the
+            # "which customer paid?" case we must never guess at.
+            raise HTTPException(
+                status_code=409,
+                detail="Payment needs review: this UTR is claimed on more than one order",
+            )
+        else:
+            # ── Tier 2: match the credit against this shop's open UPI orders ──
+            candidates = []
+            for candidate in orders:
+                if str(candidate.get("status") or "") not in BANK_SETTLEABLE_STATUSES:
+                    continue
+                if str(candidate.get("payment_method") or "").upper() not in ("UPI", "MANUAL UTR"):
+                    continue
+                if abs(float(candidate.get("total") or 0) - amount) >= 0.01:
+                    continue
+                row = payment_by_order.get(str(candidate.get("id") or ""))
+                # The order must actually have been presented for payment…
+                if not row:
+                    continue
+                # …and that payment must still be open (a settled or dead
+                # payment means the order is already handled or cancelled).
+                if str(row.get("status") or "") in ("Success", "Cancelled", "Failed", "Rejected"):
+                    continue
+                if abs(float(row.get("amount") or 0) - amount) >= 0.01:
+                    continue
+                # Only a *recent* order may be settled this way, so a stale
+                # same-amount row can't be picked up by today's credit.
+                age = _order_age_minutes(candidate)
+                if age is None or age > BANK_MATCH_WINDOW_MINUTES or age < -5:
+                    continue
+                candidates.append((candidate, row))
+
+            if not candidates:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Payment needs review: no unpaid order at this shop matches the credited amount",
+                )
+            if len(candidates) > 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Payment needs review: more than one unpaid order matches this credit — settle it manually",
+                )
+            order, payment = candidates[0]
+            # Burn the credit: stamp the bank UTR on this row so the very same
+            # SMS can never settle a second order (both databases enforce a
+            # unique index on payments.utr_number, so a re-match 409s above).
+            stamped = await _db(db.set_payment_utr, order["id"], utr)
+            if stamped:
+                payment = stamped
 
         await _db(db.update_payment_status, payment["id"], "Success")
 
@@ -1654,6 +1844,9 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
             "shop": shop.get("id"),
             "order_id": order["id"],
             "order_status": "Completed",
+            # Which tier settled it — shown in the agent log so a shopkeeper can
+            # see whether the student typed the UTR or the credit was matched.
+            "matched_by": "utr_claim" if len(claims) == 1 else "bank_credit",
         }
 
     except HTTPException:

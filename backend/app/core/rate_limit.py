@@ -16,6 +16,8 @@ import time
 from collections import defaultdict
 from typing import Pattern  # noqa: F401  (kept for type readability)
 
+from app.core.config import settings
+
 _lock = threading.Lock()
 _hits: dict[str, list[float]] = defaultdict(list)
 
@@ -52,23 +54,35 @@ def reset(purpose: str, ident: str) -> None:
 def client_ip(request) -> str:
     """The client address to bucket a rate limit by.
 
-    PENTEST FIX: this used to take the FIRST ``x-forwarded-for`` entry. That
-    header is supplied by the caller, so rotating it minted a fresh bucket per
-    request and bypassed *every* limit in the app - proven live: 10 login
-    attempts with a different spoofed XFF each produced zero 429s, leaving the
-    admin-login lockout, the agent-key throttle and the registration cap all
-    decorative.
+    PENTEST FIX (1st pass): this used to take the FIRST ``x-forwarded-for``
+    entry. That header is supplied by the caller, so rotating it minted a fresh
+    bucket per request and bypassed *every* limit in the app - proven live: 10
+    login attempts with a different spoofed XFF each produced zero 429s.
 
-    Behind Render the edge *appends* the real client address, so the LAST entry
-    is the one we can trust; anything to its left is attacker-supplied and must
-    not decide the bucket. When the header is absent (running directly, no
-    proxy) or unusable, fall back to the socket peer - which buckets everyone
-    together rather than trusting a caller-controlled string.
+    PENTEST FIX (2nd pass — this one): moving to the LAST entry is not enough on
+    its own. A header with a SINGLE value carries no proxy-appended hop, so
+    ``entries[-1]`` is still whatever the attacker typed. Rotating
+    ``X-Forwarded-For: 1.2.3.4`` per request produced zero 429s across 70 live
+    attempts, leaving the login lockout and the agent-key throttle decorative.
+
+    The rule now: trust the forwarded header only when it carries MORE THAN ONE
+    hop — i.e. a proxy appended the real address to a client-supplied chain,
+    which is exactly what the Vercel and Render edges do — and take the last of
+    those. A lone or malformed header falls back to the socket peer, which the
+    caller cannot set. Set ``TRUST_PROXY_HEADERS=true`` ONLY when a single-hop
+    header is written by your own trusted proxy.
     """
     peer = request.client.host if request.client else ""
 
-    entries = (request.headers.get("x-forwarded-for") or "").split(",")
-    candidate = entries[-1].strip() if entries else ""
+    raw = (request.headers.get("x-forwarded-for") or "").strip()
+    entries = [e.strip() for e in raw.split(",") if e.strip()]
+
+    if settings.TRUST_PROXY_HEADERS:
+        candidate = entries[-1] if entries else ""   # operator override
+    elif len(entries) > 1:
+        candidate = entries[-1]                     # proxy-appended chain
+    else:
+        candidate = ""                               # caller-written: ignore
 
     if candidate and len(candidate) <= _MAX_IP_LEN and _IP_LIKE.match(candidate):
         return candidate

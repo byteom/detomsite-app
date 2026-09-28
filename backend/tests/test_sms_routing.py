@@ -41,6 +41,7 @@ async def test_saved_utr_selects_older_order_not_newest_amount(matching):
     # (which only exists to slow brute-force over the network).
     result = await local.sms_match(local.LocalSmsMatch(phone="9876543210", utr="123456789012", amount=80), None, x_agent_key="test-key")
     assert result["order_id"] == "older"
+    assert result["matched_by"] == "utr_claim"
     assert local._notify_shop_via_whatsapp.await_args.args[0]["id"] == "older"
 
 
@@ -71,3 +72,19 @@ def test_non_credit_or_unlabelled_reference_is_not_proof(text):
 def test_balance_is_not_payment_amount():
     assert local._extract_amount("Avl bal Rs 5000. Credited Rs 80 UTR:123456789012") == 80
     assert local._extract_amount("Credit received. Available balance Rs 5000") is None
+
+
+def test_order_age_reads_both_timestamp_shapes():
+    """Supabase stores UTC ISO, SQLite stores IST wall-clock. Tier 2 refuses any
+    row whose age it cannot read, so BOTH shapes must parse — and an unreadable
+    one must be reported as unknown rather than silently treated as "recent"."""
+    from datetime import datetime, timedelta, timezone
+    from app.api.v1.local import _order_age_minutes
+
+    now = datetime.now(timezone.utc)
+    fresh_utc = (now - timedelta(minutes=5)).isoformat()
+    fresh_ist = (now - timedelta(minutes=5)).astimezone(timezone(timedelta(hours=5, minutes=30)))
+    assert _order_age_minutes({"created_at": fresh_utc}) < 10
+    assert _order_age_minutes({"created_at": fresh_ist.strftime("%Y-%m-%d %H:%M:%S")}) < 10
+    assert _order_age_minutes({"created_at": "not-a-date"}) is None
+    assert _order_age_minutes({}) is None

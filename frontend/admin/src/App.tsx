@@ -14,6 +14,24 @@ function apiError(e: any, fb = 'Request failed') {
   return (e?.message as string) || fb
 }
 
+/* Read a JSON value out of localStorage without ever throwing. A raw
+ * `JSON.parse(localStorage.getItem(x) || '{}')` in a render body blows up on one
+ * truncated or hand-edited value, and a throw during render is what produces
+ * the "blank white screen, nothing clickable" report. A bad value is dropped so
+ * it cannot keep breaking the next load. */
+function safeStorageJSON<T>(key: string, fallback: T): T {
+  let raw: string | null = null
+  try { raw = localStorage.getItem(key) } catch { return fallback }
+  if (!raw) return fallback
+  try {
+    const parsed = JSON.parse(raw)
+    return (parsed ?? fallback) as T
+  } catch {
+    try { localStorage.removeItem(key) } catch { /* private mode */ }
+    return fallback
+  }
+}
+
 
 /* ─── Dark / light mode ───
    The admin portal is dark by default; a `light` class on <html> flips the
@@ -122,7 +140,7 @@ function Layout({ children }: { children: React.ReactNode }) {
   const [notifs, setNotifs] = useState<any[]>([])
   const [notifOpen, setNotifOpen] = useState(false)
   const notifRef = useRef<HTMLDivElement>(null)
-  const admin = JSON.parse(localStorage.getItem('admin_user') || '{}')
+  const admin = safeStorageJSON<Record<string, any>>('admin_user', {})
   const path = useLocation().pathname
   const logout = () => { localStorage.removeItem('admin_token'); localStorage.removeItem('admin_user'); window.location.href = '/login' }
 
@@ -961,15 +979,28 @@ function OrdersAdminPage() {
   const [fMethod, setFMethod] = useState('all')
   const [fSearch, setFSearch] = useState('')
   const [fDate, setFDate] = useState('')
-  /* Auto-refresh every 30s so new orders appear without a manual reload —
-     and only while the tab is visible (a backgrounded tab shouldn't keep
-     pulling the whole order list). */
+  /* Auto-refresh, and only while the tab is visible (a backgrounded tab
+     shouldn't keep pulling the whole order list).
+
+     The cadence adapts: while any UPI order is still awaiting payment the page
+     checks every 10 s, because that is exactly the window in which the shop's
+     phone bot flips an order to Completed and the admin needs to see it land.
+     Once nothing is pending it relaxes to 30 s, so an idle admin console is
+     not hammering the backend all day. */
+  const [pendingCount, setPendingCount] = useState(0)
   useEffect(() => {
-    const load = () => { if (document.visibilityState === 'visible') api.get('/admin/orders').then(r => setOrders(r.data || [])).finally(() => setLoading(false)) }
+    const load = () => {
+      if (document.visibilityState !== 'visible') return
+      api.get('/admin/orders').then(r => {
+        const list = r.data || []
+        setOrders(list)
+        setPendingCount(list.filter((o: any) => o.status === 'Pending Payment').length)
+      }).finally(() => setLoading(false))
+    }
     load()
-    const t = setInterval(load, 30000)
+    const t = setInterval(load, pendingCount > 0 ? 10000 : 30000)
     return () => clearInterval(t)
-  }, [])
+  }, [pendingCount])
   const statuses = ['Pending Acceptance', 'Pending Payment', 'Accepted', 'Completed', 'Cancelled']
   const filtered = orders.filter((o: any) => {
     if (fStatus !== 'all' && o.status !== fStatus) return false

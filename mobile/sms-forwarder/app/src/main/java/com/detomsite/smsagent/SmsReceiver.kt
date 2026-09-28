@@ -12,6 +12,7 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -62,8 +63,24 @@ class SmsReceiver : BroadcastReceiver() {
         val amount = extractAmount(text) ?: return
 
         Log.i(TAG, "On-device: UTR=$utr amount=$amount — sending proof only")
+
+        // ── Keep the process alive until the proof is actually sent ──
+        // A bare `CoroutineScope(...).launch {}` from onReceive is fire-and-forget:
+        // onReceive returns immediately, the system is then free to kill this
+        // process, and the HTTP POST dies with it. That is the single biggest
+        // reason the bot "sometimes just doesn't work" — the credit SMS arrives,
+        // the order still sits unpaid. goAsync() holds a BroadcastReceiver
+        // PendingResult open (Android allows ~10 s) until we call finish(), which
+        // covers the request comfortably.
+        val pending = goAsync()
         CoroutineScope(Dispatchers.IO).launch {
-            sendProof(context, baseUrl, agentKey, utr, amount)
+            try {
+                sendProof(context, baseUrl, agentKey, utr, amount)
+            } finally {
+                // Always release, or the broadcast stays "in progress" and the
+                // system eventually force-finishes the whole app.
+                try { pending.finish() } catch (e: Exception) { Log.d(TAG, "finish skipped: ${e.message}") }
+            }
         }
     }
 
@@ -154,19 +171,65 @@ class SmsReceiver : BroadcastReceiver() {
                 .header("Content-Type", "application/json")
                 .header("X-Agent-Key", agentKey)
                 .build()
+            // Timeouts are sized to fit the goAsync() budget (~10 s), so a hung
+            // network can never leave the broadcast pending until Android force-
+            // kills the process.
             val client = OkHttpClient.Builder()
-                .connectTimeout(10, TimeUnit.SECONDS)
-                .readTimeout(10, TimeUnit.SECONDS)
+                .connectTimeout(6, TimeUnit.SECONDS)
+                .readTimeout(6, TimeUnit.SECONDS)
                 .build()
             client.newCall(request).execute().use { resp ->
                 val code = resp.code
-                Log.i(TAG, "sms/match → $code: ${resp.body?.string()?.take(120)}")
-                if (code in 200..299) notifySent(context, "UTR $utr ✓")
-                else Log.w(TAG, "Match rejected ($code)")
+                val bodyText = resp.body?.string().orEmpty()
+                Log.i(TAG, "sms/match → $code: ${bodyText.take(120)}")
+                if (code in 200..299) {
+                    val matchedBy = runCatching { JSONObject(bodyText).optString("matched_by") }.getOrDefault("")
+                    val token = runCatching { JSONObject(bodyText).optString("order_id") }.getOrDefault("")
+                    notifySent(
+                        context,
+                        if (matchedBy == "utr_claim") "UTR $utr ✓ — order $token completed"
+                        else "₹${amount.toInt()} received ✓ — order $token completed"
+                    )
+                } else {
+                    // A rejection used to be written to logcat and nowhere else,
+                    // so the shopkeeper saw "the bot didn't work" with no clue
+                    // why. The server sends a plain-language reason, so show it.
+                    val reason = rejectionReason(bodyText)
+                    Log.w(TAG, "Match rejected ($code): $reason")
+                    // Retry ONCE, and only on a server-side error. A 5xx can be a
+                    // cold start or a blip; a 429 is a deliberate throttle and
+                    // retrying only burns more of the budget. The delay is sized
+                    // to finish inside the ~10 s goAsync() window — overrun it and
+                    // Android kills the process mid-retry, which is the very bug
+                    // this class is fixing.
+                    if (code in 500..599) {
+                        delay(1500)
+                        val retry = client.newCall(request.newBuilder().build()).execute()
+                        retry.use { r2 ->
+                            val retryBody = r2.body?.string().orEmpty()
+                            if (r2.code in 200..299) {
+                                val orderId = runCatching { JSONObject(retryBody).optString("order_id") }.getOrDefault("")
+                                notifySent(context, "UTR $utr ✓ — order $orderId completed")
+                            } else {
+                                notifyRejected(context, rejectionReason(retryBody))
+                            }
+                            return
+                        }
+                    }
+                    notifyRejected(context, reason)
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "sendProof failed: ${e.message}")
+            notifyRejected(context, "Could not reach DETOMSITE — check your internet connection.")
         }
+    }
+
+    /** Pull the server's human-readable reason out of an error body. */
+    private fun rejectionReason(body: String): String = try {
+        JSONObject(body).optString("detail").ifBlank { "the payment did not match an order" }
+    } catch (e: Exception) {
+        "the payment did not match an order"
     }
 
     private fun configuredPhone(context: Context, prefs: android.content.SharedPreferences): String {
@@ -185,6 +248,15 @@ class SmsReceiver : BroadcastReceiver() {
     }
 
     private fun notifySent(context: Context, preview: String) {
+        postNotification(context, "Payment proof sent ✓", preview)
+    }
+
+    /** A credit the bot could NOT settle — say so on the phone, not just in logcat. */
+    private fun notifyRejected(context: Context, reason: String) {
+        postNotification(context, "Payment needs review", reason)
+    }
+
+    private fun postNotification(context: Context, title: String, text: String) {
         try {
             val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -194,8 +266,9 @@ class SmsReceiver : BroadcastReceiver() {
             }
             val n = NotificationCompat.Builder(context, CHANNEL)
                 .setSmallIcon(android.R.drawable.stat_sys_download_done)
-                .setContentTitle("Payment proof sent ✓")
-                .setContentText(preview)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
                 .setAutoCancel(true)
                 .build()
             nm.notify(1, n)

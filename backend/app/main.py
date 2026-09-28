@@ -83,11 +83,18 @@ async def rate_limit_middleware(request: Request, call_next):
     if not any(path.endswith(p) for p in sensitive_prefixes):
         return await call_next(request)
 
-    # Trust the first x-forwarded-for hop (set by Vercel) so every student gets
-    # their OWN bucket; using request.client.host would lump the whole campus
-    # behind the proxy's IP into a single 10/min quota.
-    forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
-    client_ip = forwarded or (request.client.host if request.client else "unknown")
+    # PENTEST FIX: this used to trust the FIRST x-forwarded-for hop
+    # (``split(",")[0]``) — a value the caller chose — so rotating the header
+    # minted a fresh bucket per request and the whole limiter was decorative
+    # (proven live: 70 login attempts with a rotating XFF, zero 429s).
+    #
+    # It now delegates to ``app.core.rate_limit.client_ip`` so the app has ONE
+    # definition of "who is this client": the two limiters can never disagree,
+    # and the header is only honoured when a proxy actually appended to it.
+    # request.client.host alone would lump a whole campus behind one proxy IP.
+    from app.core.rate_limit import client_ip as resolve_client_ip
+
+    client_ip = resolve_client_ip(request)
     now = time.time()
     key = f"{client_ip}:{path}"
     # Prune old entries

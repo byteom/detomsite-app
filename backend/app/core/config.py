@@ -137,6 +137,11 @@ class Settings(BaseSettings):
     # ``/sms/incoming``; it must send ``X-Agent-Key: <SMS_FORWARD_KEY>`` so a
     # stranger can't feed fake "credits" and confirm orders they didn't pay.
     SMS_FORWARD_KEY: str = ""
+    # PENTEST: the app sits behind Vercel/Render, both of which APPEND the real
+    # client address to x-forwarded-for. A header with a single value was written
+    # by the caller and must never decide a rate-limit bucket. Set this to true
+    # ONLY if your own trusted proxy rewrites that header as a single hop.
+    TRUST_PROXY_HEADERS: bool = False
 
     # WhatsApp automatic delivery. When a provider is configured, shopkeeper
     # WhatsApp messages (e.g. the paid-verified notification) are SENT

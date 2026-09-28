@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "smoke": "vite build --ssr scripts/mount-entry.tsx --outDir .smoke --mode smoke && node -e \"require('fs').renameSync('.smoke/mount-entry.js','.smoke/mount.mjs')\" && node scripts/render-smoke.mjs",
+    "smoke:only": "node scripts/render-smoke.mjs"
   },
   "dependencies": {
     "axios": "^1.6.0",
