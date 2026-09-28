@@ -1418,11 +1418,20 @@ def create_order(values: dict[str, Any]) -> dict[str, Any] | None:
         if not _shop_is_orderable(dict(shop)):
             return None
 
+        # PENTEST FIX: a product must belong to the shop the order is placed
+        # with, and must still be orderable. The old lookup was by id alone, so a
+        # student could post shop A's id with shop B's product_id and the order
+        # was accepted — the bill, the kitchen and the per-shop payment scoping
+        # then all disagreed about who owes what. Sold-out items were equally
+        # orderable, so the "Available" toggle did nothing on the order path.
         product_ids = [item["product_id"] for item in values["items"]]
         products_by_id = {}
         for product_id in product_ids:
-            row = connection.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
-            if row:
+            row = connection.execute(
+                "SELECT * FROM products WHERE id = ? AND shop_id = ?",
+                (product_id, values["shop_id"]),
+            ).fetchone()
+            if row and dict(row).get("available", 1):
                 products_by_id[product_id] = dict(row)
 
         subtotal = 0
@@ -1571,10 +1580,14 @@ def create_parent_order(
             products_by_id = {}
             product_ids = [item["product_id"] for item in group.get("items", [])]
             for product_id in product_ids:
+                # PENTEST FIX: same shop-scoping + availability rule as
+                # create_order — a product from another shop (or a sold-out one)
+                # must never be priced into a sub-order.
                 row = connection.execute(
-                    "SELECT * FROM products WHERE id = ?", (product_id,)
+                    "SELECT * FROM products WHERE id = ? AND shop_id = ?",
+                    (product_id, group["shop_id"]),
                 ).fetchone()
-                if row:
+                if row and dict(row).get("available", 1):
                     products_by_id[product_id] = dict(row)
 
             subtotal = 0

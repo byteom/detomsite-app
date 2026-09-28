@@ -1417,6 +1417,26 @@ class LocalPaymentUtr(BaseModel):
     utr_number: str = Field(..., min_length=6, max_length=40)
 
 
+def _is_valid_utr(utr: str) -> bool:
+    """True only for a plausible ASCII UPI reference.
+
+    PENTEST FIX: the original check was ``utr.isalnum()``, which is Unicode-aware
+    and therefore accepts Cyrillic look-alikes ("АВСDЕF"), circled digits
+    ("①②③④⑤⑥") and precomposed accented letters. Each of those renders
+    identically to the ASCII reference a student actually paid with but compares
+    as a DIFFERENT string, so one real bank UTR could be filed twice under two
+    spellings — defeating the "one UTR = one payment" replay guard and letting
+    the same payment settle two orders.
+
+    A UPI UTR is plain ASCII (12 digits for the reference format), so the
+    character class is ASCII digits and ASCII letters only. Whitespace is
+    already stripped by the caller before upper-casing.
+    """
+    if not 6 <= len(utr) <= 40:
+        return False
+    return all(c in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" for c in utr)
+
+
 @router.post("/payments/utr")
 async def submit_payment_utr(data: LocalPaymentUtr, request: Request, current_user: dict = Depends(get_current_local_user)):
     """Optional: the student may paste the UPI transaction UTR after paying.
@@ -1437,8 +1457,15 @@ async def submit_payment_utr(data: LocalPaymentUtr, request: Request, current_us
     # PENTEST FIX: a UTR is an alphanumeric reference (UPI UTRs are 12 digits).
     # Reject anything else BEFORE touching the order so junk/symbol-laden input
     # never reaches a query, and the student gets a message they can act on.
+    #
+    # PENTEST FIX 2: ``str.isalnum()`` is Unicode-aware, so it happily accepts
+    # Cyrillic look-alikes ("АВСDЕF"), circled digits ("①②③") and precomposed
+    # accented letters. Those are visually identical to the ASCII UTR a student
+    # actually paid with, yet compare as a DIFFERENT string — so the same real
+    # bank reference could be filed twice under two spellings and defeat the
+    # "one UTR = one payment" replay guard. A UTR is ASCII, so require that.
     utr = (data.utr_number or "").strip().upper()
-    if not utr.isalnum() or not 6 <= len(utr) <= 40:
+    if not _is_valid_utr(utr):
         raise HTTPException(
             status_code=422,
             detail="That doesn't look like a UTR — it is usually a 12-digit number with no spaces or symbols.",
@@ -1684,6 +1711,12 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
     utr = (data.utr or "").strip().upper()
     if not utr:
         raise HTTPException(status_code=400, detail="UTR is required")
+    # PENTEST FIX: the bank agent must send a plain ASCII reference. Without this
+    # a Unicode look-alike UTR could reach the replay comparison below and match
+    # — or fail to match — a stored reference purely on look-alike characters,
+    # which is exactly the confusion the replay guard exists to prevent.
+    if not _is_valid_utr(utr):
+        raise HTTPException(status_code=422, detail="UTR is not a valid reference")
     amount = data.amount
     if amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be > 0")
@@ -1923,9 +1956,11 @@ async def add_payment(data: LocalPaymentCreate, request: Request, current_user: 
 
     # PENTEST FIX: same UTR hygiene as /payments/utr — a UTR is an alphanumeric
     # reference (UPI UTRs are 12 digits); reject junk BEFORE touching the order
-    # so symbol-laden input never reaches a query or a stored row.
+    # so symbol-laden input never reaches a query or a stored row. ASCII-only
+    # (see _is_valid_utr) so Unicode look-alikes cannot file one bank
+    # reference twice under two spellings.
     utr_claim = (data.utr_number or "").strip().upper()
-    if utr_claim and (not utr_claim.isalnum() or not 6 <= len(utr_claim) <= 40):
+    if utr_claim and not _is_valid_utr(utr_claim):
         raise HTTPException(
             status_code=422,
             detail="That doesn't look like a UTR — it is usually a 12-digit number with no spaces or symbols.",

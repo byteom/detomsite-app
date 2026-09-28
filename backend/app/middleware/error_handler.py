@@ -1,6 +1,8 @@
 """
 Error handling middleware
 """
+import json
+
 from fastapi import Request, status
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -11,26 +13,60 @@ import uuid
 logger = logging.getLogger(__name__)
 
 
+def _is_client_body_error(exc: BaseException) -> bool:
+    """True when an exception is the caller's fault (a malformed body).
+
+    Narrow on purpose: a blanket ``except ValueError -> 400`` would relabel real
+    server bugs as client errors and hide them from the 5xx dashboards.
+    """
+    if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)):
+        return True
+    if isinstance(exc, ValueError):
+        text = str(exc).lower()
+        return "out of range float" in text or "not json compliant" in text
+    return False
+
+
 class ErrorHandlingMiddleware(BaseHTTPMiddleware):
     """Middleware for error handling"""
-    
+
     async def dispatch(self, request: Request, call_next):
         """Process request and handle errors"""
         request_id = str(uuid.uuid4())
         request.state.request_id = request_id
-        
+
         try:
             response = await call_next(request)
             return response
         except Exception as e:
+            # PENTEST FIX: a body of {"x": NaN} or {"x": Infinity} is not valid
+            # JSON, but Python's json.loads accepts those bare literals as an
+            # extension, so the value flowed into the response. Re-serialising a
+            # non-finite float then raises "Out of range float values are not
+            # JSON compliant" from inside FastAPI's own 422 builder, which escaped
+            # as a 500. It is a malformed request, not a server fault, so answer
+            # 400 and keep genuinely unexpected errors as 500.
+            if _is_client_body_error(e):
+                logger.info(
+                    f"Malformed request body - Request ID: {request_id}, "
+                    f"Path: {request.url.path}, Error: {str(e)}"
+                )
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={
+                        "detail": "Request body is not valid JSON.",
+                        "request_id": request_id,
+                    },
+                )
+
             logger.error(
                 f"Unhandled error - Request ID: {request_id}, "
                 f"Path: {request.url.path}, Error: {str(e)}"
             )
-            
+
             # Don't expose internal errors in production
             error_message = str(e) if settings.DEBUG else "Internal Server Error"
-            
+
             return JSONResponse(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 content={

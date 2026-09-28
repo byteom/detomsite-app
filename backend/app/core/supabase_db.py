@@ -1022,9 +1022,16 @@ def _create_order_impl(values: dict[str, Any]) -> dict[str, Any] | None:
             product_ids = [item["product_id"] for item in values["items"]]
             products_by_id = {}
             for product_id in product_ids:
-                cursor.execute("SELECT * FROM products WHERE id = %s", (product_id,))
+                # PENTEST FIX: scope to this shop and require the item to still be
+                # orderable. Looking up by id alone let a student post shop A with
+                # shop B's product_id (bill, kitchen and per-shop payment scoping
+                # then disagreed), and let sold-out items be ordered at all.
+                cursor.execute(
+                    "SELECT * FROM products WHERE id = %s AND shop_id = %s",
+                    (product_id, values["shop_id"]),
+                )
                 row = cursor.fetchone()
-                if row:
+                if row and dict(row).get("available", 1):
                     products_by_id[product_id] = dict(row)
 
             subtotal = 0
@@ -2481,9 +2488,15 @@ def create_parent_order(
                 product_ids = [item["product_id"] for item in group.get("items", [])]
                 products_by_id: dict[str, Any] = {}
                 for pid in product_ids:
-                    cur.execute("SELECT * FROM products WHERE id = %s", (pid,))
+                    # PENTEST FIX: same shop-scoping + availability rule as
+                    # create_order — a product from another shop (or a sold-out
+                    # one) must never be priced into a sub-order.
+                    cur.execute(
+                        "SELECT * FROM products WHERE id = %s AND shop_id = %s",
+                        (pid, group["shop_id"]),
+                    )
                     prow = cursor_row(cur)
-                    if prow:
+                    if prow and prow.get("available", 1):
                         products_by_id[pid] = prow
 
                 subtotal = 0
