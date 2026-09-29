@@ -906,7 +906,14 @@ async def local_update_me(data: LocalProfileUpdate, current_user: dict = Depends
 
 
 @router.get("/summary")
-async def summary(_user: dict = Depends(get_current_local_user)):
+async def summary(_admin: dict = Depends(_require_admin)):
+    """Platform-wide business aggregates (shops, products, ACTIVE ORDERS, REVENUE).
+
+    PENTEST FIX: this was gated on ``get_current_local_user`` — ANY signed-in
+    account — so a student could read the platform's total revenue and live order
+    count. No portal calls it (it is an admin stat), and the sibling /dashboard
+    and /stats routes already use an admin gate, so this now does too.
+    """
     return await _cached_read(15, "summary", db.get_summary)
 
 
