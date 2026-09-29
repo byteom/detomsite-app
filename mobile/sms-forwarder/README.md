@@ -24,7 +24,8 @@ The whole payment-verification step becomes fully automatic.
 2. Install the APK on the **shopkeeper's phone** (the one registered on the
    shop's bank account — the number that receives the credit SMS).
 3. Open the app, fill in:
-   - **Backend API URL** — e.g. `https://your-api.onrender.com`
+   - **Backend API URL** — e.g. `https://detomsite-backend.vercel.app` (the
+     production backend; not a `*.onrender.com` host — that one is retired)
    - **Agent key** — the same value you set for `SMS_FORWARD_KEY` in the
      backend `.env`
    - **Shop phone** — optional; leave empty to auto-read from the SIM. Set it
@@ -42,9 +43,18 @@ Add to the backend `.env`:
 SMS_FORWARD_KEY=<your-secret-agent-key>
 ```
 
-This key must match what the app sends in the `X-Agent-Key` header. When the
-key is set, `/api/v1/local/sms/match` rejects submissions without it; when
-it is empty (dev/demo), the endpoint stays open for manual testing.
+This key must match what the app sends in the `X-Agent-Key` header. When the key
+is set, the agent routes (`/api/v1/local/sms/match`, `/sms/incoming`,
+`/whatsapp/pending`) reject submissions without it — a missing or wrong key gets
+`401 {"detail":"Invalid agent key"}`, the comparison is constant-time, and failed
+guesses are throttled per client IP (20 per 15 minutes, only mismatches count, so
+the real agent is never throttled).
+
+They **fail closed**: if `SMS_FORWARD_KEY` is unset the routes return
+`503 Bank-SMS ingest is not configured on this server` instead of accepting
+anonymous input, so the key must be set on the server for the phone app to work
+at all. The only exception is a local run with `DEBUG=True`, which stays
+permissive so developers and tests can drive the endpoints by hand.
 
 ## Bank SMS formats matched
 
