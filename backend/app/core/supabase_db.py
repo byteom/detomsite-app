@@ -2276,9 +2276,15 @@ def get_summary() -> dict[str, Any]:
             active_orders = row["active"] if row else 0
             revenue = row["revenue"] if row else 0
 
-            cur.execute("SELECT COUNT(*) FROM products")
+            # The alias is NOT cosmetic: psycopg2 reports an unaliased COUNT(*)
+            # under the column name "count", so reading row["COUNT(*)"] raised
+            # KeyError and the endpoint answered 500 (an admin-only route, and
+            # the pentest sweep asserts it answers an admin). The SQLite demo
+            # store used by the tests keeps the literal "COUNT(*)" name and reads
+            # it positionally, so only the production Supabase path could fail.
+            cur.execute("SELECT COUNT(*) AS n FROM products")
             row = cursor_row(cur)
-            product_count = row["COUNT(*)"] if row else 0
+            product_count = row["n"] if row else 0
 
         return {
             "shops": shop_count,
