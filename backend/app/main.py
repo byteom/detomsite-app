@@ -185,11 +185,23 @@ async def auto_delivery_loop():
 
 
 # Create FastAPI app instance
+#
+# PENTEST FIX: /docs, /redoc and /openapi.json were served to the public,
+# publishing the complete route map (133 KB of schema) to anyone who asked.
+# That is free reconnaissance — every endpoint, parameter and schema, with no
+# auth. They are now only mounted when DEBUG is on, so local development is
+# unchanged while production exposes no API surface documentation.
+#
+# Do NOT "fix" a cold start by re-enabling these unconditionally: an
+# unimportable app is a worse incident than a hidden schema.
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
     description="Enterprise Campus Food Ordering Platform",
     lifespan=lifespan,
+    docs_url="/docs" if settings.DEBUG else None,
+    redoc_url="/redoc" if settings.DEBUG else None,
+    openapi_url="/openapi.json" if settings.DEBUG else None,
 )
 
 # Configure CORS — the API is Bearer-token auth only (tokens travel in the
@@ -285,13 +297,19 @@ app.include_router(
 @app.get("/")
 async def root():
     """Root endpoint"""
-    return {
+    payload = {
         "message": f"Welcome to {settings.APP_NAME}",
         "version": settings.APP_VERSION,
-        "docs": "/docs",
-        "redoc": "/redoc",
-        "openapi": "/openapi.json"
     }
+    # Don't advertise docs that are not mounted — a pointer to a 404 is just
+    # noise, and naming the paths re-tells a scanner they used to exist.
+    if settings.DEBUG:
+        payload.update({
+            "docs": "/docs",
+            "redoc": "/redoc",
+            "openapi": "/openapi.json",
+        })
+    return payload
 
 
 @app.get("/health")
