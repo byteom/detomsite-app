@@ -1,21 +1,25 @@
 """
-Keep-alive ping for the Render free-tier backend.
+Keep-alive ping for the deployed backend.
 
-Render free web services go to sleep after 15 minutes without any inbound
-traffic, and wake up (cold start ~1 min) on the next request. A Render cron
-service runs this script every 5 minutes, which hits the /health endpoint —
-that counts as inbound traffic, so the backend stays well inside the 15-minute
-idle cutoff and feels always-on (no cold-start wait for students).
+The Render free tier slept after 15 minutes without inbound traffic and woke on
+the next request (cold start ~1 min). A cron service ran this script every 5
+minutes against /health, which counts as inbound traffic, so the backend stayed
+well inside the 15-minute idle cutoff and felt always-on (no cold-start wait for
+students).
 
-Set HEALTH_URL in the Render dashboard to your backend's real URL if it differs
-from the default below (e.g. https://your-app-name.onrender.com/health).
+The backend now runs on Vercel (https://detomsite-backend.vercel.app), which does
+not idle-sleep, so this is only needed if you move it back to a sleeping host.
+Pinging the live URL keeps /health warm and is harmless otherwise.
+
+Set HEALTH_URL in the scheduler's environment to your backend's real URL if it
+differs from the default below (e.g. https://your-app.vercel.app/health).
 """
 import os
 import time
 import urllib.request
 
 HEALTH_URL = (os.environ.get("HEALTH_URL") or "").strip()
-FALLBACK = "https://detomsite-backend.onrender.com/health"
+FALLBACK = "https://detomsite-backend.vercel.app/health"
 TIMEOUT = 25  # generous: allows for a cold-start wake (~1 min max, 3 attempts)
 RETRIES = 3
 
