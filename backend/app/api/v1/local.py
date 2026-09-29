@@ -1651,9 +1651,20 @@ class LocalSmsMatch(BaseModel):
     The raw bank SMS text never touches this server. The Android agent reads the
     SMS on the shopkeeper's phone, pulls out the UTR and credited amount locally,
     and sends only these two fields plus the receiving phone number.
+
+    ``utr`` is OPTIONAL. The QR checkout deliberately never asks the student to
+    type a reference — they scan and pay — so the agent has nothing to claim for
+    the majority of orders, and most bank credit SMS carry no reference either
+    ("Rs 80 credited to your a/c ending 1234"). Tier 2 below exists to settle
+    exactly those orders on amount + shop + recency. Requiring a UTR here made
+    that tier unreachable and silently dropped every QR payment, so the field is
+    now genuinely optional: empty means "no claim, match on the credit itself".
     """
     phone: str = Field(default="", max_length=30)
-    utr: str = Field(..., min_length=8, max_length=30, pattern=r"^[A-Za-z0-9]+$")
+    # Empty is allowed (QR / no-claim case). When present it must still look
+    # like a real reference — the ASCII check in _sms_match_core is the guard
+    # that stops a look-alike UTR from defeating the one-UTR-one-payment rule.
+    utr: str = Field(default="", max_length=30, pattern=r"^[A-Za-z0-9]*$")
     amount: float = Field(..., gt=0, allow_inf_nan=False)
 
 
@@ -1716,13 +1727,16 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
     for the admin. Amount alone never picks a customer out of a crowd.
     """
     utr = (data.utr or "").strip().upper()
-    if not utr:
-        raise HTTPException(status_code=400, detail="UTR is required")
+    # An empty UTR is now LEGAL and means "no claim" — the QR-checkout case the
+    # student pays by scanning, where there is no reference to claim. Tier 2
+    # below settles those on amount + shop + recency. Only a UTR that is present
+    # but malformed is refused.
+    #
     # PENTEST FIX: the bank agent must send a plain ASCII reference. Without this
     # a Unicode look-alike UTR could reach the replay comparison below and match
     # — or fail to match — a stored reference purely on look-alike characters,
     # which is exactly the confusion the replay guard exists to prevent.
-    if not _is_valid_utr(utr):
+    if utr and not _is_valid_utr(utr):
         raise HTTPException(status_code=422, detail="UTR is not a valid reference")
     amount = data.amount
     if amount <= 0:
@@ -1754,9 +1768,15 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
             row_order_id = str(p.get("order_id") or "")
             if row_order_id:
                 payment_by_order.setdefault(row_order_id, p)
+        # A claim only exists when the agent actually sent a reference. Without
+        # this guard an empty ``utr`` would equal the empty ``utr_number`` of
+        # every QR order (checkout records ``utr_number: ""``), so ``claims``
+        # would collect ALL of them and the first one would be settled as if the
+        # student had claimed it — settling an arbitrary customer's order. An
+        # absent reference must fall through to tier 2, never impersonate a claim.
         claims = [
             p for p in payments
-            if str(p.get("utr_number") or "").strip().upper() == utr
+            if utr and str(p.get("utr_number") or "").strip().upper() == utr
         ]
 
         payment = None
@@ -1820,10 +1840,18 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
                     detail="Payment needs review: more than one unpaid order matches this credit — settle it manually",
                 )
             order, payment = candidates[0]
-            # Burn the credit: stamp the bank UTR on this row so the very same
-            # SMS can never settle a second order (both databases enforce a
-            # unique index on payments.utr_number, so a re-match 409s above).
-            stamped = await _db(db.set_payment_utr, order["id"], utr)
+            # Burn the credit so the SAME SMS can never settle a second order.
+            #
+            # With a UTR this stamps it on the row, and the unique index on
+            # payments.utr_number makes a re-match 409. With NO UTR there is
+            # nothing to stamp, so uniqueness has to come from somewhere else:
+            # we mint a synthetic, obviously-fake marker recording THAT this
+            # amount was already consumed at this shop. A replayed credit SMS
+            # then finds the order already settled and stops at the tier-2
+            # status check, instead of paying out a second time. Without this a
+            # student could re-scan the same bank SMS and drain the queue.
+            burn_ref = utr or f"SMS-{shop['id']}-{order['id']}"
+            stamped = await _db(db.set_payment_utr, order["id"], burn_ref)
             if stamped:
                 payment = stamped
 
@@ -1834,10 +1862,14 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
         # confirmed it, so there is no prep/ready state left to walk through.
         await _db(db.update_order_status, order["id"], "Completed")
 
+        # The audit line and the notifications read "no reference" instead of an
+        # empty "UTR:" when the credit carried none, so the shopkeeper's log and
+        # the student's message don't look like a broken record.
+        proof_label = f"UTR {utr}" if utr else "QR payment (no reference)"
         await _log_sms_inbound(
             order["id"],
             data.phone,
-            f"UTR:{utr} Amt:{int(order.get('total', 0))} -> Completed (bank SMS match)",
+            f"{proof_label} Amt:{int(order.get('total', 0))} -> Completed (bank SMS match)",
             "Auto-Confirmed",
         )
 
@@ -1848,7 +1880,7 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
             await _db(
                 db.create_notification,
                 title="Payment verified — order confirmed",
-                message=f"UTR {utr} — ₹{order.get('total')} credit confirmed. Order #{order.get('token')} is complete.",
+                message=f"{proof_label} — ₹{order.get('total')} credit confirmed. Order #{order.get('token')} is complete.",
                 order_id=order["id"],
                 status="Completed",
                 target_role="student",
@@ -1856,7 +1888,7 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
             await _db(
                 db.create_notification,
                 title="Payment verified — order confirmed",
-                message=f"UTR {utr} — ₹{order.get('total')} credit confirmed. Order #{order.get('token')} is complete.",
+                message=f"{proof_label} — ₹{order.get('total')} credit confirmed. Order #{order.get('token')} is complete.",
                 order_id=order["id"],
                 status="Completed",
                 target_role="admin",
@@ -1864,8 +1896,8 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
         except Exception as e:
             logger.warning(f"sms/match notification error: {e}")
         _push_admin(
-            "Order paid & confirmed via bank UTR",
-            f"UTR {utr} — ₹{order.get('total')} credit confirmed. Token #{order.get('token')} completed.",
+            "Order paid & confirmed via bank UTR" if utr else "Order paid & confirmed via QR payment",
+            f"{proof_label} — ₹{order.get('total')} credit confirmed. Token #{order.get('token')} completed.",
             tag="order-confirm",
         )
 

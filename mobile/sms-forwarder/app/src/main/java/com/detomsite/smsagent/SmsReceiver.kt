@@ -59,10 +59,18 @@ class SmsReceiver : BroadcastReceiver() {
         if (!isBankCreditSms(text)) return
 
         // ── On-device extraction: UTR + amount stay local, raw text never leaves ──
-        val utr = extractUtr(text) ?: return
+        // The UTR is OPTIONAL. Most real bank credit SMS carry no reference at
+        // all ("Rs 80 credited to your a/c ending 1234"), and that is exactly
+        // the QR-checkout case: the student scans the QR and never types a UTR,
+        // so there is nothing to claim. The server's tier-2 match settles those
+        // orders on amount + shop + recency alone. Bailing out here (the old
+        // `?: return`) silently dropped every such credit, so the student paid
+        // and the order sat unpaid forever — "the bot sometimes just doesn't
+        // work". Send the amount even with no UTR and let the server decide.
+        val utr = extractUtr(text).orEmpty()
         val amount = extractAmount(text) ?: return
 
-        Log.i(TAG, "On-device: UTR=$utr amount=$amount — sending proof only")
+        Log.i(TAG, "On-device: UTR=${utr.ifEmpty { "<none>" }} amount=$amount — sending proof only")
 
         // ── Keep the process alive until the proof is actually sent ──
         // A bare `CoroutineScope(...).launch {}` from onReceive is fire-and-forget:
@@ -209,7 +217,14 @@ class SmsReceiver : BroadcastReceiver() {
                             val retryBody = r2.body?.string().orEmpty()
                             if (r2.code in 200..299) {
                                 val orderId = runCatching { JSONObject(retryBody).optString("order_id") }.getOrDefault("")
-                                notifySent(context, "UTR $utr ✓ — order $orderId completed")
+                                // Same wording rule as the first attempt: a credit
+                                // settled WITHOUT a UTR must not print "UTR " and
+                                // then nothing, which reads as a bug to the shopkeeper.
+                                notifySent(
+                                    context,
+                                    if (utr.isEmpty()) "₹${amount.toInt()} received ✓ — order $orderId completed"
+                                    else "UTR $utr ✓ — order $orderId completed"
+                                )
                             } else {
                                 notifyRejected(context, rejectionReason(retryBody))
                             }
