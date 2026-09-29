@@ -133,6 +133,21 @@ class Settings(BaseSettings):
     REDIS_BREAKER_FAILURES: int = 5
     REDIS_BREAKER_COOLDOWN_SECONDS: float = 30.0
 
+    # ─── Bounded waits (a slow dependency must never pin a request) ───
+    # Server-side cap on a single Postgres statement. Without it a query that
+    # blocks (pooler queue, a row lock, a wedged backend) can hold a pooled
+    # connection — and every request queued behind it — indefinitely: production
+    # endpoints were observed sitting on an accepted socket for minutes with
+    # nothing coming back. Postgres aborts the statement at this point, which
+    # frees the pool slot and turns a hang into an ordinary error.
+    DB_STATEMENT_TIMEOUT_MS: int = 20000
+    # Total budget for one shared-cache lookup (Redis, then the Postgres
+    # ``app_cache`` table) before the read is treated as a miss and falls
+    # through to the real loader. This enforces the rule this module already
+    # documents: a cache must never take the portal down, nor be slower than
+    # the query it exists to avoid.
+    CACHE_LOOKUP_TIMEOUT_SECONDS: float = 2.0
+
     # SMS-forwarder agent auth. The Android app posts bank credit SMS to
     # ``/sms/incoming``; it must send ``X-Agent-Key: <SMS_FORWARD_KEY>`` so a
     # stranger can't feed fake "credits" and confirm orders they didn't pay.

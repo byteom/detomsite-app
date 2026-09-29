@@ -71,6 +71,59 @@ def _connection_string() -> str:
 _pool: Any = None
 
 
+def _dsn_options(dsn: str) -> str:
+    """Best-effort read of an ``options=`` setting already in the DSN.
+
+    ``psycopg2.extensions.parse_dsn`` cannot be used here: it rejects a URI whose
+    ``options`` value itself contains ``=`` (which every ``-c foo=bar`` does), and
+    silently losing an operator's ``options`` — a custom ``search_path``, say —
+    would change how their queries run. So the query string is read directly, for
+    both the URI and the ``key=value`` DSN form.
+    """
+    if not dsn:
+        return ""
+    value = ""
+    if "://" in dsn:
+        from urllib.parse import parse_qsl, urlsplit
+
+        for key, val in parse_qsl(urlsplit(dsn).query):
+            if key == "options":
+                value = val
+    else:
+        # libpq's key=value form quotes a value that contains spaces, so split
+        # with quote handling rather than on bare whitespace.
+        import shlex
+
+        try:
+            tokens = shlex.split(dsn)
+        except ValueError:
+            tokens = dsn.split()
+        for token in tokens:
+            if token.startswith("options="):
+                value = token.split("=", 1)[1]
+    return value.strip()
+
+
+def _pool_connect_kwargs() -> dict:
+    """Connect-time kwargs that make a stalled Postgres fail fast.
+
+    ``connect_timeout`` is already in the DSN, but it is repeated here because a
+    caller-supplied DSN may omit it and libpq would otherwise block for minutes.
+    ``statement_timeout`` is the one that matters most: it is a *server-side*
+    cap, so a query that wedges (pooler queue, row lock, a backend that stops
+    responding) is aborted by Postgres itself instead of holding a pooled
+    connection — and every request queued behind it — forever.
+    """
+    kwargs: dict = {"connect_timeout": 10}
+    budget_ms = max(1000, int(getattr(settings, "DB_STATEMENT_TIMEOUT_MS", 20000)))
+    cap = f"-c statement_timeout={budget_ms}"
+    # Keep whatever the operator already set and add the cap, rather than
+    # dropping it.
+    existing = _dsn_options(_connection_string())
+    kwargs["options"] = f"{existing} {cap}".strip() if existing else cap
+    return kwargs
+
+
 def _get_pool() -> Any:
     """Lazily create the shared connection pool (thread-safe)."""
     global _pool
@@ -78,6 +131,7 @@ def _get_pool() -> Any:
         _pool = _pg_pool.ThreadedConnectionPool(
             1, 15, _connection_string(),
             cursor_factory=psycopg2.extras.RealDictCursor,
+            **_pool_connect_kwargs(),
         )
     return _pool
 
@@ -95,14 +149,21 @@ def _connect() -> Any:
 
 def _release(conn: Any, discard: bool = False) -> None:
     """Return a connection to the pool. If it broke (or ``discard=True``),
-    rebuild the pool so the next connections are healthy."""
+    close that one connection rather than tearing the pool down.
+
+    Rebuilding the whole pool on a single bad connection was a stampede: every
+    in-flight request then had to open a fresh TLS connection to Supabase, so
+    one dead socket turned a blip into tens of seconds of latency across the
+    instance. Dropping just the broken connection keeps the healthy ones warm;
+    the next checkout opens a replacement if the pool needs one.
+    """
     pool = _get_pool()
     if discard:
         try:
             conn.close()
         except Exception:
             pass
-        _rebuild_pool()
+        _putconn_discarding(pool, conn)
         return
     try:
         if getattr(conn, "closed", 1) == 0:
@@ -110,8 +171,24 @@ def _release(conn: Any, discard: bool = False) -> None:
             return
     except Exception:
         pass
-    # Connection is dead — rebuild the pool so new connections are healthy.
-    _rebuild_pool()
+    # Connection is dead — drop just this one so the rest of the pool survives.
+    _putconn_discarding(pool, conn)
+
+
+def _putconn_discarding(pool: Any, conn: Any) -> None:
+    """Hand a dead connection back so the pool forgets its slot.
+
+    ``putconn(close=True)`` is the pool's own supported way to do this. If the
+    pool itself has since been swapped out from under us, fall back to dropping
+    the reference so nothing leaks.
+    """
+    try:
+        pool.putconn(conn, close=True)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _rebuild_pool() -> None:
