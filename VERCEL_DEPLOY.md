@@ -114,7 +114,17 @@ Open `https://<shopkeeper>.vercel.app` on the phone → Chrome menu → **Instal
 ## Notes
 
 - Each portal has `vercel.json` SPA rewrites, so deep links like `/mobile` work.
-- Admin login: username `12`, password `8989` (from `DEFAULT_SUPER_ADMIN_*`).
+- Admin login is **derived from the backend's env**, so it is whatever you configured —
+  there are no universal defaults:
+  - username = `DEFAULT_SUPER_ADMIN_EMAIL` up to the `@`, lowercased
+    (`12@gmail.com` → `12`; `yokesksekar@gmail.com` → `yokesksekar`)
+  - password = `DEFAULT_SUPER_ADMIN_PASSWORD`
+  The account is seeded with `role='admin'` on backend boot (`ensure_admin_user`). It is
+  idempotent: if a user with that username already exists it is left untouched, so an
+  existing account's password wins over the env value. The env-only fallback path in
+  `POST /api/v1/admin/login` is **dev-only** (`DEBUG=True`) — in production the admin
+  must exist in the DB with `role='admin'`, otherwise login returns
+  `401 Invalid admin username or password`.
 - The Supabase schema (`backend/supabase/schema.sql`) is applied automatically at backend
   startup via idempotent migrations — no manual SQL needed.
 - **Never point anything at `*.onrender.com`** — that host is retired. The only backend
