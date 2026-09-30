@@ -323,6 +323,13 @@ class LocalOrderCreate(BaseModel):
     delivery_slot: str = Field(..., max_length=50)
     pending_payment: bool = False
     payment_method: str = "UPI"  # 'UPI' | 'COD' | 'Razorpay'
+    # Client-chosen idempotency key for this checkout attempt. The payment page
+    # retries this POST when the serverless host is slow, and a retry that
+    # forked a second order left two same-amount UNPAID orders at one shop —
+    # which tier-2 bank matching deliberately refuses to disambiguate, so the
+    # retry locked out a student who had already paid. Replaying the same ref
+    # returns the original order instead.
+    client_ref: str = Field(default="", max_length=64, pattern=r"^[A-Za-z0-9_-]{1,64}$")
 
     @field_validator("delivery_location")
     @classmethod
@@ -1196,6 +1203,32 @@ async def order_payment_status(order_id: str, current_user: dict = Depends(get_c
 async def add_order(data: LocalOrderCreate, current_user: dict = Depends(get_current_local_user)):
     payload = data.model_dump()
     payload["owner_user_id"] = str(current_user["id"])
+
+    # ── Idempotent checkout ──
+    # The payment page retries this POST when the serverless host is slow to
+    # answer. A retry used to INSERT a brand-new order, which left the shop with
+    # two UNPAID orders for the same amount — exactly the ambiguity tier-2 bank
+    # matching refuses to guess at, so a student who had already paid could
+    # still never unlock "Place Order". Replaying the same client_ref returns
+    # the order the first attempt created.
+    #
+    # Only orders still AWAITING PAYMENT are reused. If that original order was
+    # already paid (or cancelled) the ref is spent, and a fresh basket must get
+    # a fresh order rather than silently reopening settled money.
+    if payload.get("client_ref"):
+        try:
+            existing = await _db(
+                db.find_order_by_client_ref, payload["client_ref"], payload["owner_user_id"]
+            )
+        except Exception as e:
+            # A missing client_ref column must not block checkout — the
+            # auto-migration will add it, and the worst case is the old
+            # duplicate-order behaviour for this one request.
+            logger.warning(f"client_ref lookup failed: {e}")
+            existing = None
+        if existing and str(existing.get("status") or "") in _AWAITING_PAYMENT_STATUSES:
+            return existing
+
     # The student's mobile is always stored as E.164 (+91 + 10 digits) so the
     # shopkeeper/order views never see a bare 10-digit number.
     payload["student_phone"] = _normalize_phone(payload.get("student_phone", ""))
@@ -1533,13 +1566,19 @@ async def _notify_shop_via_whatsapp(order: dict, shop: dict, phone: str, paid: b
         auto = (paid is True) or str(order.get("payment_method") or order.get("pay_method") or "").upper() == "COD"
         row_id = None
 
-        # Dedupe: if a Pending notification already exists for this order,
-        # refresh its message (paid → "paid ✓") instead of stacking duplicates.
+        # Dedupe: this order must never produce a SECOND WhatsApp message. We
+        # match ANY existing row for the order — not just a "Pending" one —
+        # because a row that was already auto-sent is "Sent", and looking only
+        # for "Pending" meant the later paid-refresh created a fresh row and
+        # the shopkeeper got the same order twice. Refreshing the existing row
+        # keeps it to exactly one message, with the money status up to date.
         existing = await _db(db.list_whatsapp_logs, 200)
+        already_sent = False
         for row in existing or []:
             ref = str(row.get("sub_order_id") or row.get("order_id") or "")
-            if ref == str(order["id"]) and str(row.get("status") or "") == "Pending":
+            if ref == str(order["id"]):
                 row_id = row.get("id")
+                already_sent = str(row.get("status") or "") == "Sent"
                 if paid is True:
                     await _db(db.update_whatsapp_message, row["id"], message, url)
                 break
@@ -1555,8 +1594,10 @@ async def _notify_shop_via_whatsapp(order: dict, shop: dict, phone: str, paid: b
             )
             row_id = (created or {}).get("id") or row_id
 
-        # Automatic delivery when a gateway is configured.
-        if auto and row_id and whatsapp_service.provider_configured():
+        # Automatic delivery when a gateway is configured — but NEVER re-send to
+        # a row that already went out. A second send here is exactly the
+        # duplicate "bot message" the shopkeeper kept receiving for one order.
+        if auto and row_id and not already_sent and whatsapp_service.provider_configured():
             ok = await asyncio.to_thread(
                 whatsapp_service.send_whatsapp, phone, message, None, order["id"]
             )
@@ -1660,6 +1701,94 @@ def _is_valid_utr(utr: str) -> bool:
     if not 6 <= len(utr) <= 40:
         return False
     return all(c in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" for c in utr)
+
+
+class LocalPaymentClaimConfirm(BaseModel):
+    """Student-side "I have paid" confirmation for a QR checkout.
+
+    The automatic path is the shop's SMS agent matching the bank credit. When
+    that agent is not installed, misconfigured, or its SMS never arrives, the
+    student had no way forward at all: the button stayed locked on a payment
+    they had genuinely made. This gives them one — they type the UTR their UPI
+    app shows, which turns the unverifiable tier-2 amount match into an exact
+    tier-1 UTR claim.
+    """
+
+    utr_number: str = Field(..., max_length=40)
+
+
+@router.post("/orders/{order_id}/confirm-payment")
+async def confirm_own_payment(
+    order_id: str,
+    data: LocalPaymentClaimConfirm,
+    current_user: dict = Depends(get_current_local_user),
+):
+    """Attach the student's UTR to their own pending order and re-arm matching.
+
+    This does NOT mark the order paid — that still requires bank evidence
+    (``/sms/match``). What it does is give the matcher something exact to
+    match: once a UTR is on file, an incoming credit carrying that same
+    reference settles the order through tier 1 instead of the amount-only tier
+    2, so the student is no longer dependent on being the only person at that
+    shop with an open bill of the same value.
+    """
+    if not rate_allow(
+        "claim_payment", f"{current_user.get('id')}:{order_id}", max_attempts=10, window_sec=600
+    ):
+        raise HTTPException(
+            status_code=429, detail="Too many attempts — please wait a few minutes and try again."
+        )
+
+    order, _is_parent = await _resolve_owned_order(order_id, current_user)
+
+    utr = (data.utr_number or "").strip().upper()
+    if not _is_valid_utr(utr):
+        raise HTTPException(
+            status_code=422,
+            detail="That doesn't look like a UTR — it is usually a 12-digit number with no spaces or symbols.",
+        )
+
+    if str(order.get("payment_method") or "").upper() not in ("UPI", "MANUAL UTR"):
+        raise HTTPException(
+            status_code=400, detail="This is not a prepaid order — nothing to confirm."
+        )
+    if str(order.get("status") or "") not in _AWAITING_PAYMENT_STATUSES:
+        raise HTTPException(
+            status_code=409, detail="This order is no longer awaiting payment."
+        )
+
+    server_total = int(round(float(order.get("total") or 0)))
+
+    # One UTR = one payment. A reference already filed against a DIFFERENT
+    # order is refused, so a student cannot park the same UTR on two baskets.
+    existing = await _db(db.get_payment_by_utr, utr)
+    if existing and str(existing.get("order_id") or "") != str(order_id):
+        raise HTTPException(
+            status_code=409,
+            detail="This UTR is already saved on another order — please double-check the number.",
+        )
+
+    payment = await _db(db.set_payment_utr, order_id, utr)
+    if not payment:
+        payment = await _db(db.create_payment, order_id, server_total, "Manual UTR", utr)
+    if not payment:
+        raise HTTPException(
+            status_code=400, detail="Could not save the reference — please try again."
+        )
+
+    _push_admin(
+        "Payment reference submitted",
+        f"Order #{order.get('token')} — the student submitted UTR {utr} for ₹{server_total}.",
+        tag="payment-verify",
+    )
+    return {
+        "message": (
+            "Reference saved. Your order unlocks as soon as the shop's payment "
+            "confirmation reaches us — this usually takes a few seconds."
+        ),
+        "order_id": order_id,
+        "utr_saved": True,
+    }
 
 
 @router.post("/payments/utr")
@@ -2052,6 +2181,54 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
                     status_code=409,
                     detail="Payment needs review: no unpaid order at this shop matches the credited amount",
                 )
+            if len(candidates) > 1:
+                # Several same-amount orders can only be an ambiguity BETWEEN
+                # CUSTOMERS if they belong to different people — and that must
+                # still go to manual review, because amount alone can never pick
+                # out one customer's order from a crowd.
+                #
+                # But when every candidate belongs to the SAME account, picking
+                # the wrong one cannot hurt anyone else: it is one student's own
+                # duplicated draft for one basket, and settling any of them pays
+                # the student for exactly what they paid. This is the case the
+                # retried checkout POST used to create — a timed-out order
+                # request replayed into a second identical order, after which the
+                # bank credit matched NEITHER and the student, having paid, was
+                # locked out of "Place Order" forever. Collapse to the newest
+                # (the live one) and close the superseded duplicates.
+                owners = {str((c[0].get("owner_user_id") or "")).strip() for c in candidates}
+                if len(owners) == 1 and "" not in owners:
+                    # Newest wins. ``created_at`` alone is NOT enough: two drafts
+                    # replayed seconds apart share the same timestamp string, so
+                    # the sort was a no-op and the tie was broken by whatever
+                    # order the shop query happened to return — which settled
+                    # the STALE draft and left the live one pending. The daily
+                    # token is monotonic, so it is the reliable tiebreak.
+                    def _age_key(pair):
+                        row = pair[0]
+                        try:
+                            token = int(row.get("token") or 0)
+                        except (TypeError, ValueError):
+                            token = 0
+                        return (str(row.get("created_at") or ""), token)
+
+                    candidates.sort(key=_age_key)
+                    keeper, keeper_row = candidates[-1]
+                    for stale, stale_row in candidates[:-1]:
+                        # Mark the superseded draft dead so it can never be
+                        # picked up by a LATER credit at this shop either.
+                        try:
+                            if str(stale_row.get("status") or "") not in ("Success", "Cancelled", "Failed", "Rejected"):
+                                await _db(db.update_payment_status, stale_row["id"], "Cancelled")
+                            if str(stale.get("status") or "") in BANK_SETTLEABLE_STATUSES:
+                                await _db(db.update_order_status, stale["id"], "Cancelled")
+                        except Exception as e:
+                            logger.warning(f"Could not close superseded draft {stale.get('id')}: {e}")
+                    logger.info(
+                        f"sms/match: collapsed {len(candidates)} same-owner drafts at shop "
+                        f"{shop.get('id')} to the live order {keeper.get('id')}"
+                    )
+                    candidates = [(keeper, keeper_row)]
             if len(candidates) > 1:
                 raise HTTPException(
                     status_code=409,

@@ -446,6 +446,7 @@ def init_local_demo_db() -> None:
                 delivery_slot TEXT NOT NULL,
                 status TEXT NOT NULL,
                 payment_method TEXT NOT NULL DEFAULT 'UPI',
+                client_ref TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (shop_id) REFERENCES shops(id)
             );
@@ -881,6 +882,18 @@ def init_local_demo_db() -> None:
             connection.execute("ALTER TABLE notifications ADD COLUMN action_state TEXT NOT NULL DEFAULT 'none'")
         if not _column_exists(connection, "orders", "payment_method"):
             connection.execute("ALTER TABLE orders ADD COLUMN payment_method TEXT NOT NULL DEFAULT 'UPI'")
+        # Idempotency key for checkout. The payment page may have to retry the
+        # order POST (cold starts on the serverless host are slow enough to time
+        # out), and a naive retry created a SECOND order for the same basket.
+        # Two same-amount unpaid orders at one shop is exactly the ambiguity
+        # tier-2 bank matching refuses to guess at, so a retry used to deadlock
+        # the student who had already paid. A stable client-supplied ref makes
+        # every retry return the FIRST order instead of forking a new one.
+        if not _column_exists(connection, "orders", "client_ref"):
+            connection.execute("ALTER TABLE orders ADD COLUMN client_ref TEXT")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_client_ref ON orders (client_ref)"
+        )
         if not _column_exists(connection, "password_resets", "attempts"):
             connection.execute("ALTER TABLE password_resets ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
         if not _column_exists(connection, "site_feedback", "subject"):
@@ -1438,6 +1451,32 @@ def list_orders_by_shop(shop_id: str) -> list[dict[str, Any]]:
         return _rows_to_dicts(rows)
 
 
+def find_order_by_client_ref(client_ref: str, owner_user_id: str = "") -> dict[str, Any] | None:
+    """Find a student's own order by the checkout idempotency key.
+
+    Scoped to the OWNING ACCOUNT, never to the ref alone: the ref is chosen by
+    the client, so two students could (and a hostile one would deliberately)
+    send the same value. Without the owner scope, student B could claim student
+    A's order id by guessing their ref and then read or pay against it.
+    """
+    ref = (client_ref or "").strip()
+    if not ref:
+        return None
+    with _connect() as connection:
+        if owner_user_id:
+            row = connection.execute(
+                "SELECT * FROM orders WHERE client_ref = ? AND owner_user_id = ?"
+                " ORDER BY created_at DESC LIMIT 1",
+                (ref, str(owner_user_id)),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT * FROM orders WHERE client_ref = ? ORDER BY created_at DESC LIMIT 1",
+                (ref,),
+            ).fetchone()
+        return dict(row) if row else None
+
+
 def list_recent_orders_by_shop(shop_id: str, limit: int = 250) -> list[dict[str, Any]]:
     """Latest orders for one shop (newest first) — the live feed in the vendor
     app. Bounded so the 30s auto-refresh never ships the shop's entire history."""
@@ -1568,9 +1607,11 @@ def create_order(values: dict[str, Any]) -> dict[str, Any] | None:
             INSERT INTO orders (
                 id, token, owner_user_id, student_name, student_phone, shop_id, shop_name,
                 items, subtotal, service_fee, tax, delivery_fee, total,
-                delivery_location, delivery_slot, status, payment_method, created_at
+                delivery_location, delivery_slot, status, payment_method, client_ref,
+                created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%d %H:%M:%S', 'now', '+05:30'))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    strftime('%Y-%m-%d %H:%M:%S', 'now', '+05:30'))
             """,
             (
                 order_id,
@@ -1590,6 +1631,7 @@ def create_order(values: dict[str, Any]) -> dict[str, Any] | None:
                 values["delivery_slot"],
                 initial_status,
                 payment_method,
+                values.get("client_ref") or None,
             ),
         )
         row = connection.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()

@@ -330,6 +330,15 @@ _MIGRATIONS = [
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS owner_user_id text NOT NULL DEFAULT ''",
     "ALTER TABLE parent_orders ADD COLUMN IF NOT EXISTS owner_user_id text NOT NULL DEFAULT ''",
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method text NOT NULL DEFAULT 'UPI'",
+    # Checkout idempotency key. The student portal retries the order POST when
+    # the serverless host is slow to answer, and each retry used to INSERT a
+    # fresh order. Two same-amount UNPAID orders at one shop is precisely the
+    # ambiguity tier-2 bank matching refuses to resolve, so a student who had
+    # already paid could still never get "Place Order" to unlock. Scoped lookups
+    # are by (client_ref, owner_user_id) — never by ref alone, because the value
+    # is client-chosen and guessable.
+    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS client_ref text",
+    "CREATE INDEX IF NOT EXISTS idx_orders_client_ref ON orders (client_ref)",
     "ALTER TABLE shops ADD COLUMN IF NOT EXISTS is_removed boolean NOT NULL DEFAULT false",
     "ALTER TABLE shops ADD COLUMN IF NOT EXISTS admin_dues_balance integer NOT NULL DEFAULT 0",
     "ALTER TABLE shops ADD COLUMN IF NOT EXISTS admin_dues_last_paid_at timestamptz",
@@ -1097,6 +1106,34 @@ def list_orders_by_shop(shop_id: str) -> list[dict[str, Any]]:
             return _rows_to_dicts(cursor.fetchall())
 
 
+def find_order_by_client_ref(client_ref: str, owner_user_id: str = "") -> dict[str, Any] | None:
+    """Find a student's own order by the checkout idempotency key.
+
+    ALWAYS scoped to the owning account when one is supplied: the ref is chosen
+    by the client, so student B could otherwise send student A's ref and receive
+    A's order (and its id) back from their own checkout.
+    """
+    ref = (client_ref or "").strip()
+    if not ref:
+        return None
+    with _DBContext(_connect()) as connection:
+        with connection.cursor() as cursor:
+            if owner_user_id:
+                cursor.execute(
+                    "SELECT * FROM orders WHERE client_ref = %s AND owner_user_id = %s"
+                    " ORDER BY created_at DESC LIMIT 1",
+                    (ref, str(owner_user_id)),
+                )
+            else:
+                cursor.execute(
+                    "SELECT * FROM orders WHERE client_ref = %s"
+                    " ORDER BY created_at DESC LIMIT 1",
+                    (ref,),
+                )
+                return cursor_row(cursor)
+            return cursor_row(cursor)
+
+
 def list_recent_orders_by_shop(shop_id: str, limit: int = 250) -> list[dict[str, Any]]:
     """Latest orders for one shop (newest first) — the live feed shown in the
     vendor app. Bounded so the 30s auto-refresh never ships the shop's entire
@@ -1262,9 +1299,10 @@ def _create_order_impl(values: dict[str, Any]) -> dict[str, Any] | None:
                         INSERT INTO orders (
                             id, token, owner_user_id, student_name, student_phone, shop_id, shop_name,
                             items, subtotal, service_fee, tax, delivery_fee, total,
-                            delivery_location, delivery_slot, status, payment_method, created_at
+                            delivery_location, delivery_slot, status, payment_method, client_ref,
+                            created_at
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
                         """,
                         (
                             order_id,
@@ -1284,6 +1322,7 @@ def _create_order_impl(values: dict[str, Any]) -> dict[str, Any] | None:
                             values["delivery_slot"],
                             initial_status,
                             payment_method,
+                            values.get("client_ref") or None,
                         ),
                     )
                 except psycopg2.errors.UniqueViolation:

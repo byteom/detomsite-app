@@ -231,6 +231,32 @@ const IconH = { user: Icon.user, lock: Icon.lock, graduation: Icon.graduation, b
  * never build a line the server will reject at checkout. */
 const MAX_ITEM_QTY = 20
 
+/* How many times to try creating the payable UPI draft before giving up. A
+ * single attempt made a slow server response look like a permanent failure. */
+const DRAFT_ATTEMPTS = 4
+
+/* A stable idempotency key for ONE checkout attempt.
+ *
+ * The serverless host is slow enough on a cold start that the order POST can
+ * time out even though the order was created. The retry then created a SECOND
+ * order for the same basket, and two same-amount unpaid orders at one shop is
+ * precisely the ambiguity the bank-credit matcher refuses to guess at — so the
+ * student, having paid, could never unlock "Place Order".
+ *
+ * The server de-duplicates on this value, so every retry returns the FIRST
+ * order. It is derived from the basket, so a genuinely new cart (or a changed
+ * quantity) gets a new key and still creates a new order. */
+function checkoutRef(items: CartItem[], method: string): string {
+  const basis = items
+    .map(i => `${i.product_id}x${i.quantity || 1}`)
+    .sort()
+    .join('-')
+  let hash = 5381
+  const key = `${basis}|${method}`
+  for (let i = 0; i < key.length; i++) hash = ((hash << 5) + hash + key.charCodeAt(i)) >>> 0
+  return `co-${hash.toString(36)}`
+}
+
 function addToCart(p: Product, s: Shop): boolean {
   const c = getCart()
   const existing = c.find(i => i.product_id === p.id)
@@ -1664,14 +1690,24 @@ function PayPage() {
         delivery_slot: slot,
         payment_method: method === 'cod' ? 'COD' : 'UPI',
         total: shopTotal,
+        // Same basket + same method = same key, so a retried POST returns the
+        // order the first attempt created instead of forking a duplicate.
+        client_ref: checkoutRef(shopItems, method),
       })
       created.push(order.data)
       /* Record the payment row so the bank-credit bot has something to match
-         the incoming SMS against. */
+         the incoming SMS against.
+
+         A failure here is NOT fatal: the order exists, and the student's
+         "I've paid" box can create the row later. Rethrowing used to strand
+         the page with no order id at all, so the poll had nothing to watch and
+         the button could never unlock. */
       try {
         await api.post('/local/payments', { order_id: order.data.id, amount: shopTotal, method: method === 'cod' ? 'COD' : 'Manual UTR', utr_number: '' })
       } catch (payErr: any) {
-        if (payErr?.response?.status !== 409) throw payErr
+        if (payErr?.response?.status !== 409) {
+          console.warn('Payment row not recorded yet; it can be created on confirmation', payErr)
+        }
       }
     }
     return created
@@ -1686,11 +1722,30 @@ function PayPage() {
     if (!isUpi || !canTakePayment || draft || drafting) return
     const shopIds = new Set(items.map(i => i.shop_id))
     if (shopIds.size > 1) return
+
+    let cancelled = false
     setDrafting(true)
-    createOrder()
-      .then(list => { if (list[0]) setDraft({ id: list[0].id, token: list[0].token }) })
-      .catch(e => setErr(apiError(e, 'Could not start your payment')))
-      .finally(() => setDrafting(false))
+
+    /* RETRY, because a single slow response used to strand the student forever:
+       the first attempt raised "the server is taking too long to respond", and
+       since that landed in the SAME `err` state the button is gated on,
+       `canTakePayment` went false, this effect stopped re-running, and the
+       button stayed disabled with no way forward -- the draft was never
+       created, so the bank SMS had nothing to match. A timeout is a transient
+       server condition, not a permanent failure. */
+    const attempt = (n: number) => {
+      const fail = (e: any) => {
+        if (cancelled) return
+        if (n < DRAFT_ATTEMPTS) { setTimeout(() => { if (!cancelled) attempt(n + 1) }, 1500 * n); return }
+        setErr(apiError(e, 'Could not start your payment'))
+      }
+      createOrder()
+        .then(list => { if (cancelled) return; if (list[0]) setDraft({ id: list[0].id, token: list[0].token }); else fail(new Error('no order returned')) })
+        .catch(fail)
+        .finally(() => { if (!cancelled) setDrafting(false) })
+    }
+    attempt(1)
+    return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isUpi, canTakePayment, draft, drafting, cartKey])
 
@@ -1719,6 +1774,36 @@ function PayPage() {
     const timer = setInterval(check, 4000)
     return () => { cancelled = true; clearInterval(timer) }
   }, [isUpi, draft?.id])
+
+  /* ─── Manual fallback: "I have paid" ───
+   *
+   * The automatic unlock depends on the shop's SMS agent forwarding the bank
+   * credit. If that agent is not installed, its key is wrong, or the bank sends
+   * no SMS, the student had NO way forward — the button simply stayed locked on
+   * a payment they had genuinely made. Typing the UTR their own UPI app shows
+   * gives the matcher an exact reference to settle against, turning a
+   * best-guess amount match into a precise one.
+   *
+   * This records proof only; it never marks an order paid by itself. */
+  const [utrInput, setUtrInput] = useState('')
+  const [utrBusy, setUtrBusy] = useState(false)
+  const [utrMsg, setUtrMsg] = useState('')
+  const submitUtr = async (e: FormEvent) => {
+    e.preventDefault()
+    const value = utrInput.replace(/\s/g, '')
+    if (!draft?.id || !/^[A-Za-z0-9]{6,24}$/.test(value)) {
+      setUtrMsg('Enter the UTR / reference number from your UPI app (12 digits).')
+      return
+    }
+    setUtrBusy(true); setUtrMsg('')
+    try {
+      const res = await api.post(`/local/orders/${draft.id}/confirm-payment`, { utr_number: value })
+      setUtrMsg(res.data?.message || 'Reference saved — waiting for the shop to confirm the payment.')
+      setUtrInput('')
+    } catch (e: any) {
+      setUtrMsg(apiError(e, 'Could not save that reference'))
+    } finally { setUtrBusy(false) }
+  }
 
   const placeOrder = async () => {
     if (!payable || placing) return
@@ -1833,6 +1918,40 @@ function PayPage() {
           )}
 
           {err && <p className="mt-4 rounded-btn border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-600">{err}</p>}
+
+          {/* The escape hatch. Normally the shop's SMS agent confirms the
+              payment and the button unlocks on its own. If that confirmation
+              never arrives (agent not installed, key mismatch, or the bank
+              sends no SMS) the student would otherwise be stuck forever on a
+              payment they really made — so they can hand us the reference from
+              their own UPI app instead. */}
+          {isUpi && !paid && draft?.id && (
+            <form onSubmit={submitUtr} className="mt-4 rounded-btn border border-gray-200 bg-gray-50 p-4">
+              <p className="text-xs font-bold text-gray-700">Already paid? Confirm it here</p>
+              <p className="mt-1 text-[11px] font-medium text-gray-500">
+                If the button is still locked after a minute or two, enter the UTR / reference
+                number from your UPI app. It matches your payment exactly.
+              </p>
+              <div className="mt-2 flex gap-2">
+                <input
+                  value={utrInput}
+                  onChange={e => setUtrInput(e.target.value)}
+                  inputMode="numeric"
+                  autoComplete="off"
+                  placeholder="e.g. 412233445500"
+                  className="min-w-0 flex-1 rounded-btn border border-gray-300 px-3 py-2 text-sm"
+                />
+                <button
+                  type="submit"
+                  disabled={utrBusy}
+                  className="shrink-0 rounded-btn bg-primary px-4 py-2 text-sm font-bold text-white disabled:opacity-50"
+                >
+                  {utrBusy ? 'Saving…' : 'Confirm'}
+                </button>
+              </div>
+              {utrMsg && <p className="mt-2 text-[11px] font-semibold text-gray-600">{utrMsg}</p>}
+            </form>
+          )}
 
           <button
             type="button"
