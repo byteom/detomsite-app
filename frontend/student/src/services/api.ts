@@ -4,9 +4,16 @@ const api = axios.create({
   baseURL: import.meta.env.VITE_API_URL || '/api/v1',
   headers: { 'Content-Type': 'application/json' },
   // A request that never answers used to hang its page forever — the student
-  // saw a permanent spinner and had no way out. Every call now gives up after
-  // 20 s so the UI can show a real "could not reach the server" message.
-  timeout: 20000,
+  // saw a permanent spinner and had no way out. Every call now gives up so the
+  // UI can show a real "could not reach the server" message.
+  //
+  // 45s, not 20s: the API is serverless and pays a cold start per request
+  // (measured 7-14s for an order POST in production, occasionally more). At 20s
+  // the client abandoned requests the server had ALREADY completed, so students
+  // were shown "the server is taking too long to respond" for a successful
+  // order and then placed a second one. Reads are still retried below, so a
+  // genuinely stuck read recovers rather than hanging.
+  timeout: 45000,
 })
 
 /* In-flight GET de-duplication.

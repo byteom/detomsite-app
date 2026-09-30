@@ -249,6 +249,21 @@ const DRAFT_ATTEMPTS = 4
  * 20 s is worth retrying, and nothing has been committed. */
 const ORDER_WRITE_TIMEOUT_MS = 60000
 
+/* Is this a TIMEOUT rather than a real rejection?
+ *
+ * The distinction decides whether a write is safe to repeat. A timeout means
+ * the server may have already committed the row and simply failed to answer in
+ * time, so the honest response is to ask again (idempotently), not to tell the
+ * student it failed. A 4xx is a genuine refusal and repeating it would only
+ * produce the same answer. */
+function isTimeout(err: any): boolean {
+  if (!err) return false
+  if (err.response) return false
+  const code = String(err.code || '')
+  if (code === 'ECONNABORTED' || code === 'ETIMEDOUT' || code === 'ERR_NETWORK') return true
+  return /timeout|network error/i.test(String(err.message || ''))
+}
+
 /* A stable idempotency key for ONE checkout attempt.
  *
  * The serverless host is slow enough on a cold start that the order POST can
@@ -1659,6 +1674,21 @@ function PayPage() {
   const [draft, setDraft] = useState<{ id: string; token: number } | null>(null)
   const [paid, setPaid] = useState(false)
   const [drafting, setDrafting] = useState(false)
+  /* Guards the order POST against a retry storm.
+   *
+   * This is a REF, not the `drafting` state on purpose. `drafting` is a
+   * dependency of the effect that creates the draft, so clearing it re-runs
+   * that effect. An earlier version cleared it in a `.finally()` on every
+   * attempt — including attempts that were about to be retried — which started
+   * a second chain while the first was still counting down. Each failure
+   * doubled the concurrent order POSTs until the backend's connection pool was
+   * saturated and every request became slow: the retry added to fix a timeout
+   * became the cause of them. A ref changes without re-triggering the effect,
+   * so exactly one chain can ever be in flight. */
+  const draftInFlight = useRef(false)
+  /* The same guard for the COD "Place Order" tap, plus its retry counter. */
+  const placeInFlight = useRef(false)
+  const placeAttempt = useRef(0)
 
   /* Everything that must be true before we can ask for money, EXCLUDING the
      payment itself. The draft order is created up-front so the bank SMS has
@@ -1730,7 +1760,7 @@ function PayPage() {
      Only a single-shop basket can be matched reliably by the SMS agent (it
      matches on shop + amount), so a multi-shop basket waits for the button. */
   useEffect(() => {
-    if (!isUpi || !canTakePayment || draft || drafting) return
+    if (!isUpi || !canTakePayment || draft) return
     const shopIds = new Set(items.map(i => i.shop_id))
     if (shopIds.size > 1) return
 
@@ -1743,22 +1773,54 @@ function PayPage() {
        `canTakePayment` went false, this effect stopped re-running, and the
        button stayed disabled with no way forward -- the draft was never
        created, so the bank SMS had nothing to match. A timeout is a transient
-       server condition, not a permanent failure. */
-    const attempt = (n: number) => {
-      const fail = (e: any) => {
-        if (cancelled) return
-        if (n < DRAFT_ATTEMPTS) { setTimeout(() => { if (!cancelled) attempt(n + 1) }, 1500 * n); return }
-        setErr(apiError(e, 'Could not start your payment'))
-      }
-      createOrder()
-        .then(list => { if (cancelled) return; if (list[0]) setDraft({ id: list[0].id, token: list[0].token }); else fail(new Error('no order returned')) })
-        .catch(fail)
-        .finally(() => { if (!cancelled) setDrafting(false) })
+       server condition, not a permanent failure.
+
+       The in-flight guard is a REF, not the `drafting` state, and that matters.
+       An earlier version cleared `drafting` in a `.finally()` on every attempt
+       — including ones that were about to be retried. `drafting` is a
+       dependency of this effect, so clearing it re-ran the effect and started a
+       SECOND chain while the first was still counting down. Every failure
+       doubled the number of concurrent order POSTs, which saturated the
+       backend's connection pool and made every subsequent request slower — the
+       retry meant to help was the thing causing the timeouts. */
+    if (draftInFlight.current) return
+    draftInFlight.current = true
+
+    const release = () => { draftInFlight.current = false; setDrafting(false) }
+
+    const giveUp = (e: any) => {
+      if (cancelled) return
+      release()
+      setErr(apiError(e, 'Could not start your payment'))
     }
+
+    const attempt = (n: number) => {
+      createOrder()
+        .then(list => {
+          if (cancelled) return
+          if (list && list[0]) {
+            release()
+            setDraft({ id: list[0].id, token: list[0].token })
+          } else {
+            giveUp(new Error('no order returned'))
+          }
+        })
+        .catch(e => {
+          if (cancelled) return
+          // A retry is still pending, so the guard is deliberately KEPT here —
+          // releasing it would let this effect start a second, parallel chain.
+          if (n < DRAFT_ATTEMPTS) {
+            setTimeout(() => { if (!cancelled) attempt(n + 1) }, 1500 * n)
+            return
+          }
+          giveUp(e)
+        })
+    }
+
     attempt(1)
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isUpi, canTakePayment, draft, drafting, cartKey])
+  }, [isUpi, canTakePayment, draft, cartKey])
 
   /* Poll the draft's payment state. The bank SMS is matched by the shop's agent;
      this is how the page learns it landed, and unlocks the button.
@@ -1821,13 +1883,32 @@ function PayPage() {
     /* A UPI draft already exists (created for matching). Releasing it is just
        finishing the job; a COD order is created here for the first time. */
     if (draft) { clearCart(); navigate('/orders'); return }
+    /* Same guard the UPI draft uses. A double tap must never fire two order
+       POSTs — and on COD each one notifies the shop immediately, so a duplicate
+       here means the kitchen is told about an order the student never placed. */
+    if (placeInFlight.current) return
+    placeInFlight.current = true
     setPlacing(true); setErr('')
     try {
-      const placed = await createOrder()
+      await createOrder()
       clearCart()
       navigate('/orders')
-    } catch (err: any) { setErr(apiError(err, 'Failed')) }
-    finally { setPlacing(false) }
+    } catch (err: any) {
+      /* A timeout here is genuinely ambiguous: the order may have been created
+         and simply not answered in time. `client_ref` makes the POST
+         idempotent, so retrying cannot duplicate the order — it returns the one
+         that already exists. Retrying is therefore safe, and giving up after one
+         slow response is what left students stuck on a placed order. */
+      if (isTimeout(err) && placeAttempt.current < DRAFT_ATTEMPTS) {
+        placeAttempt.current += 1
+        setPlacing(false)
+        setErr('Still placing your order — the connection is slow. Retrying…')
+        setTimeout(() => { placeOrder() }, 1500 * placeAttempt.current)
+        return
+      }
+      setErr(apiError(err, 'Failed'))
+    }
+    finally { placeInFlight.current = false; setPlacing(false) }
   }
 
   if (!items.length) {
