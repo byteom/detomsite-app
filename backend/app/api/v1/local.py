@@ -1270,6 +1270,35 @@ async def add_order(data: LocalOrderCreate, current_user: dict = Depends(get_cur
     except Exception as e:
         logger.warning(f"Could not auto-accept order {order.get('id')}: {e}")
 
+    # ── Open the payment intent in the SAME request ──
+    # This used to be a second call from the browser (POST /local/payments).
+    # Measured in production that call takes 12-27 s on its own — the serverless
+    # host pays a cold start per request, and a second request paid it AGAIN.
+    # The client gave up at 20 s and reported "the server is taking too long"
+    # for an order that had in fact been created, which is the worst possible
+    # outcome: the student is told it failed, and retries.
+    #
+    # The payment row is what tier-2 bank matching needs to recognise the credit
+    # (it only settles an order that has an OPEN payment), so it must exist
+    # before the student can pay. Creating it here costs one extra statement on
+    # a connection we already hold, instead of a whole extra request.
+    try:
+        if str(order.get("payment_method") or "").upper() == "COD":
+            await _db(db.create_payment, order["id"], int(round(float(order.get("total") or 0))), "COD", None)
+        else:
+            await _db(
+                db.create_payment,
+                order["id"],
+                int(round(float(order.get("total") or 0))),
+                "Manual UTR",
+                None,
+            )
+    except Exception as e:
+        # Never fail the order over its payment intent: the student's "Already
+        # paid? Confirm it here" box creates this row on demand, and the admin
+        # can too. A missing row is recoverable; a lost order is not.
+        logger.warning(f"Could not open the payment intent for {order.get('id')}: {e}")
+
     # Fire the vendor's phone notification without blocking the student's
     # response — the web push runs in a worker thread (fire-and-forget).
     #
@@ -2465,6 +2494,15 @@ async def add_payment(data: LocalPaymentCreate, request: Request, current_user: 
     settled = await _db(db.get_payment_by_order_id, data.order_id)
     if settled and str(settled.get("status") or "") == "Success":
         raise HTTPException(status_code=409, detail="This order has already been paid.")
+
+    # `POST /orders` now opens the payment intent itself (one request instead of
+    # two, because the second call measured 12-27 s on a cold instance). An
+    # older client — or the admin re-recording proof — can still reach this
+    # endpoint, and it must NOT stack a second row on the order: two open
+    # payment rows make tier-2 matching read the wrong one and double-count the
+    # order in the admin's settlement views.
+    if settled and str(settled.get("status") or "") == "Pending" and not utr_claim:
+        return settled
 
     # One UTR = one payment (unique index on payments.utr_number in both DBs).
     # A re-used reference must fail with a FRIENDLY 409 at checkout too — never

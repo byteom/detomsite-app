@@ -235,6 +235,20 @@ const MAX_ITEM_QTY = 20
  * single attempt made a slow server response look like a permanent failure. */
 const DRAFT_ATTEMPTS = 4
 
+/* Budget for the order POST, measured against production rather than guessed.
+ *
+ * The shared client timeout is 20 s, but this write legitimately runs longer on
+ * a cold serverless instance (measured 7-14 s here, and it also opens the
+ * payment intent). At the shared budget the client abandoned the request and
+ * showed "the server is taking too long to respond" for an order the server
+ * had ALREADY created — so the student retried, and a slow host turned into
+ * duplicate orders and duplicate shop messages. Writes that cannot be safely
+ * repeated get a budget that outlasts the server's own work.
+ *
+ * Reads deliberately keep the shorter default: a read that has not answered in
+ * 20 s is worth retrying, and nothing has been committed. */
+const ORDER_WRITE_TIMEOUT_MS = 60000
+
 /* A stable idempotency key for ONE checkout attempt.
  *
  * The serverless host is slow enough on a cold start that the order POST can
@@ -1693,22 +1707,19 @@ function PayPage() {
         // Same basket + same method = same key, so a retried POST returns the
         // order the first attempt created instead of forking a duplicate.
         client_ref: checkoutRef(shopItems, method),
+        // The order POST is the one write that genuinely takes time on a cold
+        // serverless instance (measured 7-14 s), and it also opens the payment
+        // intent server-side. It gets its own generous budget so a slow host
+        // is never reported to the student as a failure for an order that was
+        // in fact created.
+        timeout: ORDER_WRITE_TIMEOUT_MS,
       })
       created.push(order.data)
-      /* Record the payment row so the bank-credit bot has something to match
-         the incoming SMS against.
-
-         A failure here is NOT fatal: the order exists, and the student's
-         "I've paid" box can create the row later. Rethrowing used to strand
-         the page with no order id at all, so the poll had nothing to watch and
-         the button could never unlock. */
-      try {
-        await api.post('/local/payments', { order_id: order.data.id, amount: shopTotal, method: method === 'cod' ? 'COD' : 'Manual UTR', utr_number: '' })
-      } catch (payErr: any) {
-        if (payErr?.response?.status !== 409) {
-          console.warn('Payment row not recorded yet; it can be created on confirmation', payErr)
-        }
-      }
+      /* The payment row is opened by the server as part of this same request.
+         It used to be a second POST here, and that call alone measured 12-27 s
+         in production — a second cold start for one INSERT. The client hit its
+         20 s ceiling and showed "the server is taking too long" for an order
+         that had already succeeded, so students retried a completed order. */
     }
     return created
   }

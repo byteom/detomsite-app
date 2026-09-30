@@ -238,9 +238,83 @@ async def test_student_can_submit_a_utr_to_unblock_themselves(client):
     assert res.status_code == 200, res.text
     assert res.json()["utr_saved"] is True
 
-    # The UTR is on file, so the bank credit can now settle it EXACTLY (tier 1)
+    # A UTR on file, so the bank credit can now settle it EXACTLY (tier 1)
     # rather than relying on an amount-only guess.
     assert db.get_payment_by_order_id(order_id)["utr_number"] == "412233445500"
+
+
+@pytest.mark.anyio
+async def test_placing_an_order_opens_its_payment_intent(client):
+    """POST /orders opens the payment row ITSELF — no second request needed.
+
+    The browser used to follow every order with POST /local/payments. Measured
+    in production that second call took 12-27 s on its own (a second cold start
+    for one INSERT), so the client hit its 20 s ceiling and reported "the server
+    is taking too long" for an order that had already been created.
+
+    The intent must exist on the SAME response, because tier-2 bank matching
+    only settles an order that has an open payment row — without it the QR
+    amount is real but nothing can ever match the credit.
+    """
+    token = await _student(client, "intent")
+    headers = _headers(token)
+    shop, product = _approved_shop_with_product(f"{_u('in_v')}@example.com", "Intent Vendor")
+    created = await client.post("/api/v1/local/orders", json=_body(shop, product, "co-" + _u("i")), headers=headers)
+    order_id = created.json()["id"]
+
+    payment = db.get_payment_by_order_id(order_id)
+    assert payment is not None, (
+        "the order was created without a payment intent — the bank credit can "
+        "never match it, so Place Order would stay locked after a real payment"
+    )
+    assert payment["status"] == "Pending"
+    assert payment["amount"] == created.json()["total"]
+
+
+@pytest.mark.anyio
+async def test_re_posting_payment_does_not_stack_a_second_row(client):
+    """A repeat POST /payments reuses the open intent rather than duplicating it.
+
+    Two open payment rows on one order make tier-2 matching read the wrong row
+    and double-count the order in the admin's settlement views.
+    """
+    token = await _student(client, "norow")
+    headers = _headers(token)
+    shop, product = _approved_shop_with_product(f"{_u('nr2_v')}@example.com", "NoRow Vendor")
+    # This shop needs a UPI target, or POST /payments correctly refuses before
+    # it ever reaches the dedupe branch we are testing.
+    db.update_shop(shop["id"], {"upi_id": f"norow{_RUN}@upi", "upi_enabled": 1})
+    created = await client.post("/api/v1/local/orders", json=_body(shop, product, "co-" + _u("r")), headers=headers)
+    order_id = created.json()["id"]
+    first_id = db.get_payment_by_order_id(order_id)["id"]
+
+    again = await client.post(
+        "/api/v1/local/payments",
+        json={"order_id": order_id, "amount": 100, "method": "Manual UTR", "utr_number": ""},
+        headers=headers,
+    )
+    assert again.status_code == 200, again.text
+    assert again.json()["id"] == first_id, "a second payment row was stacked on the order"
+    assert len([p for p in db.list_payments() if p["order_id"] == order_id]) == 1
+
+
+@pytest.mark.anyio
+async def test_cod_order_opens_a_settled_payment_row(client):
+    """COD is paid on delivery, so its intent is opened as already-successful.
+
+    COD orders are visible to the shop immediately and are never payment-gated,
+    so the row must not sit open — that would make the admin's settlement views
+    count cash that was never collected.
+    """
+    token = await _student(client, "codrow")
+    headers = _headers(token)
+    shop, product = _approved_shop_with_product(f"{_u('cod_v')}@example.com", "Cod Vendor")
+    body = _body(shop, product, "co-" + _u("c"))
+    body["payment_method"] = "COD"
+    created = await client.post("/api/v1/local/orders", json=body, headers=headers)
+    order_id = created.json()["id"]
+    payment = db.get_payment_by_order_id(order_id)
+    assert payment is not None and payment["status"] == "Success"
 
 
 @pytest.mark.anyio
