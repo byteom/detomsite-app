@@ -171,6 +171,18 @@ def compose_order_wa(order: dict[str, Any], paid: bool | None = None) -> str:
     # exact message it is about to send and never taps the wrong chat.
     ref = or_none(order.get("id"))
     ref_line = f"\n• Ref: {ref}" if ref else ""
+    # A COD order is PLACED, not proposed — the student has committed and the
+    # money is collected on handover, so there is nothing for the shopkeeper to
+    # confirm. Telling them to "confirm this order" in the app asked for a tap
+    # that is no longer part of the flow. Prepaid orders still genuinely await
+    # payment, so that instruction stays for them.
+    if payment.upper() == "COD":
+        closing = (
+            "This order is already placed — please start preparing it and keep "
+            "the token ready for pickup. Thank you!"
+        )
+    else:
+        closing = "Please confirm this order in the DETOMSITE shop app. Thank you!"
     return (
         f"Hello! New DETOMSITE order #{token} for you 🛵\n\n"
         f"• Student: {student}\n"
@@ -178,8 +190,7 @@ def compose_order_wa(order: dict[str, Any], paid: bool | None = None) -> str:
         f"• Deliver to: {location}\n"
         f"• Slot: {slot}\n"
         f"• Payment: {paid_label}{ref_line}\n\n"
-        f"Please confirm this order in the DETOMSITE shop app. "
-        f"Thank you!"
+        f"{closing}"
     )
 
 

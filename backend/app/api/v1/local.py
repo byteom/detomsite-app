@@ -1258,17 +1258,29 @@ async def add_order(data: LocalOrderCreate, current_user: dict = Depends(get_cur
         # toggled closed between the check above and the insert.
         raise HTTPException(status_code=400, detail="Could not place your order — the shop stopped accepting orders or an item in your cart was removed. Please check and try again.")
 
-    # Auto-accept: orders placed inside a delivery window (before 12:30 PM or
-    # before 6:00 PM) are accepted automatically — the vendor no longer taps
-    # Accept for every order. Orders outside the windows stay pending so the
-    # vendor can still handle them manually.
+    # COD IS PLACED IMMEDIATELY — NO CONFIRMATION STEP.
+    #
+    # This used to auto-accept only inside a delivery window, so an order placed
+    # outside one sat in "Pending Acceptance" waiting for the shop to tap
+    # Accept. For cash on delivery that wait bought nothing: the money is
+    # collected on handover either way, and the student was shown a pending
+    # state for an order the shop had already been told about.
+    #
+    # A COD order therefore moves straight to "Accepted" (the shop has it, no tap
+    # needed) and the shopkeeper is messaged on WhatsApp at once. "Accepted" is
+    # the same state the in-window path already used, so the vendor dashboard,
+    # the student's order list and the cancellation window all keep working
+    # unchanged — this only removes the wait.
+    #
+    # The shop's own Start/Stop toggle is still the gate on whether an order can
+    # be placed at all, so a stopped shop still refuses orders as before.
     try:
-        if in_delivery_window() and order.get("status") == "Pending Acceptance":
+        if str(order.get("payment_method") or "").upper() == "COD" and order.get("status") == "Pending Acceptance":
             accepted = await _db(db.update_order_status, order["id"], "Accepted")
             if accepted:
                 order = accepted
     except Exception as e:
-        logger.warning(f"Could not auto-accept order {order.get('id')}: {e}")
+        logger.warning(f"Could not mark order {order.get('id')} as placed: {e}")
 
     # ── Open the payment intent in the SAME request ──
     # This used to be a second call from the browser (POST /local/payments).

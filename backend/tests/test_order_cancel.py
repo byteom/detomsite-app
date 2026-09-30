@@ -102,14 +102,28 @@ async def test_order_auto_accepted_within_window(client, monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_order_not_auto_accepted_outside_window(client, monkeypatch):
+async def test_cod_is_placed_immediately_outside_any_window(client, monkeypatch):
+    """COD is PLACED on submit — there is no confirmation step to wait for.
+
+    This used to assert the opposite: an order placed at 8 PM sat in "Pending
+    Acceptance" until the shop tapped Accept. For cash on delivery that wait
+    bought nothing — the money is collected on handover either way — and the
+    student saw a pending state for an order the shop had already been told
+    about. COD now goes straight to "Accepted" (the shop has it) whatever the
+    hour, and the shopkeeper is messaged on WhatsApp immediately.
+
+    Note the shop's own Start/Stop toggle still gates whether an order can be
+    placed at all; this is only about the status AFTER placement.
+    """
     _freeze_time(monkeypatch, 20, 0)  # 8:00 PM — outside both delivery windows
     await _register_and_login(client, _u("autos2"), "password123", "Auto Student 2", "student")
     shop, product = _approved_shop_with_product(_u("autos2vendor") + "@example.com", "Auto Vendor 2")
 
     _tok2 = await _register_and_login(client, _u("autos2_tok"), "password123", "Auto 2", "student")
     order = await _place_order(client, shop["id"], product["id"], "Auto Student 2", method="COD", token=_tok2)
-    assert order["status"] == "Pending Acceptance"
+    assert order["status"] == "Accepted", (
+        "COD fell back to waiting for a shop confirmation that is no longer part of the flow"
+    )
 
 
 @pytest.mark.anyio

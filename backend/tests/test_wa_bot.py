@@ -3,9 +3,12 @@ Phone-bot endpoints: the WhatsApp auto-send agent polls ``/whatsapp/pending``
 with the SMS forward key, gets only messages that are READY to deliver (COD and
 paid-verified UPI), and confirms delivery via ``/whatsapp/{id}/mark-sent``.
 """
+import uuid
+
 import pytest
 
 from app.core.store import store
+from app.services.sms_service import compose_order_wa
 
 
 @pytest.fixture(autouse=True)
@@ -13,6 +16,14 @@ def _clean_wa_logs():
     yield
     with store._connect() as connection:
         connection.execute("DELETE FROM whatsapp_logs")
+
+
+_RUN = uuid.uuid4().hex[:6]
+
+
+def _u(base: str) -> str:
+    """A collision-proof unique suffix, so repeated runs never reuse a shop."""
+    return f"{base}_{_RUN}{uuid.uuid4().hex[:4]}"
 
 
 def _ready_row(order_id: str, status: str = "Pending") -> dict:
@@ -115,6 +126,89 @@ async def test_an_unpaid_draft_is_never_claimed(client):
     )
     second = await client.get("/api/v1/local/whatsapp/pending")
     assert [x["id"] for x in second.json()] == [draft["id"]]
+
+
+# ─── COD: placed on submit, messaged once, nothing to confirm ───
+async def test_cod_is_accepted_at_every_hour(client, monkeypatch):
+    """The placement hour must not decide whether a COD order is "placed".
+
+    Sweeping the whole day guards the actual rule — COD is placed on submit —
+    rather than one convenient hour, which is how the old window-conditional
+    behaviour was able to hide.
+    """
+    from test_order_cancel import (
+        _approved_shop_with_product,
+        _freeze_time,
+        _place_order,
+        _register_and_login,
+    )
+
+    for hour in (9, 14, 20, 23):
+        _freeze_time(monkeypatch, hour, 0)
+        shop, product = _approved_shop_with_product(
+            f"{_u(f'codhr{hour}')}@example.com", f"COD Hour {hour}"
+        )
+        tok = await _register_and_login(
+            client, _u(f"codtok{hour}"), "password123", f"COD {hour}", "student"
+        )
+        order = await _place_order(
+            client, shop["id"], product["id"], f"COD {hour}", method="COD", token=tok
+        )
+        assert order["status"] == "Accepted", f"COD at {hour}:00 was not marked placed"
+
+
+def test_cod_whatsapp_says_placed_not_confirm():
+    """A COD message must not ask the shop to confirm anything.
+
+    COD is placed the moment the student submits and the cash is collected on
+    handover, so there is nothing left for the shopkeeper to confirm. Telling
+    them to "confirm this order in the app" asked for a tap that is no longer
+    part of the flow, and a shop that ignored it looked like a dropped order.
+
+    Prepaid orders genuinely DO await payment, so they keep the instruction.
+    """
+    cod = compose_order_wa(
+        {"id": "o1", "token": 1, "items": "2x Dosa", "student_name": "Asha",
+         "delivery_location": "VIT-AP Main Gate", "delivery_slot": "Evening",
+         "total": 120, "payment_method": "COD"},
+        paid=False,
+    )
+    assert "confirm this order" not in cod.lower(), (
+        "a COD message still asks the shop for a confirmation that is not required"
+    )
+    assert "already placed" in cod.lower()
+    assert "Cash on Delivery" in cod
+
+    upi = compose_order_wa(
+        {"id": "o2", "token": 2, "items": "1x Dosa", "student_name": "Asha",
+         "delivery_location": "VIT-AP Main Gate", "delivery_slot": "Evening",
+         "total": 60, "payment_method": "UPI"},
+        paid=False,
+    )
+    assert "confirm this order" in upi.lower()
+    assert "awaiting payment" in upi.lower()
+
+
+async def test_a_cod_order_queues_exactly_one_shop_whatsapp(client):
+    """COD messages the shop on placement — and only once.
+
+    The queued row is what the bot actually sends, so the "one message per
+    order" guarantee has to hold on the COD path too, not just paid UPI.
+    """
+    from app.core import local_demo_db as store
+    from test_order_cancel import (
+        _approved_shop_with_product,
+        _place_order,
+        _register_and_login,
+    )
+
+    shop, product = _approved_shop_with_product(_u("codmsg_v") + "@example.com", "COD Msg Vendor")
+    tok = await _register_and_login(client, _u("codmsg_t"), "password123", "COD Msg", "student")
+    order = await _place_order(client, shop["id"], product["id"], "COD Msg", method="COD", token=tok)
+
+    rows = [r for r in store.list_whatsapp_logs(50) if str(r.get("sub_order_id")) == order["id"]]
+    assert len(rows) == 1, f"expected one shop message for the order, got {len(rows)}"
+    assert "confirm this order" not in str(rows[0].get("message") or "").lower()
 
 
 async def test_pending_filters_drafts_and_sent(client):
