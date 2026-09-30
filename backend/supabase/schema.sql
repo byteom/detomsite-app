@@ -477,6 +477,9 @@ create table if not exists public.whatsapp_logs (
   url text not null default '',
   status text not null default 'sent',
   order_id text,
+  -- Set when the row is handed to the auto-send bot, so the same order is never
+  -- handed out twice. See the claim_whatsapp_logs helper.
+  claimed_at timestamptz,
   created_at timestamptz not null default now()
 );
 

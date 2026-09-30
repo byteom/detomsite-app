@@ -780,6 +780,7 @@ def init_local_demo_db() -> None:
                 message TEXT NOT NULL DEFAULT '',
                 url TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'Sent',
+                claimed_at TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -896,6 +897,11 @@ def init_local_demo_db() -> None:
         )
         if not _column_exists(connection, "password_resets", "attempts"):
             connection.execute("ALTER TABLE password_resets ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        # Durable "already handed to the WhatsApp bot" stamp — see the Supabase
+        # migration note. Without it a delivered message whose mark-sent was lost
+        # is offered again on every poll and the shop is messaged repeatedly.
+        if not _column_exists(connection, "whatsapp_logs", "claimed_at"):
+            connection.execute("ALTER TABLE whatsapp_logs ADD COLUMN claimed_at TEXT")
         if not _column_exists(connection, "site_feedback", "subject"):
             connection.execute("ALTER TABLE site_feedback ADD COLUMN subject TEXT NOT NULL DEFAULT ''")
         if not _column_exists(connection, "site_feedback", "page"):
@@ -2444,6 +2450,41 @@ def update_whatsapp_message(whatsapp_id: str, message: str, url: str = "") -> di
         )
         row = connection.execute("SELECT * FROM whatsapp_logs WHERE id = ?", (whatsapp_id,)).fetchone()
         return dict(row) if row else None
+
+
+def claim_whatsapp_logs(
+    log_ids: list[str], stale_minutes: int = 15
+) -> list[dict[str, Any]]:
+    """Durably claim these WhatsApp rows for delivery, and return the ones won.
+
+    Mirrors the Supabase implementation. A row is claimable when it is still
+    ``Pending``, or ``Sending`` but claimed longer than ``stale_minutes`` ago
+    (the bot died mid-send, so the message never went out and must be retried).
+    Claiming flips it to ``Sending`` and stamps ``claimed_at``, which is what
+    makes "send once" survive a bot restart.
+    """
+    ids = [str(i) for i in (log_ids or []) if str(i).strip()]
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    cutoff = f"-{int(stale_minutes)} minutes"
+    with _connect() as connection:
+        rows = connection.execute(
+            f"""
+            UPDATE whatsapp_logs
+               SET status = 'Sending', claimed_at = CURRENT_TIMESTAMP
+             WHERE id IN ({placeholders})
+               AND (
+                    status = 'Pending'
+                 OR (status = 'Sending'
+                     AND (claimed_at IS NULL
+                          OR claimed_at < datetime('now', ?)))
+               )
+            RETURNING *
+            """,
+            (*ids, cutoff),
+        ).fetchall()
+        return _rows_to_dicts(rows)
 
 
 def list_whatsapp_logs(limit: int = 100) -> list[dict[str, Any]]:

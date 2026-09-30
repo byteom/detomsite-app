@@ -339,6 +339,16 @@ _MIGRATIONS = [
     # is client-chosen and guessable.
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS client_ref text",
     "CREATE INDEX IF NOT EXISTS idx_orders_client_ref ON orders (client_ref)",
+    # WhatsApp auto-send: a durable claim stamp.
+    #
+    # The phone bot de-duplicates in MEMORY only, so a message it delivered but
+    # failed to confirm (mark-sent lost to a network blip, or the service simply
+    # restarted) came back on the next poll and the shopkeeper received the same
+    # order over and over. claimed_at lets the SERVER remember that a row has
+    # already been handed to the bot, so it is offered exactly once. A row stuck
+    # in 'Sending' (bot killed mid-send) becomes eligible again after the
+    # staleness window, so nothing is lost — it just can't be re-sent instantly.
+    "ALTER TABLE whatsapp_logs ADD COLUMN IF NOT EXISTS claimed_at timestamptz",
     "ALTER TABLE shops ADD COLUMN IF NOT EXISTS is_removed boolean NOT NULL DEFAULT false",
     "ALTER TABLE shops ADD COLUMN IF NOT EXISTS admin_dues_balance integer NOT NULL DEFAULT 0",
     "ALTER TABLE shops ADD COLUMN IF NOT EXISTS admin_dues_last_paid_at timestamptz",
@@ -3635,6 +3645,44 @@ def list_audit_logs(limit: int = 200) -> list[dict[str, Any]]:
             return _rows_to_dicts(cur.fetchall())
     finally:
         _release(connection)
+
+
+def claim_whatsapp_logs(
+    log_ids: list[str], stale_minutes: int = 15
+) -> list[dict[str, Any]]:
+    """Durably claim these WhatsApp rows for delivery, and return the ones won.
+
+    A row is claimable when it is still ``Pending``, or when it is ``Sending``
+    but was claimed longer than ``stale_minutes`` ago (the bot died mid-send, so
+    the message genuinely never went out and must be retried).
+
+    Claiming flips the row to ``Sending`` and stamps ``claimed_at``. That is what
+    makes "send once" durable: the feed no longer offers a row that is already
+    mid-delivery, so a bot that cannot confirm no longer re-sends on every poll.
+    Rows claimed by a concurrent poller are excluded by the status guard, so two
+    agents can never both win the same message.
+    """
+    ids = [str(i) for i in (log_ids or []) if str(i).strip()]
+    if not ids:
+        return []
+    with _DBContext(_connect()) as connection:
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE whatsapp_logs
+                   SET status = 'Sending', claimed_at = NOW()
+                 WHERE id = ANY(%s)
+                   AND (
+                        status = 'Pending'
+                     OR (status = 'Sending'
+                         AND (claimed_at IS NULL
+                              OR claimed_at < NOW() - (%s || ' minutes')::interval))
+                   )
+                RETURNING *
+                """,
+                (ids, int(stale_minutes)),
+            )
+            return _rows_to_dicts(cur.fetchall())
 
 
 def list_whatsapp_logs(limit: int = 100) -> list[dict[str, Any]]:

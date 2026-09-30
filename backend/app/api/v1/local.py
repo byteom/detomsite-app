@@ -2374,22 +2374,52 @@ async def whatsapp_pending_agent(request: Request, x_agent_key: Optional[str] = 
     _require_agent_key(x_agent_key, request)
 
     logs = await _db(db.list_whatsapp_logs, 100)
-    pending = []
+    # Two filters, both about not messaging the shop more than necessary:
+    #   * "Sent" is already delivered.
+    #   * "awaiting payment" is a UPI draft — the bot waits for the verified
+    #     "paid ✓" version rather than sending a message it would have to
+    #     correct. The claim below therefore never touches these rows, so they
+    #     stay claimable once the payment lands.
+    candidates = []
     for log in logs or []:
         if str(log.get("status") or "").lower() == "sent":
             continue
         message = str(log.get("message") or "").strip()
         if "awaiting payment" in message.lower():
             continue
-        pending.append(
-            {
-                "id": log.get("id"),
-                "sub_order_id": log.get("sub_order_id") or log.get("order_id") or "",
-                "phone": str(log.get("phone") or "").strip(),
-                "message": message,
-            }
+        candidates.append(log)
+
+    # CLAIM BEFORE HANDING THEM OVER. This is what makes "one message per
+    # order" durable.
+    #
+    # The bot's own duplicate guard is in-memory, so it is lost whenever the
+    # service restarts. If it delivered a message but its mark-sent POST failed
+    # (a network blip, or the process died first), the row stayed Pending and
+    # was handed straight back on the next poll — the shopkeeper got the same
+    # order again and again. Claiming flips each row to 'Sending' with a
+    # timestamp, so a re-poll skips it.
+    #
+    # A row stuck in 'Sending' becomes eligible again after the staleness
+    # window, so a bot killed mid-send still results in delivery — it just can
+    # never be re-sent instantly.
+    claimed = []
+    if candidates:
+        won = await _db(
+            db.claim_whatsapp_logs,
+            [c.get("id") for c in candidates if c.get("id")],
         )
-    return pending
+        won_ids = {str(w.get("id")) for w in (won or [])}
+        claimed = [c for c in candidates if str(c.get("id")) in won_ids]
+
+    return [
+        {
+            "id": log.get("id"),
+            "sub_order_id": log.get("sub_order_id") or log.get("order_id") or "",
+            "phone": str(log.get("phone") or "").strip(),
+            "message": str(log.get("message") or "").strip(),
+        }
+        for log in claimed
+    ]
 
 
 @router.post("/whatsapp/{whatsapp_id}/mark-sent")
