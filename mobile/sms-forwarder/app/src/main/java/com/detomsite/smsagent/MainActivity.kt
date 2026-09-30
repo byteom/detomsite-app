@@ -13,7 +13,51 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import com.detomsite.smsagent.databinding.ActivityMainBinding
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
+
+private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
+
+/**
+ * Normalise whatever was typed into a usable backend root.
+ *
+ * PENTEST/RELIABILITY FIX. The app used to pass the typed string straight to
+ * OkHttp, so three very common inputs all failed with an opaque error that the
+ * catch-all reported as "could not reach the server":
+ *
+ *   "detomsite-backend.vercel.app"  -> IllegalArgumentException (no scheme)
+ *   "http://detomsite-backend..."   -> UnknownServiceException, because
+ *                                      Android 9+ blocks cleartext HTTP
+ *   "https://host/api/v1/local"     -> would double-append the path
+ *
+ * So a missing "s", or a missing "https://", looked identical to being offline
+ * — which is exactly how it was reported. Fixing the input here means the user
+ * cannot get it wrong, and it applies to the WhatsApp bot's own requests too
+ * since they read the same stored value.
+ */
+internal fun normalizeBackendUrl(raw: String): String {
+    var url = raw.trim()
+    if (url.isEmpty()) return url
+    // A bare host (or a host with a path) gets https:// — the API is HTTPS-only.
+    if (!url.startsWith("http://", ignoreCase = true) && !url.startsWith("https://", ignoreCase = true)) {
+        url = "https://$url"
+    }
+    // Android blocks cleartext by default; upgrade rather than fail cryptically.
+    if (url.startsWith("http://", ignoreCase = true)) {
+        url = "https://" + url.substring("http://".length)
+    }
+    // Keep only the origin — callers append /api/v1/local/... themselves.
+    return url.substringBefore("/api/v1").trimEnd('/')
+}
 
 class MainActivity : AppCompatActivity() {
 
@@ -51,6 +95,7 @@ class MainActivity : AppCompatActivity() {
 
         binding.btnGrantSms.setOnClickListener { requestPerms() }
         binding.btnSave.setOnClickListener { save() }
+        binding.btnTest.setOnClickListener { testConnection() }
         binding.swWABot.setOnCheckedChangeListener { _, checked ->
             prefs.edit().putBoolean("wa_bot_enabled", checked).apply()
             if (checked) {
@@ -124,12 +169,19 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun save() {
-        val url = binding.etBaseUrl.text.toString().trim().trimEnd('/')
+        // Store the NORMALISED url, not what was typed. Otherwise a user who
+        // typed "detomsite-backend.vercel.app" (no scheme) saves a value that
+        // every later request — the SMS match and the WhatsApp bot's queue poll —
+        // would fail on, with no error shown at the moment it matters.
+        val url = normalizeBackendUrl(binding.etBaseUrl.text.toString())
         val key = binding.etAgentKey.text.toString().trim()
         if (url.isEmpty() || key.isEmpty()) {
             Toast.makeText(this, "Backend URL and Agent Key are required.", Toast.LENGTH_LONG).show()
             return
         }
+        // Show the exact value being stored, so a normalised URL is visible
+        // rather than silently different from what was typed.
+        binding.etBaseUrl.setText(url)
         prefs.edit()
             .putString("base_url", url)
             .putString("agent_key", key)
@@ -138,7 +190,127 @@ class MainActivity : AppCompatActivity() {
             .putBoolean("wa_bot_enabled", binding.swWABot.isChecked)
             .apply()
         if (binding.swWABot.isChecked) WhatsAppBotService.start(this)
-        Toast.makeText(this, "Saved. Bank credit SMS will be auto-matched on this device.", Toast.LENGTH_LONG).show()
+        // PENTEST/RELIABILITY FIX: this used to claim "bank credit SMS will be
+        // auto-matched" purely because two text boxes were non-empty, which is
+        // how a wrong key/phone/URL looked identical to a working setup. Point
+        // the user at the check that actually proves it instead of asserting a
+        // result nobody has verified.
+        Toast.makeText(
+            this,
+            "Saved. Tap TEST CONNECTION to confirm the key and phone are right.",
+            Toast.LENGTH_LONG,
+        ).show()
+        binding.tvTestResult.visibility = View.GONE
+    }
+
+    /**
+     * Verify the three settings BEFORE trusting them.
+     *
+     * PENTEST/RELIABILITY FIX. `save()` stored whatever was typed and then said
+     * "Saved — bank credit SMS will be auto-matched on this device", without
+     * contacting the server. So a wrong key, a wrong phone or a wrong URL all
+     * produced the same cheerful message, and the bot silently did nothing
+     * forever after. There were three independent ways to fail and no way to
+     * tell them apart.
+     *
+     * `/sms/match` answers differently for each cause, so one call pins down
+     * all three:
+     *   401 -> the agent key is wrong
+     *   404 -> the key is good, but this phone is not registered to any shop
+     *   400/409/422 -> key good + shop found; there is simply nothing to match
+     *                  yet, which is the expected "ready" answer
+     *   (no response) -> the URL is wrong or there is no connectivity
+     */
+    private fun testConnection() {
+        val url = normalizeBackendUrl(binding.etBaseUrl.text.toString())
+        val key = binding.etAgentKey.text.toString().trim()
+        val phone = binding.etPhone.text.toString().trim()
+        if (url.isEmpty() || key.isEmpty() || phone.isEmpty()) {
+            showTestResult("Fill in Backend URL, Agent Key and Phone first.", false)
+            return
+        }
+        binding.btnTest.isEnabled = false
+        showTestResult("Testing $url …", false)
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            val root = url
+            // A deliberately unmatchable proof: amount 0 is rejected by the
+            // matcher with 400, which is only reached AFTER the agent key is
+            // accepted. That ordering is what makes this a real connectivity
+            // test rather than a guess.
+            val payload = JSONObject()
+                .put("phone", phone)
+                .put("utr", "0")
+                .put("amount", 0)
+                .toString()
+                .toRequestBody(JSON_MEDIA)
+
+            var verdict: String
+            var ok = false
+            try {
+                val request = Request.Builder()
+                    .url("$root/api/v1/local/sms/match")
+                    .post(payload)
+                    .header("Content-Type", "application/json")
+                    .header("X-Agent-Key", key)
+                    .build()
+                val client = OkHttpClient.Builder()
+                    .connectTimeout(10, TimeUnit.SECONDS)
+                    .readTimeout(10, TimeUnit.SECONDS)
+                    .build()
+                client.newCall(request).execute().use { resp ->
+                    val body = resp.body?.string().orEmpty()
+                    val detail = runCatching { JSONObject(body).optString("detail") }.getOrDefault("")
+                    verdict = when (resp.code) {
+                        401 -> "✗ Agent key rejected (401). Copy the key again from the admin."
+                        404 -> "✗ Key is good, but no shop uses the phone $phone. Use the number registered to your shop."
+                        400, 409, 422 -> "✓ Connected. Key accepted and your shop was found — ready to match payments."
+                        429 -> "⚠ Too many attempts from this device. Wait ~15 minutes."
+                        503 -> "✗ Server is not configured for SMS matching (503)."
+                        else -> "✗ Unexpected response ${resp.code}: ${detail.take(120)}"
+                    }
+                    ok = resp.code == 400 || resp.code == 409 || resp.code == 422
+                }
+            } catch (e: Exception) {
+                // PENTEST/RELIABILITY FIX: one catch-all used to render every
+                // failure as "could not reach ... check your internet", which is
+                // simply false for a mistyped URL and sends the user off to
+                // debug the wrong thing. Name the actual cause instead.
+                val detail = e.message.orEmpty()
+                verdict = when {
+                    e is java.net.UnknownHostException ->
+                        "✗ Can't find that server name. Check the URL spelling and your internet."
+                    // Android blocks cleartext HTTP by default (API 28+). OkHttp's
+                    // exception type for it is internal, so match on the text.
+                    detail.contains("CLEARTEXT communication") ->
+                        "✗ Android blocked an unencrypted connection. Use https:// in the URL."
+                    e is javax.net.ssl.SSLException ->
+                        "✗ Secure connection failed. Check the URL uses https:// and try again."
+                    e is java.net.SocketTimeoutException ->
+                        "✗ The server didn't answer in time. Try again in a moment."
+                    e is java.net.ConnectException ->
+                        "✗ Connection refused. Check the URL and your internet."
+                    e is IllegalArgumentException ->
+                        "✗ That URL isn't valid. Use https://detomsite-backend.vercel.app"
+                    else -> "✗ Could not reach $root — ${e.javaClass.simpleName}: ${detail.take(80)}"
+                }
+            }
+            withContext(Dispatchers.Main) {
+                showTestResult(verdict, ok)
+                binding.btnTest.isEnabled = true
+            }
+        }
+    }
+
+    private fun showTestResult(text: String, ok: Boolean) {
+        binding.tvTestResult.text = text
+        binding.tvTestResult.setTextColor(
+            ContextCompat.getColor(
+                this,
+                if (ok) android.R.color.holo_green_dark else android.R.color.holo_orange_dark
+            )
+        )
+        binding.tvTestResult.visibility = View.VISIBLE
     }
 
     private fun requestPerms() {

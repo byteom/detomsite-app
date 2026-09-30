@@ -2,6 +2,7 @@ import { useState, useEffect, FormEvent, useMemo, useCallback, useRef } from 're
 import { BrowserRouter as Router, Routes, Route, Link, Navigate, useNavigate, useSearchParams, useParams, useLocation } from 'react-router-dom'
 import api, { dedupeGet } from './services/api'
 import ErrorBoundary from './components/ErrorBoundary'
+import { usePolling } from './hooks/usePolling'
 import { QRCodeSVG } from 'qrcode.react'
 
 function apiError(e: any, fb = 'Request failed') {
@@ -125,7 +126,7 @@ interface Shop { id: string; name: string; category: string; description: string
 interface Product { id: string; shop_id: string; name: string; description: string; price: number; pending_price: number | null; category: string; inventory: number; prep_time: number; available: number; is_combo?: number; combo_items?: string }
 interface Order { id: string; token: number; student_name: string; student_phone: string; shop_id: string; shop_name: string; items: string; total: number; delivery_location: string; delivery_slot: string; status: string; payment_method?: string; created_at: string }
 interface Payment { id: string; order_id: string; amount: number; method: string; status: string; utr_number: string | null; created_at: string }
-interface CartItem { product_id: string; shop_id: string; shop_name: string; name: string; price: number; category: string }
+interface CartItem { product_id: string; shop_id: string; shop_name: string; name: string; price: number; category: string; quantity: number }
 interface Notification { id: string; title: string; message: string; order_id: string | null; status: string | null; is_read: number; created_at: string }
 interface PaymentSettings { manual_enabled: boolean; upi_id: string; receiver_name: string; instructions: string }
 /* Site-wide info block the admin writes in the Admin Centre → Settings and every
@@ -146,9 +147,11 @@ function clearCart() { saveCart([]) }
 
 /* UPI transaction limit — Indian banks cap UPI at ₹1,00,000 per transaction.
    Above that the bank rejects the payment (money is NOT debited) with the
-   "exceeded the bank limit … retry with a smaller amount" error. We warn the
-   student before they ever see that confusing failure. */
+   "exceeded the bank limit … retry with a smaller amount" error. The limit is
+   no longer surfaced at checkout (payment moved to its own page) but the
+   constant is kept here so the warning can be re-added there if wanted. */
 const UPI_LIMIT = 100000
+void UPI_LIMIT
 
 /* Client-side cache for the shops list (60s TTL) so the dashboard and shops
    pages render instantly instead of waiting on the network every click. */
@@ -224,8 +227,34 @@ const Icon = {
 const IconH = { user: Icon.user, lock: Icon.lock, graduation: Icon.graduation, bell: Icon.bell, cart: Icon.cart, store: Icon.store, package: Icon.package, home: Icon.home, star: Icon.star, support: Icon.support, search: Icon.search, alert: Icon.alert, phone: Icon.phone, mapPin: Icon.mapPin, check: Icon.check, chevronRight: Icon.chevronRight, card: Icon.card, cash: Icon.cash, eye: Icon.eye, eyeOff: Icon.eyeOff, sun: Icon.sun, moon: Icon.moon, clock: Icon.clock }
 /* Quantity system removed — one copy of each product, no +/− counting.
    Adding an item that is already in the cart is a no-op (returns False). */
-function addToCart(p: Product, s: Shop): boolean { const c = getCart(); if (c.some(i => i.product_id === p.id)) return false; saveCart([...c, { product_id: p.id, shop_id: s.id, shop_name: s.name, name: p.name, price: p.price, category: p.category }]); return true }
-function billBreakdown(items: CartItem[]) { const total = items.reduce((a, i) => a + i.price, 0); return { subtotal: total, tax: 0, platformFee: 0, delivery: 0, total: total } }
+/* MAX matches the backend's own per-line cap (MAX_LINE_QUANTITY) so the cart can
+ * never build a line the server will reject at checkout. */
+const MAX_ITEM_QTY = 20
+
+function addToCart(p: Product, s: Shop): boolean {
+  const c = getCart()
+  const existing = c.find(i => i.product_id === p.id)
+  if (existing) {
+    // Adding the same product again means "one more", not "already in cart".
+    // Previously this returned false and the tap did nothing visible, which is
+    // exactly the bug: there was no way to order two of the same thing.
+    if ((existing.quantity || 1) >= MAX_ITEM_QTY) return false
+    saveCart(c.map(i => i.product_id === p.id ? { ...i, quantity: (i.quantity || 1) + 1 } : i))
+    return true
+  }
+  saveCart([...c, { product_id: p.id, shop_id: s.id, shop_name: s.name, name: p.name, price: p.price, category: p.category, quantity: 1 }])
+  return true
+}
+
+/** Set a line's quantity; 0 or less removes the row entirely. */
+function setItemQty(productId: string, qty: number): void {
+  const c = getCart()
+  if (qty <= 0) { saveCart(c.filter(i => i.product_id !== productId)); return }
+  const next = Math.min(MAX_ITEM_QTY, qty)
+  saveCart(c.map(i => i.product_id === productId ? { ...i, quantity: next } : i))
+}
+
+function billBreakdown(items: CartItem[]) { const total = items.reduce((a, i) => a + i.price * (i.quantity || 1), 0); return { subtotal: total, tax: 0, platformFee: 0, delivery: 0, total: total } }
 /* UPI amounts MUST be clean numbers with at most 2 decimal places. Raw float
    totals (e.g. 99.5 * 3 = 298.50000000000006 from decimal product prices)
    make banks reject the payment — often with a confusing "exceeded bank
@@ -244,6 +273,54 @@ function buildUpiUri(pa: string, pn: string, am: number, tn: string) {
   const note = String(tn || '').trim().slice(0, 40)
   return `upi://pay?pa=${encodeURIComponent(payee)}&pn=${encodeURIComponent(name)}&am=${upiAmount(am).toFixed(2)}&cu=INR&tn=${encodeURIComponent(note)}`
 }
+
+/* ─── Download the payment QR as a PNG ───
+   A student often wants the QR in their gallery, not on this page: to open it on
+   another device, send it to a sibling who is paying, or scan it from a laptop /
+   a printed copy. The QR the portal draws is an inline <svg>, so it is
+   serialized, painted onto a canvas at 2× and handed to the browser as a PNG —
+   no new dependency, and the file is a real image any scanner can read. */
+function downloadQrPng(svg: SVGSVGElement | null, filename: string) {
+  if (!svg) return
+  try {
+    // Clone so the on-screen QR keeps its styling, and give the standalone copy
+    // an explicit white background (scanners need the quiet zone to be white).
+    const clone = svg.cloneNode(true) as SVGSVGElement
+    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+    const size = Number(svg.getAttribute('width')) || 180
+    clone.setAttribute('width', String(size))
+    clone.setAttribute('height', String(size))
+    const xml = new XMLSerializer().serializeToString(clone)
+    const src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(xml)}`
+    const img = new Image()
+    img.onload = () => {
+      // 2× so the saved file is crisp when a payment app zooms in on it.
+      const scale = 2
+      const canvas = document.createElement('canvas')
+      canvas.width = size * scale
+      canvas.height = size * scale
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return
+      ctx.fillStyle = '#ffffff'
+      ctx.fillRect(0, 0, canvas.width, canvas.height)
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+      canvas.toBlob(blob => {
+        if (!blob) return
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = filename
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        // Release the object URL once the download has been handed over.
+        setTimeout(() => URL.revokeObjectURL(url), 1000)
+      }, 'image/png')
+    }
+    img.src = src
+  } catch { /* a failed download must never break the payment page */ }
+}
+
 /* Delivery is the VIT-AP MAIN GATE only — a single fixed drop point, enforced
    server-side as well. The old presets (Hostel A/B, Academic Block, Food Court,
    Library) and free text are gone: one place means one place, so a student
@@ -380,12 +457,20 @@ function Layout({ children }: { children: React.ReactNode }) {
     return () => window.removeEventListener('cart-updated', sync)
   }, [])
 
-  useEffect(() => {
-    // Students only see order notifications — vendor/product alerts go to the admin.
-    // Poll only while the tab is visible so a backgrounded tab stops calling the API.
-    const load = () => { if (document.visibilityState === 'visible') api.get<Notification[]>('/local/notifications', { params: { role: 'student' } }).then(r => setNotifs(r.data)).catch(() => {}) }
-    load(); const t = setInterval(load, 30000); return () => clearInterval(t)
-  }, [])
+  /* Students only see order notifications — vendor/product alerts go to the admin.
+     Visibility-aware and de-duplicated: the bell used to run a raw interval that
+     kept firing behind a locked phone, and a screen that also polls its own data
+     could end up with two identical requests in the air at once. */
+  usePolling(
+    useCallback(() => {
+      if (document.visibilityState !== 'visible') return
+      return dedupeGet<Notification[]>('/local/notifications', { role: 'student' })
+        .then(r => setNotifs(r.data || []))
+        .catch(() => { /* keep the last known bell through a blip */ })
+    }, []),
+    30000,
+    [],
+  )
 
   const logout = () => { localStorage.removeItem('access_token'); localStorage.removeItem('user_data'); window.location.href = '/login' }
 
@@ -686,8 +771,22 @@ function ForgotPassword() {
           {step === 'request' && (
             <form onSubmit={requestOtp} className="space-y-4">
               <div>
-                <label className="mb-1.5 block text-xs font-bold uppercase tracking-wide text-gray-500">Username or Email</label>
-                <input type="text" value={identifier} onChange={e => setIdentifier(e.target.value)} className={inputCls} placeholder="Your username or registered email" required />
+                <label className="mb-1.5 block text-xs font-bold uppercase tracking-wide text-gray-500">Email Address</label>
+                {/* EMAIL ONLY. The field used to say "Username or Email", but the
+                    code is delivered by email to the address on the account — a
+                    username alone gives the user nothing to check, so they wait
+                    for a mail that can never arrive at an address they never
+                    typed. Now that the label matches what is actually sent. */}
+                <input
+                  type="email"
+                  autoComplete="email"
+                  value={identifier}
+                  onChange={e => setIdentifier(e.target.value)}
+                  onInvalid={e => { if (!identifier.includes('@')) e.currentTarget.setCustomValidity('Enter the email address on your account') }}
+                  className={inputCls}
+                  placeholder="you@example.com"
+                  required
+                />
               </div>
               <button type="submit" disabled={loading} className="w-full rounded-btn bg-primary px-6 py-3.5 text-base font-bold text-white transition-all hover:bg-primary-dark active:scale-[0.99] disabled:opacity-40">{loading ? 'Sending...' : 'Send Code'}</button>
             </form>
@@ -1001,7 +1100,7 @@ function CartPage() {
                 grouped[item.shop_name].push(item)
               }
               return Object.entries(grouped).map(([shopName, shopItems]) => {
-                const shopSubtotal = shopItems.reduce((a, i) => a + i.price, 0)
+                const shopSubtotal = shopItems.reduce((a, i) => a + i.price * (i.quantity || 1), 0)
                 return (
                   <div key={shopName} className="rounded-btn bg-white p-4 shadow-sm border">
                     <div className="mb-3 flex items-center justify-between border-b border-gray-100 pb-2">
@@ -1012,10 +1111,29 @@ function CartPage() {
                       {shopItems.map(item => (
                         <div key={item.product_id} className="flex items-center justify-between rounded-sm bg-gray-50 px-3 py-2.5">
                           <div className="min-w-0"><h4 className="truncate font-semibold text-primary-dark">{item.name}</h4><p className="text-xs text-gray-500">₹{item.price} each</p></div>
-                          {/* Quantity system removed — one row per product, with a remove button instead of −/+ steppers */}
+                          {/* Quantity stepper. "Add" on a product already in the cart
+                              increments the line, so ordering two of something is
+                              possible instead of the tap being ignored. */}
                           <div className="flex items-center gap-3">
-                            <span className="min-w-[4rem] text-right font-bold text-primary">₹{item.price}</span>
-                            <button onClick={() => { saveCart(getCart().filter(i => i.product_id !== item.product_id)); setItems(getCart()) }} className="rounded-sm border border-red-200 px-2.5 py-1 text-xs font-bold text-red-500 transition-colors hover:bg-red-50">Remove</button>
+                            <div className="flex items-center rounded-sm border border-gray-200">
+                              <button
+                                aria-label={`Decrease ${item.name}`}
+                                onClick={() => { setItemQty(item.product_id, (item.quantity || 1) - 1); setItems(getCart()) }}
+                                className="px-2.5 py-1 text-sm font-bold text-gray-600 transition-colors hover:bg-gray-50 disabled:opacity-40"
+                                disabled={(item.quantity || 1) <= 1}
+                              >−</button>
+                              <span className="min-w-[2rem] text-center text-sm font-bold text-primary-dark">{item.quantity || 1}</span>
+                              <button
+                                aria-label={`Increase ${item.name}`}
+                                onClick={() => { setItemQty(item.product_id, (item.quantity || 1) + 1); setItems(getCart()) }}
+                                className="px-2.5 py-1 text-sm font-bold text-primary transition-colors hover:bg-primary-light/30 disabled:opacity-40"
+                                disabled={(item.quantity || 1) >= MAX_ITEM_QTY}
+                              >+</button>
+                            </div>
+                            <span className="min-w-[4.5rem] text-right font-bold text-primary">
+                              ₹{item.price * (item.quantity || 1)}
+                            </span>
+                            <button onClick={() => { setItemQty(item.product_id, 0); setItems(getCart()) }} className="rounded-sm border border-red-200 px-2.5 py-1 text-xs font-bold text-red-500 transition-colors hover:bg-red-50">Remove</button>
                           </div>
                         </div>
                       ))}
@@ -1031,7 +1149,7 @@ function CartPage() {
               <div className="flex justify-between"><span>Subtotal</span><span className="font-semibold">₹{bill.subtotal}</span></div>
               <div className="flex justify-between border-t pt-3 text-lg font-bold">Total<span>₹{bill.total}</span></div>
             </div>
-            <button onClick={() => navigate('/payment')} className="mt-5 w-full rounded-btn bg-primary px-5 py-3 text-sm font-bold text-white hover:bg-primary-dark">Proceed to Payment →</button>
+            <button onClick={() => navigate('/payment')} className="mt-5 w-full rounded-btn bg-primary px-5 py-3 text-sm font-bold text-white hover:bg-primary-dark">Proceed to Checkout →</button>
           </div>
         </div>
       )}
@@ -1176,7 +1294,12 @@ function PreviousOrdersPage() {
 function PaymentPage() {
   const navigate = useNavigate()
   const [ps, setPs] = useState<PaymentSettings | null>(null); const [shop, setShop] = useState<Shop | null>(null)
-  const [method, setMethod] = useState<'qr' | 'cod'>('qr')
+  /* Payment is no longer chosen here. The student places the order and the QR
+     appears on the NEXT page, so the method is DERIVED from what the shop
+     accepts: UPI (pay by QR) whenever it is available, Cash on Delivery only
+     when the shop has no working UPI. There is no toggle to get wrong and no
+     second QR anywhere in the flow. */
+  const [manualMethod, setManualMethod] = useState<'qr' | 'cod' | null>(null)
   /* Remembered checkout details: the phone number and the (single) delivery gate
      are restored from localStorage so a student who logs out and comes back does
      not have to retype their number — the "get out and come back" problem. */
@@ -1188,10 +1311,10 @@ function PaymentPage() {
   const user = readUser()
   const items = getCart(); const bill = billBreakdown(items)
   /* A cart can span several shops. Checkout then creates one order PER shop, so
-     a single combined QR would show a total that matches no payment record —
-     see the notice rendered below. */
+     a single combined QR would show a total that matches no payment record — the
+     student is sent to the payment page of the FIRST order and pays the rest from
+     "My orders", one shop at a time. */
   const shopCount = useMemo(() => new Set(items.map(i => i.shop_id)).size, [items])
-  const multiShop = shopCount > 1
 
   // Resolve the UPI target: the shop's own UPI ID first, then the global
   // (admin) UPI ID as a fallback. Money goes to the shop the order is from.
@@ -1223,21 +1346,27 @@ function PaymentPage() {
      before letting the student pay, so they never hit a confusing backend
      rejection mid-payment. */
   const orderable = shopLoaded ? (shop ? isShopOrderable(shop) : true) : true
-  useEffect(() => {
-    if (!settingsLoaded || !shopLoaded) return
-    if (!upiAvailable && codAvailable) setMethod('cod')
-    else if (upiAvailable && !codAvailable) setMethod('qr')
-    else if (!upiAvailable && !codAvailable) setMethod('qr')
-  }, [settingsLoaded, shopLoaded, upiAvailable, codAvailable])
+  /* Payment method is CHOSEN here and is COMPULSORY.
+   *
+   * It used to be derived silently (UPI whenever the shop had it, COD otherwise).
+   * The student never saw a choice, so a shop with both enabled always got UPI —
+   * and a student who genuinely wanted to pay cash was forced onto a QR with no
+   * way out. `method` is now null until the student picks, and "Proceed to Pay"
+   * refuses to continue without one.
+   *
+   * A shop that accepts only ONE method is pre-selected (and shown read-only):
+   * asking them to "choose" between one option is just a dead end. */
+  const [chosen, setChosen] = useState<'qr' | 'cod' | null>(null)
+  const onlyUpi = upiAvailable && !codAvailable
+  const onlyCod = codAvailable && !upiAvailable
+  const method: 'qr' | 'cod' | null =
+    chosen ?? (onlyUpi ? 'qr' : onlyCod ? 'cod' : null)
+  void manualMethod; void setManualMethod
 
-  /* The ONLY QR in the whole flow — shown once here at checkout. The order
-     result page shows NO second QR (scanning two different codes confused
-     students into paying twice). pn is the EXACT bank account-holder name
-     (receiver name), never the shop display name — a mismatched pn is what
-     triggers "THIS PAYMENT MAY FAIL AS PER UPI RISK POLICY … pay MR
-     YOKESHWARAN S via mobile number or scan QR". */
-  const payerName = (shopUpi ? (shop?.shopkeeper_name || ps?.receiver_name) : ps?.receiver_name) || 'DETOMSITE'
-  const qrUri = upi ? buildUpiUri(upi, payerName, bill.total, `Detomsite ${bill.total}`) : ''
+  /* The QR and its amount are built on the PAYMENT page, not here — checkout only
+     collects delivery details. The UPI target is still resolved here so the page
+     can refuse to continue when the shop accepts no payment method at all. */
+  void buildUpiUri
 
   useEffect(() => { api.get<PaymentSettings>('/local/payment-settings').then(r => setPs(r.data)).catch(() => {}).finally(() => setSettingsLoaded(true)) }, [])
   useEffect(() => {
@@ -1245,86 +1374,28 @@ function PaymentPage() {
     api.get<Shop>(`/local/shops/${items[0].shop_id}`).then(r => setShop(r.data)).catch(() => {}).finally(() => setShopLoaded(true))
   }, [items[0]?.shop_id])
 
-  const submit = async (e: FormEvent) => {
+  const submit = (e: FormEvent) => {
     e.preventDefault(); setErr(''); if (!items.length) { setErr('Cart empty'); return }
     if (!isValidMobile(phone)) { setErr('Please enter a valid 10-digit mobile number'); return }
     if (!isVitApLocation(loc)) { setErr('Delivery is VIT-AP main gate only.'); return }
-    /* Persist the number + gate BEFORE the network calls, so a failed order or
-       a dropped connection never costs the student their retyping it. */
-    try { localStorage.setItem('detomsite_checkout', JSON.stringify({ phone: String(phone).replace(/\s/g, ''), location: loc })) } catch {}
+    /* Persist the number + gate BEFORE moving on, so a failed payment page or a
+       dropped connection never costs the student their retyping it. */
+    /* Persist the choice so the payment page knows whether to show a QR at all.
+       Without it the page has to re-derive the method, which is exactly the
+       silent behaviour this replaced. */
+    try { localStorage.setItem('detomsite_checkout', JSON.stringify({ phone: String(phone).replace(/\s/g, ''), location: loc, slot, method })) } catch {}
     if (shopLoaded && shop && !isShopOrderable(shop)) { setErr('This shop is currently closed — the vendor hasn\'t started accepting orders right now. Please try again later.'); return }
     if (!payOn) { setErr('This shop is not accepting any payments right now — the vendor has turned off UPI and Cash on Delivery. Please try again later.'); return }
     if (method === 'qr' && !upiAvailable) { setErr(upiOn ? 'This shop has not set up UPI payments yet — ask the vendor to add their UPI ID' : 'This shop has turned off UPI payments — choose Cash on Delivery instead'); return }
     if (method === 'cod' && !codAvailable) { setErr('This shop has turned off Cash on Delivery — please pay via UPI instead'); return }
-    /* No UTR paste at checkout anymore: the student pays straight from the
-       QR or the "Scan for better option" button (opens the UPI app with the
-       amount pre-filled), and the admin verifies the recorded payment. */
-    setLoading(true)
-    try {
-      /* Group items by shop so each shop gets its own sub-order */
-      const shopGroups: Record<string, CartItem[]> = {}
-      for (const item of items) {
-        if (!shopGroups[item.shop_id]) shopGroups[item.shop_id] = []
-        shopGroups[item.shop_id].push(item)
-      }
-      const shopIds = Object.keys(shopGroups)
-      const placed: Order[] = []
-      for (const shopId of shopIds) {
-        const shopItems = shopGroups[shopId]
-        const shopTotal = shopItems.reduce((a, i) => a + i.price, 0)
-        const order = await api.post<Order>('/local/orders', {
-          shop_id: shopId,
-          items: shopItems.map(i => ({ product_id: i.product_id, quantity: 1 })),
-          student_name: user.name || 'Student',
-          student_phone: toE164(phone),
-          delivery_location: loc,
-          delivery_slot: slot,
-          payment_method: method === 'cod' ? 'COD' : 'UPI',
-          total: shopTotal,
-        })
-        placed.push(order.data)
-        /* Record payment for each sub-order — no UTR anymore: the row carries
-           the server-priced amount, and the shop's payment bot settles it from
-           the bank's credit message. */
-        try {
-          await api.post('/local/payments', { order_id: order.data.id, amount: shopTotal, method: method === 'cod' ? 'COD' : 'Manual UTR', utr_number: '' })
-        } catch (payErr: any) {
-          const detail = String(payErr?.response?.data?.detail || '')
-          /* 409 = this exact UTR already belongs to another order — the shop
-             basket created >1 order with 1 UTR. First order already saved it;
-             don't fail the whole basket: keep the order and let the student
-             see the 409 reason on the result page rather than losing food. */
-          if (payErr?.response?.status !== 409) throw payErr
-          if (shopIds.length <= 1) throw payErr
-          setErr('')
-          void detail
-        }
-      }
-      const lastOrder = placed.length ? placed[placed.length - 1] : null
-
-      if (method === 'cod') {
-        clearCart()
-        /* Navigate to last order's result page */
-        if (lastOrder) navigate(`/order/${lastOrder.id}`)
-        return
-      }
-
-      clearCart()
-      /* UPI → straight to the payment portal, which is where the QR, the UPI-app
-         button and the manual reference live. The student never has to hunt for
-         the order again.
-
-         A multi-shop basket is paid PER SHOP: each shop is a separate order with
-         its own payment record and its own amount, so one combined QR would show
-         a total that no payment row can ever match (the bank credit would then
-         arrive for a sum no single order expects and the bot would refuse it as
-         ambiguous). Starting on the first order and listing the rest in "My
-         orders" keeps what the student scans identical to what the shop's bank
-         receives. */
-      const first = placed[0]
-      if (first) navigate(`/pay/${first.id}`)
-    } catch (err: any) { setErr(apiError(err, 'Failed')) }
-    finally { setLoading(false) }
+    /* COMPULSORY: no method chosen, no payment page. */
+    if (!method) { setErr('Please choose how you want to pay — UPI or Cash on Delivery.'); return }
+    /* Checkout only COLLECTS the details — it places no order. The order is
+       created on the payment page, where the student can see the QR and the
+       exact amount first and then commit with "Place Order". Nothing is sent to
+       the vendor until that final tap, so an abandoned checkout never produces a
+       real order. */
+    navigate('/pay')
   }
 
   return (
@@ -1383,109 +1454,36 @@ function PaymentPage() {
                 <select value={slot} onChange={e => setSlot(e.target.value)} className="w-full rounded-btn border-2 px-4 py-2.5 text-sm outline-none focus:border-primary-light/200">{['Morning', 'Afternoon', 'Evening', 'Night'].map(s => <option key={s}>{s}</option>)}</select>
               </div>
             </div>
-            <h2 className="mb-4 text-lg font-bold">Payment</h2>
-            {/* Stack the two method cards on phones so each gets full width; side-by-side from sm up */}
-            <div className="flex flex-col gap-3 mb-4 sm:flex-row">
+            <h2 className="mb-1 text-lg font-bold">How do you want to pay?</h2>
+            <p className="mb-3 text-xs text-gray-500">
+              {onlyUpi
+                ? 'This shop only accepts UPI.'
+                : onlyCod
+                  ? 'This shop has no UPI set up, so it only accepts cash on delivery.'
+                  : 'Choose one to continue.'}
+            </p>
+            <div className="mb-4 flex flex-col gap-3 sm:flex-row">
               {upiAvailable && (
-                <button type="button" onClick={() => setMethod('qr')} className={`flex-1 rounded-btn border-2 p-4 text-center transition-all ${method === 'qr' ? 'border-primary-light/200 bg-primary-light/30 shadow-sm' : 'border-gray-200 hover:border-emerald-300'}`}>
-                  <span className="mx-auto flex h-9 w-9 items-center justify-center rounded-pill bg-primary-light text-primary"><svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><path d="M14 14h3v3h-3zM18 18h3v3h-3zM14 21v-1M21 14v-1" /></svg></span>
-                  <span className="mt-1.5 block text-sm font-bold">Scan &amp; Pay (UPI QR)</span>
-                  <span className="block text-[11px] text-gray-500">Scan the QR with GPay / PhonePe / Paytm</span>
+                <button type="button" onClick={() => setChosen('qr')} disabled={onlyUpi}
+                  className={`flex-1 rounded-btn border-2 p-4 text-center transition-all ${method === 'qr' ? 'border-emerald-500 bg-primary-light/30' : 'border-gray-200 hover:border-emerald-300'} ${onlyUpi ? 'opacity-70' : ''}`}>
+                  <span className="mx-auto flex h-9 w-9 items-center justify-center rounded-pill bg-primary-light text-primary"><svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><path d="M14 14h3v3h-3zM18 18h3v3h-3z" /></svg></span>
+                  <span className="mt-1.5 block text-sm font-bold">UPI (QR)</span>
+                  <span className="block text-[11px] text-gray-500">Pay now by scanning the QR</span>
                 </button>
               )}
               {codAvailable && (
-              <button type="button" onClick={() => setMethod('cod')} className={`flex-1 rounded-btn border-2 p-4 text-center transition-all ${method === 'cod' ? 'border-amber-500 bg-amber-50 shadow-sm' : 'border-gray-200 hover:border-gold/40'}`}>
-                <span className="mx-auto flex h-9 w-9 items-center justify-center rounded-pill bg-gold-light text-gold-dark">{IconH.cash({ className: 'h-5 w-5' })}</span>
-                <span className="mt-1.5 block text-sm font-bold">Cash on Delivery</span>
-                <span className="block text-[11px] text-gray-500">Pay when your order arrives</span>
-              </button>
+                <button type="button" onClick={() => setChosen('cod')} disabled={onlyCod}
+                  className={`flex-1 rounded-btn border-2 p-4 text-center transition-all ${method === 'cod' ? 'border-amber-500 bg-amber-50' : 'border-gray-200 hover:border-gold/40'} ${onlyCod ? 'opacity-70' : ''}`}>
+                  <span className="mx-auto flex h-9 w-9 items-center justify-center rounded-pill bg-gold-light text-gold-dark">{IconH.cash({ className: 'h-5 w-5' })}</span>
+                  <span className="mt-1.5 block text-sm font-bold">Cash on Delivery</span>
+                  <span className="block text-[11px] text-gray-500">Pay when your order arrives</span>
+                </button>
               )}
             </div>
-            {shopLoaded && shop && !orderable && (
-              <p className="mb-4 flex items-start gap-2 rounded-btn border-2 border-red-200 bg-red-50 px-4 py-3 text-xs font-semibold text-red-600">
-                {IconH.alert({ className: 'h-4 w-4 mt-0.5 shrink-0' })}<span>This shop is currently <b>closed</b> — the vendor hasn't started accepting orders right now. Your cart is saved; you can pay once the shop is back.</span>
+            {!method && (
+              <p className="mb-4 rounded-btn border-2 border-dashed border-amber-300 bg-amber-50 px-4 py-3 text-xs font-semibold text-gold-dark">
+                Select a payment method to continue.
               </p>
-            )}
-            {!payOn && (
-              <p className="mb-4 flex items-start gap-2 rounded-btn border-2 border-red-200 bg-red-50 px-4 py-3 text-xs font-semibold text-red-600">
-                {IconH.alert({ className: 'h-4 w-4 mt-0.5 shrink-0' })}<span>This shop isn't accepting <b>any payments</b> right now — the vendor has turned off UPI and Cash on Delivery. Try again later.</span>
-              </p>
-            )}
-            {!upiAvailable && codAvailable && (
-              <p className="mb-4 flex items-start gap-2 rounded-btn border-2 border-dashed border-gray-200 bg-gray-50 px-4 py-3 text-xs text-gray-500">
-                {IconH.alert({ className: 'h-4 w-4 mt-0.5 shrink-0 text-gold-dark' })}<span>{upiOn ? "This shop hasn't set up UPI payments yet — only <b>Cash on Delivery</b> is available. The vendor can add a UPI ID from their portal." : "This shop has turned off <b>UPI payments</b> — only <b>Cash on Delivery</b> is available right now."}</span>
-              </p>
-            )}
-            {upiAvailable && !codAvailable && (
-              <p className="mb-4 flex items-start gap-2 rounded-btn border-2 border-dashed border-gray-200 bg-gray-50 px-4 py-3 text-xs text-gray-500">
-                {IconH.alert({ className: 'h-4 w-4 mt-0.5 shrink-0 text-gold-dark' })}<span>This shop has turned off <b>Cash on Delivery</b> — please pay via <b>UPI / QR</b> instead.</span>
-              </p>
-            )}
-            {bill.total > UPI_LIMIT && (
-              <div className="mb-4 flex items-start gap-2.5 rounded-btn border-2 border-gold/40 bg-amber-50 p-4">
-                {IconH.alert({ className: 'h-5 w-5 shrink-0 text-gold-dark' })}
-                <div className="text-xs leading-relaxed text-gold-dark">
-                  <p className="font-bold">₹{bill.total.toLocaleString('en-IN')} is above the UPI transaction limit (₹{UPI_LIMIT.toLocaleString('en-IN')}).</p>
-                  <p className="mt-1">Indian banks cap UPI per payment — above the limit the bank rejects the transaction with “exceeded the bank limit … retry with a smaller amount”, and <b>no money is debited</b>. {codAvailable ? <>Please choose <b>Cash on Delivery</b>, or place two smaller orders.</> : <>Please place two smaller orders instead.</>}</p>
-                </div>
-              </div>
-            )}
-            {method === 'qr' && (
-              <div className="space-y-3">
-                {upiAvailable && multiShop ? (
-                  /* A basket from N shops becomes N separate orders, each with its
-                     own amount and its own payment record. One combined QR would
-                     show a total that no payment row matches, so the shop's bank
-                     would receive a sum no single order expects and the bot would
-                     (correctly) refuse it as ambiguous. Say that plainly instead
-                     of showing a QR that cannot settle. */
-                  <div className="rounded-btn border-2 border-gold-light/60 bg-amber-50 p-4">
-                    <p className="flex items-start gap-2 text-sm font-bold text-gold-dark">
-                      {IconH.alert({ className: 'h-5 w-5 shrink-0' })}
-                      <span>Your cart has items from {shopCount} different shops</span>
-                    </p>
-                    <p className="mt-1.5 text-xs leading-relaxed text-gold-dark">
-                      Each shop is a separate order with its own bill, so you pay{' '}
-                      <b>once per shop</b> — never one combined amount. Place the order
-                      now, then pay each shop from its own payment page (the first one
-                      opens automatically, and the rest are in <b>My orders</b>).
-                    </p>
-                  </div>
-                ) : upiAvailable ? (
-                  <div className="rounded-btn border-2 border-primary-light/50 bg-primary-light/30 p-4">
-                    <p className="text-xs font-semibold text-primary">Pay ₹{bill.total} to {payerName} by scanning the QR — ONE time only</p>
-                    <p className="mt-1 font-mono font-bold text-primary-dark">{upi}</p>
-                    <p className="mt-1 text-xs text-primary">{shopUpi ? (shop?.shopkeeper_name ? `Receiver: ${shop.shopkeeper_name} (pay to this name — if your UPI app shows a different name, STOP and pay via mobile number instead)` : 'Direct to shop') : (ps?.receiver_name ? `Receiver: ${ps.receiver_name}` : '')}</p>
-                    <div className="mt-4 flex w-full flex-col items-center gap-4 rounded-card border-2 border-dashed border-emerald-300 bg-white p-4 sm:flex-row sm:justify-center sm:gap-6">
-                      {qrUri && <QRCodeSVG value={qrUri} size={160} level="M" bgColor="#ffffff" fgColor="#065F46" className="h-auto w-full max-w-[170px] shrink-0" />}
-                      <p className="flex items-center gap-1.5 text-center text-xs font-bold text-primary sm:max-w-[240px] sm:text-left">{IconH.phone({ className: 'h-3.5 w-3.5 shrink-0' })}Scan with your UPI app — amount ₹{bill.total} pre-filled. Pay ONCE.</p>
-                    </div>
-                    {/* NO UTR INPUT — replaced by the "Scan for better option"
-                        button: scanning has its downside, so the direct-pay
-                        button stays and opens the UPI app with the amount
-                        pre-filled. Nothing is pasted; the admin verifies the
-                        recorded payment. */}
-                    <div className="mt-3 rounded-card border-2 border-gold/40 bg-amber-50/70 p-3">
-                      <a href={qrUri} className="flex w-full items-center justify-center gap-2 rounded-btn bg-primary px-4 py-3 text-sm font-bold text-white transition-colors hover:bg-primary-dark">
-                        <svg className="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2" /><path d="M17 3h2a2 2 0 0 1 2 2v2" /><path d="M21 17v2a2 2 0 0 1-2 2h-2" /><path d="M7 21H5a2 2 0 0 1-2-2v-2" /><path d="M7 12h10" /></svg>
-                        Scan for better option
-                      </a>
-                      <p className="mt-2 text-[11px] leading-relaxed text-gold-dark">Opens GPay / PhonePe / Paytm with ₹{bill.total} pre-filled — pay directly if scanning the QR is inconvenient. <b>No money is deducted until you confirm in your UPI app.</b></p>
-                    </div>
-                    <p className="mt-3 flex items-start gap-1.5 text-[11px] leading-relaxed text-gold-dark">{IconH.alert({ className: 'h-3.5 w-3.5 mt-0.5 shrink-0' })}<span><b>Step 2:</b> tap "Place Order" below — your order is placed instantly and you are taken straight to the payment page, where the shop's payment bot confirms the money from the bank's message. <b>No money is deducted until you confirm in your UPI app.</b> If the app shows <b>"THIS PAYMENT MAY FAIL AS PER UPI RISK POLICY"</b> it means the VPA name check failed — STOP, verify the receiver name above matches your UPI app, or pay the same VPA via <b>mobile number</b> instead of QR. If it shows <b>"exceeded bank limit"</b>, that is your bank refusing (no money debited) — try later or choose <b>Cash on Delivery</b>.</span></p>
-                  </div>
-                ) : (
-                  <p className="flex items-start gap-2 rounded-btn border-2 border-gold-light/60 bg-amber-50 px-4 py-3 text-sm text-gold-dark">
-                    {IconH.alert({ className: 'h-4 w-4 mt-0.5 shrink-0' })}<span>This shop hasn't added a UPI ID yet. You can still order with <b>Cash on Delivery</b>.</span>
-                  </p>
-                )}
-              </div>
-            )}
-            {method === 'cod' && (
-              <div className="rounded-btn border-2 border-gold-light/60 bg-amber-50 p-4">
-                <p className="flex items-center gap-2 text-sm font-bold text-gold-dark">{IconH.cash({ className: 'h-4 w-4' })}Pay ₹{bill.total} when your order is delivered</p>
-                <p className="mt-1 text-xs text-gold-dark">Cash on Delivery — no online payment needed. The shop confirms your order, and you pay the delivery person in cash.</p>
-              </div>
             )}
             {err && <p className="mt-4 text-sm font-medium text-red-600">{err}</p>}
           </div>
@@ -1493,9 +1491,365 @@ function PaymentPage() {
           <div className="h-fit rounded-btn bg-white p-5 shadow-sm border lg:sticky lg:top-6">
             <h2 className="mb-4 text-lg font-bold">Summary</h2>
             <div className="space-y-2 text-sm"><div className="flex justify-between"><span>Subtotal</span><span className="font-semibold">₹{bill.subtotal}</span></div><div className="flex justify-between border-t pt-3 text-lg font-bold">Total<span>₹{bill.total}</span></div></div>
-            <button type="submit" disabled={loading || !payOn || (method === 'qr' && !upiAvailable) || (shopLoaded && shop !== null && !orderable)} className="mt-5 w-full rounded-btn bg-primary px-5 py-3 text-sm font-bold text-white hover:bg-primary-dark disabled:opacity-40">{loading ? 'Placing order...' : method === 'cod' ? `Place Order · Pay ₹${bill.total} on Delivery` : `Place Order · ₹${bill.total}`}</button>
+            <button type="submit" className="mt-5 w-full rounded-btn bg-primary px-5 py-3 text-sm font-bold text-white hover:bg-primary-dark">
+              Proceed to Pay →
+            </button>
+            <p className="mt-2 text-center text-[11px] font-medium text-gray-400">
+              Next page shows the QR and the amount. Your order is placed only when you tap Place Order.
+            </p>
           </div>
         </form>
+      )}
+    </div>
+  )
+}
+
+/* ─── Pay (page 3 of 3) ───
+ * Cart → Checkout → THIS PAGE → Orders. The student arrives here after filling in
+ * their delivery details and sees the QR plus the exact amount BEFORE anything is
+ * committed. "Place Order" is the single button that creates the real order, so an
+ * abandoned checkout never notifies a vendor.
+ *
+ * The amount shown is priced from the LIVE product list, not from the prices the
+ * cart happened to capture: the server re-prices every order from the product
+ * table and ignores whatever total the client sends, so a stale cart price would
+ * otherwise produce a QR for the wrong amount and the bank-SMS matcher would
+ * reject the real payment as ambiguous. Server fees are all zero, so the live
+ * product-price sum IS the order total. If the cart and the live prices disagree
+ * the student is stopped here and told, rather than being charged the difference
+ * after the fact. */
+function PayPage() {
+  const navigate = useNavigate()
+  const user = readUser()
+  const [ps, setPs] = useState<PaymentSettings | null>(null)
+  const [shop, setShop] = useState<Shop | null>(null)
+  const [live, setLive] = useState<Record<string, number> | null>(null)
+  const [placing, setPlacing] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [err, setErr] = useState('')
+  const svgRef = useRef<SVGSVGElement | null>(null)
+
+  const items = getCart()
+  const cartBill = billBreakdown(items)
+
+  /* Details captured on the checkout page. Reading them back here (rather than
+     passing through router state) means a refresh, or a back-and-forth with the
+     cart, never loses the phone number the student already typed. */
+  const saved = useMemo(() => safeParse<{ phone?: string; location?: string; slot?: string; method?: 'qr' | 'cod' }>(
+    localStorage.getItem('detomsite_checkout'), {},
+  ), [])
+  const phone = String(saved.phone || '')
+  const loc = saved.location || MAIN_GATE
+  const slot = saved.slot || 'Evening'
+  /* The method the student CHOSE at checkout. A shop with no UPI (off, or never
+     set up) lands here as 'cod' and the page shows no QR and no payment gate —
+     the student goes straight to Place Order. */
+  const chosenMethod = saved.method || null
+
+  useEffect(() => { api.get<PaymentSettings>('/local/payment-settings').then(r => setPs(r.data)).catch(() => {}) }, [])
+
+  /* Price the cart from the live product list, and pull the first shop for the
+     UPI target + open/closed state. Every shop in the basket is priced, not just
+     the first, so a price edit at any one shop is caught before the order. */
+  const cartKey = items.map(i => i.product_id).join(',')
+  useEffect(() => {
+    if (!items.length) { setLoading(false); return }
+    const shopIds = Array.from(new Set(items.map(i => i.shop_id)))
+    Promise.all(shopIds.map(id =>
+      Promise.all([
+        api.get<Product[]>('/local/products', { params: { shop_id: id } }),
+        api.get<Shop>(`/local/shops/${id}`),
+      ]).then(([pr, sr]) => ({ id, products: pr.data, shop: sr.data })),
+    ))
+      .then(results => {
+        // Values are the price of the WHOLE LINE (unit price x quantity), not
+        // the unit price. Storing the unit price here and summing it directly
+        // would quote a 3-vada order as the price of one vada.
+        const prices: Record<string, number> = {}
+        let anyMissing = false
+        for (const item of items) {
+          const group = results.find(r => r.id === item.shop_id)
+          const product = group?.products.find(p => p.id === item.product_id)
+          if (!product || !product.available) { anyMissing = true; continue }
+          prices[item.product_id] = Number(product.price) * (item.quantity || 1)
+        }
+        if (anyMissing) {
+          setErr('Something in your cart is no longer available. Go back to the cart and remove it, then try again.')
+        }
+        setLive(prices)
+        setShop(results[0]?.shop ?? null)
+      })
+      .catch(() => setErr('Could not load the live prices for your cart. Check your connection and try again.'))
+      .finally(() => setLoading(false))
+  }, [cartKey])
+
+  /* The amount due = live price sum, matching the server's own zero-fee total. */
+  const quotedTotal = live
+    ? items.reduce((sum, i) => sum + (live[i.product_id] ?? 0), 0)
+    : cartBill.total
+  const priceChanged = live !== null && quotedTotal !== cartBill.total
+
+  const shopUpi = shop?.upi_id?.trim() || ''
+  const globalUpi = ps?.upi_id?.trim() || ''
+  const upiTarget = shopUpi || (ps?.manual_enabled ? globalUpi : '')
+  const upiOn = shop ? !!shop.upi_enabled : true
+  const codOn = shop ? !!shop.cod_enabled : true
+  const upiAvailable = upiOn && Boolean(upiTarget)
+  /* Honour the student's CHOICE from checkout. A shop with no UPI (disabled, or
+     never given a UPI ID) can only be COD, so the page shows no QR and no
+     payment gate — straight to Place Order, as required. */
+  const method: 'qr' | 'cod' = chosenMethod === 'cod' ? 'cod' : (upiAvailable ? 'qr' : 'cod')
+  const receiver = (shopUpi ? (shop?.shopkeeper_name || ps?.receiver_name) : ps?.receiver_name) || 'DETOMSITE'
+
+  /* ─── Payment gate (UPI only) ───
+   *
+   * The bank SMS is matched by shop + amount + a RECENT UNPAID ORDER. With no
+   * order there is nothing to match, so a "pay first, order after" flow that
+   * creates the order only on the final tap can never confirm: the button would
+   * stay disabled forever.
+   *
+   * So for UPI the order is created up-front as a Pending Payment draft. The
+   * shop never sees it (prepaid orders are withheld until paid), which is what
+   * makes the QR amount real and matchable. The student pays, the SMS matches,
+   * and ONLY THEN does "Place Order" become tappable.
+   *
+   * COD has no gate: cash is collected on delivery, so requiring payment first
+   * would be impossible. */
+  const isUpi = method === 'qr' && upiAvailable
+  const [draft, setDraft] = useState<{ id: string; token: number } | null>(null)
+  const [paid, setPaid] = useState(false)
+  const [drafting, setDrafting] = useState(false)
+
+  /* Everything that must be true before we can ask for money, EXCLUDING the
+     payment itself. The draft order is created up-front so the bank SMS has
+     something to match, and that creation must NOT wait on payment — doing so
+     deadlocks: the draft is what makes payment confirmable, so gating the
+     draft on "already paid" means it is never created and the button can never
+     unlock. */
+  const canTakePayment = items.length > 0 && live !== null && !priceChanged && !err
+    && (method === 'cod' ? codOn : upiAvailable)
+    && (shop ? isShopOrderable(shop) : false)
+
+  /* The button additionally requires a confirmed payment (UPI only). */
+  const payable = canTakePayment && (isUpi ? paid : true)
+
+  const qrUri = isUpi
+    ? buildUpiUri(upiTarget, receiver, quotedTotal, `Detomsite ${quotedTotal}`)
+    : ''
+
+  const createOrder = async (): Promise<Order[]> => {
+    /* One order per shop, exactly as before: each shop needs its own payment
+       record and its own amount, or the bank credit can never be matched to a
+       single order. */
+    const shopGroups: Record<string, CartItem[]> = {}
+    for (const item of items) {
+      if (!shopGroups[item.shop_id]) shopGroups[item.shop_id] = []
+      shopGroups[item.shop_id].push(item)
+    }
+    const created: Order[] = []
+    for (const [shopId, shopItems] of Object.entries(shopGroups)) {
+      // `live` already holds the line total (unit x quantity); the fallback must
+      // do the same, or a shop whose price failed to load would be charged for
+      // one unit of everything.
+      const shopTotal = shopItems.reduce((a, i) => a + (live?.[i.product_id] ?? i.price * (i.quantity || 1)), 0)
+      const order = await api.post<Order>('/local/orders', {
+        shop_id: shopId,
+        // Send the cart's real quantity. It used to be hardcoded to 1, so
+        // raising the stepper in the cart changed the total the student was
+        // shown but the order was still created for one of each.
+        items: shopItems.map(i => ({ product_id: i.product_id, quantity: i.quantity || 1 })),
+        student_name: user.name || 'Student',
+        student_phone: toE164(phone),
+        delivery_location: loc,
+        delivery_slot: slot,
+        payment_method: method === 'cod' ? 'COD' : 'UPI',
+        total: shopTotal,
+      })
+      created.push(order.data)
+      /* Record the payment row so the bank-credit bot has something to match
+         the incoming SMS against. */
+      try {
+        await api.post('/local/payments', { order_id: order.data.id, amount: shopTotal, method: method === 'cod' ? 'COD' : 'Manual UTR', utr_number: '' })
+      } catch (payErr: any) {
+        if (payErr?.response?.status !== 409) throw payErr
+      }
+    }
+    return created
+  }
+
+  /* Create the payable draft as soon as a UPI payment page is ready. Gated on
+     ``canTakePayment``, NOT ``payable`` — see the note above: this is the step
+     that MAKES payment confirmable, so it must not itself require payment.
+     Only a single-shop basket can be matched reliably by the SMS agent (it
+     matches on shop + amount), so a multi-shop basket waits for the button. */
+  useEffect(() => {
+    if (!isUpi || !canTakePayment || draft || drafting) return
+    const shopIds = new Set(items.map(i => i.shop_id))
+    if (shopIds.size > 1) return
+    setDrafting(true)
+    createOrder()
+      .then(list => { if (list[0]) setDraft({ id: list[0].id, token: list[0].token }) })
+      .catch(e => setErr(apiError(e, 'Could not start your payment')))
+      .finally(() => setDrafting(false))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isUpi, canTakePayment, draft, drafting, cartKey])
+
+  /* Poll the draft's payment state. The bank SMS is matched by the shop's agent;
+     this is how the page learns it landed, and unlocks the button.
+     Either signal counts: the payment row turning "Success", or the order itself
+     turning "Completed" (the bot sets both in the same settle). Checking only
+     the payment row would leave the button locked whenever that row is missing
+     or lagging behind. */
+  useEffect(() => {
+    if (!isUpi || !draft?.id) return
+    let cancelled = false
+    const check = () => {
+      api.get<{ payment_status?: string; order_status?: string }>(
+        `/local/orders/${draft.id}/payment`,
+      )
+        .then(r => {
+          if (cancelled) return
+          const pay = String(r.data?.payment_status || '').toUpperCase()
+          const ord = String(r.data?.order_status || '').toUpperCase()
+          if (pay === 'SUCCESS' || ord === 'COMPLETED') setPaid(true)
+        })
+        .catch(() => { /* keep polling; a blip must not reset the gate */ })
+    }
+    check()
+    const timer = setInterval(check, 4000)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [isUpi, draft?.id])
+
+  const placeOrder = async () => {
+    if (!payable || placing) return
+    /* A UPI draft already exists (created for matching). Releasing it is just
+       finishing the job; a COD order is created here for the first time. */
+    if (draft) { clearCart(); navigate('/orders'); return }
+    setPlacing(true); setErr('')
+    try {
+      const placed = await createOrder()
+      clearCart()
+      navigate('/orders')
+    } catch (err: any) { setErr(apiError(err, 'Failed')) }
+    finally { setPlacing(false) }
+  }
+
+  if (!items.length) {
+    return (
+      <div className="mx-auto max-w-2xl px-4 py-10 text-center">
+        <h1 className="text-xl font-bold text-gray-600">Your cart is empty</h1>
+        <Link to="/shops" className="mt-4 inline-flex rounded-btn bg-primary px-5 py-2.5 text-sm font-bold text-white">Browse shops →</Link>
+      </div>
+    )
+  }
+
+  return (
+    <div className="mx-auto max-w-lg px-4 py-6">
+      <h1 className="mb-1 text-2xl font-bold text-primary-dark">Payment</h1>
+      <p className="mb-6 text-sm text-gray-500">
+        {isUpi
+          ? 'Scan the QR and pay the exact amount. Place Order unlocks after your payment is confirmed.'
+          : 'No payment needed now — your order is confirmed on delivery.'}
+      </p>
+
+      {loading ? (
+        <div className="rounded-btn bg-white p-8 text-center border shadow-sm">
+          <p className="text-sm text-gray-500">Loading the live price…</p>
+        </div>
+      ) : (
+        <div className="rounded-btn bg-white p-5 border shadow-sm">
+          <div className="mb-4 flex items-baseline justify-between border-b border-gray-100 pb-4">
+            <span className="text-sm font-semibold text-gray-500">Amount to pay</span>
+            <span className="text-2xl font-black text-primary-dark">₹{quotedTotal}</span>
+          </div>
+
+          {method === 'qr' ? (
+            <>
+              <div className="flex flex-col items-center">
+                <QRCodeSVG
+                  ref={svgRef}
+                  value={qrUri}
+                  size={224}
+                  level="M"
+                  marginSize={2}
+                  bgColor="#ffffff"
+                  fgColor="#000000"
+                />
+                <p className="mt-2 text-xs font-semibold text-primary-dark">₹{quotedTotal} · {shop?.name}</p>
+              </div>
+              <p className="mt-3 text-[11px] leading-relaxed text-gray-500">
+                Download this QR and scan it with GPay / PhonePe / Paytm. The amount is
+                pre-filled, so you cannot overpay by accident.
+                <b> Do not scan any other QR</b> — one scan, one payment.
+              </p>
+              {/* Download is the ONLY QR action. The deep link that used to open a
+                  UPI app directly is gone on purpose: two ways to pay is two ways
+                  to pay twice, and the amount can only ever be settled once. */}
+              <button
+                type="button"
+                onClick={() => downloadQrPng(svgRef.current, 'Detomsite-QR.png')}
+                className="mt-3 flex w-full items-center justify-center gap-2 rounded-btn bg-primary px-4 py-2.5 text-sm font-bold text-white hover:bg-primary-dark"
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
+                Download QR
+              </button>
+            </>
+          ) : (
+            <div className="rounded-btn border-2 border-gold-light/60 bg-amber-50 p-4">
+              <p className="flex items-center gap-2 text-sm font-bold text-gold-dark">
+                {IconH.cash({ className: 'h-4 w-4' })} Pay ₹{quotedTotal} on delivery
+              </p>
+              <p className="mt-1 text-xs text-gold-dark">
+                {upiOn
+                  ? "This shop hasn't set up a UPI ID, so there is no QR to scan. Pay the delivery person in cash."
+                  : 'This shop has turned off UPI payments, so there is no QR to scan. Pay in cash on delivery.'}
+              </p>
+            </div>
+          )}
+
+          {priceChanged && (
+            <p className="mt-4 flex items-start gap-2 rounded-btn border-2 border-amber-300 bg-amber-50 px-4 py-3 text-xs font-semibold text-gold-dark">
+              {IconH.alert({ className: 'h-4 w-4 mt-0.5 shrink-0' })}
+              <span>The price changed since you added this to your cart (now ₹{quotedTotal}). Go back to the cart to review before ordering.</span>
+            </p>
+          )}
+
+          {/* The gate. Until the bank credit is matched by the shop's SMS agent,
+              the button stays disabled and the reason is stated — a greyed-out
+              button with no explanation reads as a broken app. */}
+          {isUpi && (
+            <div className={`mt-4 flex items-start gap-2 rounded-btn border-2 px-4 py-3 text-xs font-semibold ${
+              paid ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-amber-300 bg-amber-50 text-gold-dark'}`}>
+              {paid ? <IconH.check className='h-4 w-4 mt-0.5 shrink-0' />
+                : <svg className="h-4 w-4 mt-0.5 shrink-0 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" strokeLinecap="round" /></svg>}
+              <span>
+                {paid
+                  ? `Payment received — ₹${quotedTotal} confirmed. Tap Place Order to send it to the shop.`
+                  : drafting
+                    ? 'Setting up your order for payment…'
+                    : 'Place Order is locked until your payment is confirmed. Pay the exact amount above, then this unlocks automatically (usually within a few seconds).'}
+              </span>
+            </div>
+          )}
+
+          {err && <p className="mt-4 rounded-btn border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-600">{err}</p>}
+
+          <button
+            type="button"
+            onClick={placeOrder}
+            disabled={!payable || placing}
+            className="mt-5 w-full rounded-btn bg-primary px-5 py-3 text-sm font-bold text-white hover:bg-primary-dark disabled:opacity-40"
+          >
+            {placing ? 'Placing order…' : `Place Order · ₹${quotedTotal}`}
+          </button>
+          <p className="mt-2 text-center text-[11px] font-medium text-gray-400">
+            {isUpi
+              ? paid
+                ? 'Your order goes to the shop when you tap this.'
+                : 'The button unlocks once your payment is confirmed.'
+              : 'Your order is sent to the shop only when you tap this.'}
+          </p>
+        </div>
       )}
     </div>
   )
@@ -1566,22 +1920,27 @@ function PaymentPortalPage() {
 
   /* Live status. A settled (or dead) order stops polling — there is nothing
      left to watch, and a permanent timer is what drains a phone during a
-     lunch rush. */
+     lunch rush.
+
+     `usePolling` also stops a tick from starting while the previous one is still
+     in flight. On a weak campus connection a 4 s interval with a slow response
+     used to stack requests on top of each other, which is exactly the
+     "the page keeps reloading / freezes" behaviour students reported. */
   const settled = pay?.order_status === 'Completed' || pay?.payment_status === 'Success'
   const closed = pay?.order_status === 'Cancelled' || pay?.order_status === 'Failed'
-  useEffect(() => {
+  /* The admin confirming the order is what the Approvals queue exists for, so
+     the page reflects it explicitly instead of leaving the student guessing
+     between "placed" and "confirmed". */
+  const adminConfirmed = ['Confirmed', 'Preparing', 'Ready', 'Delivered', 'Accepted'].includes(
+    String(pay?.order_status || ''),
+  )
+  const loadPay = useCallback(() => {
     if (!orderId || settled || closed) return
-    let cancelled = false
-    const load = () => {
-      if (document.visibilityState !== 'visible') return
-      dedupeGet(`/local/orders/${orderId}/payment`)
-        .then(r => { if (!cancelled) setPay(r.data) })
-        .catch(() => { /* keep the last known state; the next tick retries */ })
-    }
-    load()
-    const t = setInterval(load, 4000)
-    return () => { cancelled = true; clearInterval(t) }
+    return dedupeGet(`/local/orders/${orderId}/payment`)
+      .then(r => setPay(r.data))
+      .catch(() => { /* keep the last known state; the next tick retries */ })
   }, [orderId, settled, closed])
+  usePolling(loadPay, 4000, [orderId, settled, closed])
 
   /* The UPI target and the exact receiver name — identical rules to checkout:
      the shop's own UPI first, the admin's global UPI as the fallback. A wrong
@@ -1659,6 +2018,31 @@ function PaymentPortalPage() {
         </div>
       )}
 
+      {/* The admin confirming the order is the point the whole queue exists for —
+          say so plainly, and point at the QR the student can now download. */}
+      {!settled && !closed && adminConfirmed && (
+        <div className="mb-5 flex items-start gap-2.5 rounded-btn border-2 border-primary-light/50 bg-primary-light/30 p-4 text-sm text-primary">
+          {IconH.check({ className: 'h-5 w-5 shrink-0' })}
+          <span>
+            <b>Order confirmed by the admin ✓</b> — {order.shop_name} has your order and is preparing it.
+            {upiAvailable
+              ? <> Download the QR below and pay <b>₹{amount}</b> from your own UPI app (GPay / PhonePe / Paytm).</>
+              : <> Keep <b>₹{amount}</b> ready for delivery.</>}
+          </span>
+        </div>
+      )}
+
+      {!isCod && !settled && !adminConfirmed && !closed && (
+        <div className="mb-5 flex items-start gap-2.5 rounded-btn border-2 border-dashed border-gray-200 bg-gray-50 p-4 text-xs text-gray-600">
+          {IconH.clock({ className: 'h-4 w-4 mt-0.5 shrink-0' })}
+          <span>
+            <b>Waiting for the admin to confirm your order.</b> The QR below is ready and you can
+            download it now — but the shop starts preparing only after the order is confirmed.
+            This page updates by itself; you do not need to refresh.
+          </span>
+        </div>
+      )}
+
       {!isCod && !settled && closed && (
         <div className="mb-5 rounded-btn border-2 border-red-200 bg-red-50 p-4 text-sm font-semibold text-red-600">
           This order was {String(order.status).toLowerCase()}, so there is nothing left to pay. If you were still charged, contact support with your token #{order.token}.
@@ -1700,7 +2084,15 @@ function PaymentPortalPage() {
               <>
                 <p className="mt-1 text-xs text-gray-500">Pay exactly once, to <b>{upiTarget}</b>, using GPay / PhonePe / Paytm / any UPI app.</p>
                 <div className="mt-4 flex w-full flex-col items-center gap-4 rounded-card border-2 border-dashed border-emerald-300 bg-white p-4 sm:flex-row sm:justify-center sm:gap-6">
-                  <QRCodeSVG value={qrUri} size={180} level="M" bgColor="#ffffff" fgColor="#065F46" className="h-auto w-full max-w-[190px] shrink-0" />
+                  <QRCodeSVG
+                    id="detomsite-pay-qr"
+                    value={qrUri}
+                    size={180}
+                    level="M"
+                    bgColor="#ffffff"
+                    fgColor="#065F46"
+                    className="h-auto w-full max-w-[190px] shrink-0"
+                  />
                   <p className="flex items-start gap-1.5 text-center text-xs font-bold text-primary sm:max-w-[240px] sm:text-left">
                     {IconH.phone({ className: 'h-3.5 w-3.5 shrink-0' })}
                     <span>The receiver name in your app must read <b>{receiver}</b>. If it shows a different name, stop and pay via the shop's mobile number instead.</span>
@@ -1711,6 +2103,16 @@ function PaymentPortalPage() {
                   {IconH.card({ className: 'h-4 w-4 shrink-0' })}
                   Open my UPI app · Pay ₹{amount}
                 </a>
+                {/* Save the QR to the phone gallery — for paying from another
+                    device, sharing it, or scanning it from a laptop screen. */}
+                <button
+                  type="button"
+                  onClick={() => downloadQrPng(document.getElementById('detomsite-pay-qr') as SVGSVGElement | null, `detomsite-order-${order?.token ?? 'payment'}-upi-qr.png`)}
+                  className="mt-2.5 flex w-full items-center justify-center gap-2 rounded-btn border border-primary-light/60 bg-white px-4 py-2.5 text-sm font-bold text-primary transition-colors hover:bg-primary-light/30"
+                >
+                  <svg className="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
+                  Download QR · pay in my UPI app
+                </button>
                 <p className="mt-2 text-[11px] leading-relaxed text-gray-500">
                   The amount is pre-filled, so you cannot overpay by accident. <b>Do not scan any other QR</b> — one scan, one payment.
                 </p>
@@ -1725,58 +2127,6 @@ function PaymentPortalPage() {
             )}
           </div>
 
-          {/* ── 2. Manual reference — the student's own payment method ── */}
-          <div className="rounded-btn bg-white p-5 border shadow-sm">
-            <h2 className="text-lg font-bold text-primary-dark">Already paid? Add the reference</h2>
-            <p className="mt-1 text-xs leading-relaxed text-gray-500">
-              Once your UPI app confirms the payment it shows a <b>transaction / UTR / reference number</b>.
-              Paste it here and the shop's payment bot matches it against the bank's credit message, which confirms
-              your order instantly instead of waiting for manual review.
-            </p>
-            {pay?.utr_saved ? (
-              <div className="mt-4 flex items-start gap-2 rounded-btn border-2 border-primary-light/50 bg-primary-light/30 p-4 text-sm text-primary">
-                {IconH.check({ className: 'h-5 w-5 shrink-0' })}
-                <span><b>Reference received ✓</b> — we are matching it against the bank now. This page updates by itself; you do not need to refresh.</span>
-              </div>
-            ) : (
-              <form onSubmit={submitUtr} className="mt-4 space-y-3">
-                <input
-                  value={utr}
-                  onChange={e => setUtr(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 40))}
-                  inputMode="text" autoComplete="off" placeholder="e.g. 412233445566"
-                  aria-label="UPI transaction reference"
-                  className="w-full rounded-btn border-2 border-gray-200 px-4 py-3 font-mono text-sm text-gray-900 outline-none focus:border-primary-light/200"
-                />
-                {err && <p className="text-sm font-semibold text-red-600">{err}</p>}
-                {okMsg && <p className="text-sm font-semibold text-primary">{okMsg}</p>}
-                <button type="submit" disabled={saving || !utr}
-                  className="w-full rounded-btn bg-primary px-5 py-3 text-sm font-bold text-white hover:bg-primary-dark disabled:opacity-40">
-                  {saving ? 'Saving…' : 'Save reference'}
-                </button>
-              </form>
-            )}
-          </div>
-
-          {/* ── 3. Live status — no manual refreshing anywhere in this flow ── */}
-          <div className="rounded-btn bg-white p-5 border shadow-sm">
-            <div className="flex items-center justify-between gap-3">
-              <div className="min-w-0">
-                <p className="text-sm font-bold text-primary-dark">Verification status</p>
-                <p className="text-xs text-gray-500">
-                  Order: <b>{pay?.order_status || order.status}</b>
-                  {pay?.payment_status ? <> · Payment: <b>{pay.payment_status}</b></> : null}
-                </p>
-              </div>
-              <span className="inline-flex shrink-0 items-center gap-1.5 rounded-pill bg-amber-50 px-3 py-1.5 text-xs font-bold text-gold-dark">
-                <span className="h-2 w-2 animate-pulse rounded-pill bg-amber-500" />Checking…
-              </span>
-            </div>
-            <p className="mt-3 text-xs leading-relaxed text-gray-500">
-              This page re-checks by itself every few seconds and turns green the moment the bank payment is confirmed.
-              If it stays pending, the shopkeeper can also confirm it from their portal.
-            </p>
-            <Link to={`/order/${order.id}`} className="mt-4 inline-flex rounded-btn border px-5 py-2.5 text-sm font-bold text-gray-600 hover:bg-gray-50">View full order</Link>
-          </div>
         </div>
       )}
     </div>
@@ -1789,20 +2139,17 @@ function PaymentPortalPage() {
 function OrderResultPage() {
   const { orderId } = useParams()
   const [order, setOrder] = useState<Order | null>(null); const [shop, setShop] = useState<Shop | null>(null)
-  useEffect(() => {
-    if (!orderId) return
-    // Poll only while the tab is visible. The shop is fetched ONCE (it cannot
-    // change mid-order) instead of on every tick — the old code refetched it
-    // each time, doubling the requests on the busiest page in the app.
-    let cancelled = false
-    const load = () => {
-      if (cancelled || document.visibilityState !== 'visible') return
-      dedupeGet<Order>(`/local/orders/${orderId}`).then(r => { if (!cancelled) setOrder(r.data) }).catch(() => {})
-    }
-    load()
-    const t = setInterval(load, 8000)
-    return () => { cancelled = true; clearInterval(t) }
-  }, [orderId])
+  // Poll only while the tab is visible, and never overlap a tick. The shop is
+  // fetched ONCE (it cannot change mid-order) instead of on every tick — the old
+  // code refetched it each time, doubling the requests on the busiest page.
+  usePolling(
+    useCallback(() => {
+      if (!orderId) return
+      return dedupeGet<Order>(`/local/orders/${orderId}`).then(r => setOrder(r.data)).catch(() => {})
+    }, [orderId]),
+    8000,
+    [orderId],
+  )
   useEffect(() => {
     if (!order?.shop_id) return
     let cancelled = false
@@ -2063,6 +2410,7 @@ export default function App() {
                 <Route path="/orders" element={<OrdersPage />} />
                 <Route path="/previous-orders" element={<PreviousOrdersPage />} />
                 <Route path="/payment" element={<PaymentPage />} />
+                <Route path="/pay" element={<PayPage />} />
                 <Route path="/pay/:orderId" element={<PaymentPortalPage />} />
                 <Route path="/order/:orderId" element={<OrderResultPage />} />
                 <Route path="/reviews" element={<ReviewsPage />} />

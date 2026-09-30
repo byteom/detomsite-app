@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from 'react'
 import { Link, useParams } from 'react-router-dom'
+import QRCode from 'qrcode'
 import api from '../services/api'
 import { LocalParentOrder, LocalPaymentSettings } from '../types/localApi'
 import { usePolling } from '../hooks/usePolling'
@@ -122,6 +123,20 @@ export function OrderResultPage() {
     ? `upi://pay?pa=${encodeURIComponent(payUpi)}&pn=${encodeURIComponent((ps?.receiver_name || 'DETOMSITE').trim())}&am=${(Math.round(Number(order.total) * 100) / 100).toFixed(2)}&cu=INR&tn=${encodeURIComponent(`Detomsite ${order.total}`)}`
     : ''
 
+  /* The QR is rendered here and ONLY here — checkout no longer shows one, so
+     this is the single place a student pays. Kept in a data URL rather than a
+     <canvas> so the same image can be offered as a download for students paying
+     from a second device (or from a desktop while ordering on a phone). */
+  const [qrImage, setQrImage] = useState('')
+  useEffect(() => {
+    let active = true
+    if (!payUri) { setQrImage(''); return () => { active = false } }
+    QRCode.toDataURL(payUri, { width: 260, margin: 2, errorCorrectionLevel: 'M' })
+      .then(url => { if (active) setQrImage(url) })
+      .catch(() => { if (active) setQrImage('') })
+    return () => { active = false }
+  }, [payUri])
+
   const parentStyle = order ? statusStyles[order.status] || statusStyles.Pending : statusStyles.Pending
 
   return (
@@ -176,15 +191,32 @@ export function OrderResultPage() {
 
             {awaitingPayment && (
               <div className="mt-4 rounded-card border border-emerald-200 bg-emerald-50/60 p-4 text-left">
-                <p className="text-sm font-bold text-primary">Payment pending — complete it in your UPI app.</p>
-                <p className="mt-0.5 text-[11px] leading-relaxed text-primary">Pay ₹{order.total} once — the admin verifies the payment and confirms your order. Do NOT scan any other QR.</p>
-                {payUri ? (
-                  <a href={payUri}
-                    className="mt-3 flex w-full items-center justify-center gap-2 rounded-btn bg-primary px-4 py-2.5 text-sm font-bold text-white transition-all hover:bg-primary-dark">
-                    <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2" /><path d="M17 3h2a2 2 0 0 1 2 2v2" /><path d="M21 17v2a2 2 0 0 1-2 2h-2" /><path d="M7 21H5a2 2 0 0 1-2-2v-2" /><path d="M7 12h10" /></svg>
-                    Scan for better option · Pay ₹{order.total}
-                  </a>
-                ) : null}
+                <p className="text-sm font-bold text-primary">Scan this QR to pay ₹{order.total}</p>
+                <p className="mt-0.5 text-[11px] leading-relaxed text-primary">
+                  Pay with GPay / PhonePe / Paytm. The amount is already filled in, so you cannot overpay
+                  by accident, and the admin confirms the payment. <b>Do not scan any other QR</b> — one scan, one payment.
+                </p>
+                {qrImage ? (
+                  <div className="mt-4 flex flex-col items-center">
+                    <img src={qrImage} alt={`UPI QR for order ${order.token}`}
+                      className="h-56 w-56 rounded-btn border border-emerald-200 bg-white p-2" />
+                    <p className="mt-2 text-xs font-semibold text-primary-dark">₹{order.total} · {order.student_name}</p>
+                    {/* Download is the ONLY QR action — the UPI-app deep link is
+                        removed on purpose, so there is exactly one way to pay and
+                        one amount can only ever be settled once. The file is the
+                        same data URL shown on screen, so it can never encode a
+                        different amount than the one displayed. */}
+                    <a href={qrImage} download={`Detomsite-QR-${order.token}.png`}
+                      className="mt-3 flex w-full items-center justify-center gap-2 rounded-btn bg-primary px-4 py-2.5 text-sm font-bold text-white transition-all hover:bg-primary-dark">
+                      <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></svg>
+                      Download QR
+                    </a>
+                  </div>
+                ) : (
+                  <p className="mt-3 text-sm text-primary">
+                    This shop hasn't set up UPI payments, so there's no QR to show. Please pay in cash at the counter.
+                  </p>
+                )}
               </div>
             )}
 

@@ -5,18 +5,12 @@ import android.content.Intent
 import android.os.Bundle
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.coroutines.*
-import okhttp3.OkHttpClient
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONObject
 import com.detomsite.adminapp.databinding.ActivityLoginBinding
 
 class LoginActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityLoginBinding
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val client = OkHttpClient.Builder().connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS).readTimeout(20, java.util.concurrent.TimeUnit.SECONDS).build()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -45,40 +39,18 @@ class LoginActivity : AppCompatActivity() {
         binding.tvStatus.text = "Signing in…"
         binding.btnLogin.isEnabled = false
         scope.launch {
-            val body = JSONObject().put("username", username).put("password", password).toString()
-            val req = Request.Builder()
-                .url("$base/api/v1/admin/login")
-                .post(body.toRequestBody("application/json".toMediaType()))
-                .build()
-            try {
-                client.newCall(req).execute().use { resp ->
-                    val text = resp.body?.string().orEmpty()
-                    if (resp.code in 200..299) {
-                        val json = JSONObject(text)
-                        val token = json.optString("access_token")
-                        val user = json.optJSONObject("user")
-                        val name = user?.optString("name") ?: username
-                        if (token.isBlank()) {
-                            withContext(Dispatchers.Main) { err("Login succeeded but no token came back.") }
-                            return@use
-                        }
-                        getSharedPreferences("admin", Context.MODE_PRIVATE).edit()
-                            .putString("base_url", base)
-                            .putString("token", token)
-                            .putString("username", username)
-                            .putString("user_name", name)
-                            .apply()
-                        withContext(Dispatchers.Main) { goMain() }
-                    } else {
-                        val detail = try { JSONObject(text).optString("detail") } catch (_: Exception) { "" }
-                        withContext(Dispatchers.Main) { err(if (detail.isNotBlank()) detail else "Login failed (HTTP ${resp.code}).") }
-                    }
+            when (val r = ApiClient.login(base, username, password)) {
+                is ApiResult.Ok -> {
+                    val (token, name) = r.value
+                    Session.save(this@LoginActivity, base, token, username, name)
+                    withContext(Dispatchers.Main) { goMain() }
                 }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) { err("Could not reach the server: ${e.message}") }
-            } finally {
-                withContext(Dispatchers.Main) { binding.btnLogin.isEnabled = true }
+                is ApiResult.Failure -> withContext(Dispatchers.Main) { err(r.message) }
+                ApiResult.SessionExpired -> withContext(Dispatchers.Main) {
+                    err("Sign-in failed — check your username and password.")
+                }
             }
+            withContext(Dispatchers.Main) { binding.btnLogin.isEnabled = true }
         }
     }
 

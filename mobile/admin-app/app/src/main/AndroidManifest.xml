@@ -8,7 +8,7 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:icon="@android:drawable/sym_def_app_icon"
         android:label="@string/app_name"
         android:theme="@style/Theme.Material3.DayNight">
@@ -30,6 +30,16 @@
             android:name=".AdminNotificationService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!--
+          The order notification's "Confirm order" button targets this receiver,
+          so an order can be approved straight from the lock screen without
+          launching the app. It is NOT exported: only our own notification's
+          PendingIntent may fire it, so no other app can confirm orders.
+        -->
+        <receiver
+            android:name=".ConfirmReceiver"
+            android:exported="false" />
 
         <receiver
             android:name=".BootReceiver"

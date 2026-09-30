@@ -12,7 +12,7 @@ import secrets
 from app.core.config import settings
 from app.core.store import store as db
 from app.core.security import hash_password, verify_password, create_access_token, create_refresh_token, decode_token
-from app.services.email_service import EmailService
+from app.services.email_service import EmailService, email_delivery_configured
 from app.core.rate_limit import allow as rate_allow, reset as rate_reset, client_ip as rate_ip
 
 logger = logging.getLogger(__name__)
@@ -73,7 +73,10 @@ async def _send_reset_otp(user: dict) -> None:
         if user.get("role") == "admin" and admin_email
         else (user.get("email") or f"{user['username']}@campus.local")
     )
-    await EmailService.send_otp_email(
+    # Return whether the code actually LEFT the server. The caller reports
+    # success to the user, so this must be the real delivery result rather than
+    # a hard-coded True (see the unconfigured branch of _send_smtp).
+    return await EmailService.send_otp_email(
         to_email,
         otp,
         purpose="password reset",
@@ -205,13 +208,44 @@ async def forgot_password(data: ForgotPasswordRequest):
     """Send the single 6-digit OTP to the account's registered email.
     The response never reveals whether an account exists (account enumeration
     protection) — the code is only ever delivered by email, never shown in
-    the UI or returned in the API response."""
+    the UI or returned in the API response.
+
+    PENTEST/RELIABILITY FIX. This used to answer "a 6-digit code was sent to
+    your registered email" even when the deployment had NO mail provider at all
+    — the code was only written to the server log, so the user waited for an
+    email that could never arrive, and the API insisted it had worked. That is
+    the whole reason forgot-password looked broken with nothing to fix.
+
+    When no provider is configured we now say so with a 503. That reveals
+    nothing about the account: it is a property of the SERVER, so an unknown
+    identifier gets the identical answer.
+    """
+    if not email_delivery_configured():
+        logger.error(
+            "forgot-password requested but no email provider is configured "
+            "(set RESEND_API_KEY or SMTP_HOST) — the reset code cannot be sent"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Password reset by email is not available right now — this "
+                "server has no email service configured. Please contact the admin."
+            ),
+        )
+
     user = await _find_user_for_reset(data.identifier)
     if not user:
         # Same response either way — don't leak which usernames exist.
         return {"message": "If that account exists, a verification code was sent to its email.", "step": 1}
 
-    await _send_reset_otp(user)
+    delivered = await _send_reset_otp(user)
+    if not delivered:
+        # A configured provider that rejected the message must NOT be reported
+        # as success either — same reasoning, one layer down.
+        raise HTTPException(
+            status_code=503,
+            detail="We could not send the reset email. Please try again shortly.",
+        )
     return {
         "message": "A 6-digit code was sent to your registered email. Enter it below to set a new password.",
         "step": 1,

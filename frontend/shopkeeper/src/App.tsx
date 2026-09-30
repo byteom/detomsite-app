@@ -1,7 +1,8 @@
-import { useState, useEffect, useRef, FormEvent } from 'react'
+import { useState, useEffect, useRef, useCallback, FormEvent } from 'react'
 import { BrowserRouter as Router, Routes, Route, Link, useNavigate } from 'react-router-dom'
 import ScanOrderPage from './ScanOrderPage'
 import api from './services/api'
+import { usePolling } from './hooks/usePolling'
 import { QRCodeSVG } from 'qrcode.react'
 
 function apiError(e: any, fb = 'Request failed') {
@@ -938,21 +939,20 @@ function VendorMobileApp() {
       }
     }
     void boot()
-    // Refreshing on focus keeps the app current when the vendor returns to it
-    // (e.g. after tapping a push notification that opens the app).
-    const onVisible = () => { if (document.visibilityState === 'visible') refreshAll(true) }
-    window.addEventListener('focus', onVisible)
-    document.addEventListener('visibilitychange', onVisible)
-    // Auto-reload orders & products every 30s so new orders appear on their
-    // own — but only while the app tab is visible, so a backgrounded vendor
-    // app stops pulling the dashboard every 30s.
-    const auto = setInterval(() => { if (document.visibilityState === 'visible') refreshAll(true) }, 30000)
-    return () => {
-      window.removeEventListener('focus', onVisible)
-      document.removeEventListener('visibilitychange', onVisible)
-      clearInterval(auto)
-    }
   }, [])
+
+  /* Auto-reload orders & products so new ones appear on their own. The old code
+     paired this with its own `setInterval` PLUS its own focus/visibility
+     listeners; on top of the boot retry loop that meant three independent
+     schedules all able to fire the same dashboard request at once. `usePolling`
+     is one visibility-aware schedule that pauses in the background, refreshes
+     (debounced) on focus, and never overlaps a tick — so the vendor app stops
+     re-fetching on top of itself. */
+  usePolling(
+    useCallback(async () => { await refreshAll(true) }, []),
+    30000,
+    [isLoggedIn],
+  )
 
   const logout = () => { localStorage.removeItem('vendor_token'); localStorage.removeItem('vendor_user'); navigate('/') }
 

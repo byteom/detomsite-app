@@ -105,6 +105,73 @@ def _rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def _next_suffixed_id(connection: Any, table: str, prefix: str) -> str:
+    """Allocate the next ``<prefix><n>`` primary key for ``table``, safely.
+
+    PENTEST/RELIABILITY FIX. The original code computed the key with a bare
+    ``SELECT COALESCE(MAX(...), 0) + 1`` and then INSERTed it. Those are two
+    separate statements with nothing serialising them, so two concurrent callers
+    could read the same MAX and derive the SAME id — the loser's INSERT then died
+    on the primary key and its row was silently dropped (the callers catch and
+    log, so the app looked healthy).
+
+    Measured on this store: 40 concurrent threads x 3 inserts lost 52 of 120
+    rows (43%). The visible symptom was an order that existed and was paid for
+    but never reached the admin's "confirm this order" queue, so it was never
+    approved. Using MAX rather than COUNT only protects against DELETED rows, not
+    against concurrency.
+
+    This helper only PROPOSES a candidate id; the caller must still INSERT it
+    through :func:`_insert_with_suffixed_id`, which is where the real retry
+    happens on the actual UNIQUE violation. A "check then insert" done here
+    cannot be made safe — the gap between the check and the caller's INSERT is
+    exactly the window the race exploits.
+    """
+    next_id = connection.execute(
+        f"SELECT COALESCE(MAX(CAST(substr(id, ?) AS INTEGER)), 0) + 1 FROM {table}",
+        (len(prefix) + 1,),
+    ).fetchone()[0]
+    return f"{prefix}{next_id}"
+
+
+def _insert_with_suffixed_id(
+    connection: Any,
+    table: str,
+    prefix: str,
+    insert_sql: str,
+    params_for,
+    attempts: int = 25,
+) -> str:
+    """INSERT a row whose id comes from :func:`_next_suffixed_id`, retrying on a
+    primary-key collision.
+
+    This is the part that actually closes the race: the candidate id and the
+    INSERT are attempted together, and a UNIQUE violation means another writer
+    took that id, so we simply re-read MAX and try the next one. Nothing is lost.
+
+    ``params_for(row_id)`` builds the parameter tuple for ``insert_sql`` given the
+    chosen id, so the caller does not have to thread the id through itself.
+    """
+    last_error: Exception | None = None
+    for _ in range(attempts):
+        row_id = _next_suffixed_id(connection, table, prefix)
+        try:
+            connection.execute(insert_sql, params_for(row_id))
+            return row_id
+        except sqlite3.IntegrityError as exc:
+            # A concurrent writer took this id between our MAX read and this
+            # INSERT. Re-read and try again. Any OTHER integrity error (a real
+            # constraint violation) is a genuine bug and must surface.
+            message = str(exc).lower()
+            if "unique" not in message and "primary key" not in message:
+                raise
+            last_error = exc
+            continue
+    raise RuntimeError(
+        f"Could not allocate a unique id for {table} after {attempts} attempts"
+    ) from last_error
+
+
 
 
 
@@ -416,6 +483,8 @@ def init_local_demo_db() -> None:
                 status TEXT,
                 target_role TEXT DEFAULT '',
                 is_read INTEGER NOT NULL DEFAULT 0,
+                action TEXT NOT NULL DEFAULT '',
+                action_state TEXT NOT NULL DEFAULT 'none',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -805,6 +874,11 @@ def init_local_demo_db() -> None:
             connection.execute("ALTER TABLE orders ADD COLUMN delivery_fee INTEGER NOT NULL DEFAULT 0")
         if not _column_exists(connection, "notifications", "target_role"):
             connection.execute("ALTER TABLE notifications ADD COLUMN target_role TEXT DEFAULT ''")
+        # Inline admin action on a notification (the bell's Confirm button).
+        if not _column_exists(connection, "notifications", "action"):
+            connection.execute("ALTER TABLE notifications ADD COLUMN action TEXT NOT NULL DEFAULT ''")
+        if not _column_exists(connection, "notifications", "action_state"):
+            connection.execute("ALTER TABLE notifications ADD COLUMN action_state TEXT NOT NULL DEFAULT 'none'")
         if not _column_exists(connection, "orders", "payment_method"):
             connection.execute("ALTER TABLE orders ADD COLUMN payment_method TEXT NOT NULL DEFAULT 'UPI'")
         if not _column_exists(connection, "password_resets", "attempts"):
@@ -1247,40 +1321,47 @@ def list_products(shop_id: str | None = None) -> list[dict[str, Any]]:
 
 def create_product(values: dict[str, Any]) -> dict[str, Any]:
     with _connect() as connection:
-        # Collision-proof: COUNT(*) + 1 reuses IDs after a delete, which breaks
-        # inserts with a duplicate-key error. MAX(numeric suffix) keeps the next
-        # ID unique even after rows are removed.
-        next_num = connection.execute(
-            "SELECT COALESCE(MAX(CAST(substr(id, 2) AS INTEGER)), 0) + 1 FROM products"
-        ).fetchone()[0]
-        product_id = values.get("id") or f"p{next_num}"
+        # MAX(numeric suffix) keeps the next id unique after deletes; the helper
+        # additionally retries on a concurrent collision (see _next_suffixed_id).
         # Combo: force category to Combo + mark is_combo so students see the
         # combo badge; normal products pass through untouched.
         is_combo = bool(values.get("is_combo"))
         category = "Combo" if is_combo else values["category"]
-        connection.execute(
-            """
+        _insert_sql = """
             INSERT INTO products (
                 id, shop_id, name, description, price, pending_price,
                 category, inventory, prep_time, available, is_combo, combo_items
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                product_id,
-                values["shop_id"],
-                values["name"],
-                values.get("description", ""),
-                values["price"],
-                values.get("pending_price"),
-                category,
-                values.get("inventory", 0),
-                values.get("prep_time", 10),
-                1 if values.get("available", True) else 0,
-                1 if is_combo else 0,
-                str(values.get("combo_items", "") or ""),
-            ),
-        )
+        """
+        if values.get("id"):
+            # Caller-supplied id: honour it verbatim (imports / fixtures).
+            product_id = values["id"]
+            connection.execute(
+                _insert_sql,
+                (
+                    product_id, values["shop_id"], values["name"],
+                    values.get("description", ""), values["price"],
+                    values.get("pending_price"), category,
+                    values.get("inventory", 0), values.get("prep_time", 10),
+                    1 if values.get("available", True) else 0,
+                    1 if is_combo else 0,
+                    str(values.get("combo_items", "") or ""),
+                ),
+            )
+        else:
+            product_id = _insert_with_suffixed_id(
+                connection, "products", "p", _insert_sql,
+                lambda rid: (
+                    rid, values["shop_id"], values["name"],
+                    values.get("description", ""), values["price"],
+                    values.get("pending_price"), category,
+                    values.get("inventory", 0), values.get("prep_time", 10),
+                    1 if values.get("available", True) else 0,
+                    1 if is_combo else 0,
+                    str(values.get("combo_items", "") or ""),
+                ),
+            )
         row = connection.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
         return dict(row)
 
@@ -1691,8 +1772,12 @@ def create_parent_order(
         if not sub_orders:
             raise ValueError("No valid shops or items in order")
 
-        connection.execute(
-            """
+        # PENTEST/RELIABILITY FIX — mirrors the Supabase store. The token is read
+        # with MAX(token)+1 and then INSERTed, and nothing serialises the gap, so
+        # two concurrent baskets can build the same parent id. A collision used to
+        # abort the whole request (and, in Postgres, could leave already-consumed
+        # batch stock stranded). Retry on the real UNIQUE violation instead.
+        parent_sql = """
             INSERT INTO parent_orders (
                 id, token, student_name, student_phone, student_email,
                 student_id, owner_user_id, total, payment_method, payment_status,
@@ -1702,20 +1787,33 @@ def create_parent_order(
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?, 'Pending',
                 strftime('%Y-%m-%d %H:%M:%S', 'now', '+05:30')
             )
-            """,
-            (
-                parent_id,
-                token,
-                student_name,
-                student_phone,
-                student_email,
-                student_id,
-                owner_user_id,
-                grand_total,
-                payment_method,
-                delivery_location,
-            ),
-        )
+            """
+        for _attempt in range(5):
+            try:
+                connection.execute(
+                    parent_sql,
+                    (
+                        parent_id,
+                        token,
+                        student_name,
+                        student_phone,
+                        student_email,
+                        student_id,
+                        owner_user_id,
+                        grand_total,
+                        payment_method,
+                        delivery_location,
+                    ),
+                )
+                break
+            except sqlite3.IntegrityError as exc:
+                message = str(exc).lower()
+                if "unique" not in message and "primary key" not in message:
+                    raise
+                if _attempt == 4:
+                    raise
+                token = consume_token(connection=connection)
+                parent_id = f"p{today_key}-{token}"
 
         row = connection.execute(
             "SELECT * FROM parent_orders WHERE id = ?", (parent_id,)
@@ -2275,13 +2373,11 @@ def log_whatsapp(
 ) -> dict[str, Any] | None:
     """Persist one WhatsApp notification (link generated, ready to send)."""
     with _connect() as connection:
-        next_id = connection.execute(
-            "SELECT COALESCE(MAX(CAST(substr(id, 2) AS INTEGER)), 0) + 1 FROM whatsapp_logs"
-        ).fetchone()[0]
-        wa_id = f"w{next_id}"
-        connection.execute(
-            "INSERT INTO whatsapp_logs (id, sub_order_id, phone, message, url, status) VALUES (?, ?, ?, ?, ?, ?)",
-            (wa_id, sub_order_id, phone or "", message or "", url or "", status),
+        wa_id = _insert_with_suffixed_id(
+            connection, "whatsapp_logs", "w",
+            "INSERT INTO whatsapp_logs (id, sub_order_id, phone, message, url, status)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            lambda rid: (rid, sub_order_id, phone or "", message or "", url or "", status),
         )
         row = connection.execute("SELECT * FROM whatsapp_logs WHERE id = ?", (wa_id,)).fetchone()
         return dict(row) if row else None
@@ -2325,13 +2421,11 @@ def log_sms(
 ) -> dict[str, Any] | None:
     """Persist one SMS (out = sent to a phone, in = received from a phone)."""
     with _connect() as connection:
-        next_id = connection.execute(
-            "SELECT COALESCE(MAX(CAST(substr(id, 2) AS INTEGER)), 0) + 1 FROM sms_logs"
-        ).fetchone()[0]
-        sms_id = f"s{next_id}"
-        connection.execute(
-            "INSERT INTO sms_logs (id, sub_order_id, phone, message, direction, status) VALUES (?, ?, ?, ?, ?, ?)",
-            (sms_id, sub_order_id, phone or "", message or "", direction, status),
+        sms_id = _insert_with_suffixed_id(
+            connection, "sms_logs", "s",
+            "INSERT INTO sms_logs (id, sub_order_id, phone, message, direction, status)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            lambda rid: (rid, sub_order_id, phone or "", message or "", direction, status),
         )
         row = connection.execute("SELECT * FROM sms_logs WHERE id = ?", (sms_id,)).fetchone()
         return dict(row) if row else None
@@ -2662,23 +2756,24 @@ def create_notification(
     order_id: str | None = None,
     status: str | None = None,
     target_role: str | None = None,
+    action: str = "",
+    action_state: str = "none",
     connection: Any | None = None,
 ) -> dict[str, Any] | None:
+    """Insert one notification, optionally carrying an inline admin action
+    (``action="confirm_order"`` + ``action_state="pending"``). Mirrors the
+    Supabase store exactly so tests cover the production shape."""
     owns_connection = connection is None
     active_connection = connection or _connect()
     try:
-        # Collision-proof id (MAX, not COUNT) so deleted notification rows can
-        # never make the next insert fail with a duplicate-key error.
-        next_id = active_connection.execute(
-            "SELECT COALESCE(MAX(CAST(substr(id, 2) AS INTEGER)), 0) + 1 FROM notifications"
-        ).fetchone()[0]
-        notification_id = f"n{next_id}"
-        active_connection.execute(
-            """
-            INSERT INTO notifications (id, title, message, order_id, status, target_role)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (notification_id, title, message, order_id, status, target_role),
+        # MAX (not COUNT) so deletes can never reuse an id, AND a retry on a
+        # concurrent collision so a lost insert can never drop the admin's
+        # "confirm this order" queue row (see _next_suffixed_id).
+        notification_id = _insert_with_suffixed_id(
+            active_connection, "notifications", "n",
+            "INSERT INTO notifications (id, title, message, order_id, status, target_role, action, action_state)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            lambda rid: (rid, title, message, order_id, status, target_role, action or "", action_state or "none"),
         )
         row = active_connection.execute(
             "SELECT * FROM notifications WHERE id = ?",
@@ -2692,18 +2787,61 @@ def create_notification(
             active_connection.close()
 
 
+# Kept in sync with supabase_db.NOTIFICATION_LIST_LIMIT.
+NOTIFICATION_LIST_LIMIT = 60
+
+
 def list_notifications(role: str | None = None) -> list[dict[str, Any]]:
     """List notifications. When ``role`` is given, only notifications targeted at
-    that exact role are returned (strict role separation)."""
+    that exact role are returned (strict role separation). Rows that still carry
+    a PENDING admin action sort to the top so an un-confirmed order is never
+    truncated away from the bell."""
     with _connect() as connection:
+        pending_first = (
+            "ORDER BY (CASE WHEN action <> '' AND action_state = 'pending' THEN 0 ELSE 1 END), rowid DESC"
+        )
         if role:
             rows = connection.execute(
-                "SELECT * FROM notifications WHERE target_role = ? ORDER BY rowid DESC LIMIT 20",
-                (role,),
+                f"SELECT * FROM notifications WHERE target_role = ? {pending_first} LIMIT ?",
+                (role, NOTIFICATION_LIST_LIMIT),
             ).fetchall()
         else:
-            rows = connection.execute("SELECT * FROM notifications ORDER BY rowid DESC LIMIT 20").fetchall()
+            rows = connection.execute(
+                f"SELECT * FROM notifications {pending_first} LIMIT ?",
+                (NOTIFICATION_LIST_LIMIT,),
+            ).fetchall()
         return _rows_to_dicts(rows)
+
+
+def list_actionable_notifications(action: str, action_state: str = "pending") -> list[dict[str, Any]]:
+    """Every notification carrying a given inline action in a given state."""
+    with _connect() as connection:
+        rows = connection.execute(
+            """SELECT * FROM notifications
+               WHERE action = ? AND action_state = ?
+               ORDER BY rowid DESC LIMIT 50""",
+            (action, action_state),
+        ).fetchall()
+        return _rows_to_dicts(rows)
+
+
+def set_notification_action_state(notification_id: str, action_state: str) -> dict[str, Any] | None:
+    """Move a notification's inline action to a new state (pending → done)."""
+    with _connect() as connection:
+        exists = connection.execute(
+            "SELECT id FROM notifications WHERE id = ?", (notification_id,)
+        ).fetchone()
+        if not exists:
+            return None
+        connection.execute(
+            "UPDATE notifications SET action_state = ? WHERE id = ?",
+            (action_state, notification_id),
+        )
+        row = connection.execute(
+            "SELECT * FROM notifications WHERE id = ?", (notification_id,)
+        ).fetchone()
+        connection.commit()
+        return dict(row) if row else None
 
 
 # ─── Web push subscriptions (vendor order notifications) ───
@@ -2909,11 +3047,8 @@ def create_site_feedback(values: dict[str, Any]) -> dict[str, Any] | None:
     with _connect() as connection:
         # Collision-proof id (MAX, not COUNT) so deleted rows never cause the
         # next insert to fail with a duplicate-key error.
-        next_id = connection.execute(
-            "SELECT COALESCE(MAX(CAST(substr(id, 3) AS INTEGER)), 0) + 1 FROM site_feedback"
-        ).fetchone()[0]
-        feedback_id = f"fb{next_id}"
-        connection.execute(
+        feedback_id = _insert_with_suffixed_id(
+            connection, "site_feedback", "fb",
             """
             INSERT INTO site_feedback (
                 id, user_id, username, name, email, category,
@@ -2921,8 +3056,8 @@ def create_site_feedback(values: dict[str, Any]) -> dict[str, Any] | None:
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Open', ?)
             """,
-            (
-                feedback_id,
+            lambda rid: (
+                rid,
                 values.get("user_id"),
                 values.get("username", ""),
                 values.get("name", ""),
@@ -3016,10 +3151,6 @@ def delete_site_feedback(source: str | None = None) -> int:
 def create_review(values: dict[str, Any]) -> dict[str, Any] | None:
     """Save a student's shop review. The admin sees it on the Reviews page."""
     with _connect() as connection:
-        next_id = connection.execute(
-            "SELECT COALESCE(MAX(CAST(substr(id, 3) AS INTEGER)), 0) + 1 FROM reviews"
-        ).fetchone()[0]
-        review_id = f"rv{next_id}"
         # Resolve shop name if only shop_id was provided.
         shop_name = values.get("shop_name", "")
         if not shop_name and values.get("shop_id"):
@@ -3031,13 +3162,14 @@ def create_review(values: dict[str, Any]) -> dict[str, Any] | None:
                     shop_name = shop["name"]
             except Exception:
                 pass
-        connection.execute(
+        review_id = _insert_with_suffixed_id(
+            connection, "reviews", "rv",
             """
             INSERT INTO reviews (id, user_id, username, student_name, shop_id, shop_name, rating, comment)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                review_id,
+            lambda rid: (
+                rid,
                 values.get("user_id"),
                 values.get("username", ""),
                 values.get("student_name", ""),

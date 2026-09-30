@@ -248,7 +248,19 @@ from app.core import embedded_redis, read_cache, redis_cache, shared_cache, ttl_
 async def cache_invalidation_middleware(request: Request, call_next):
     response = await call_next(request)
     if request.method in ("POST", "PUT", "PATCH", "DELETE") and response.status_code < 400:
-        await read_cache.clear()
+        # Every cached portal (admin/shopkeeper lists) must stop serving the old
+        # rows once an action lands — otherwise a confirmed order keeps showing
+        # as "pending" until the TTL runs out.
+        #
+        # This used to `await read_cache.clear()` UNBOUNDED, so every order
+        # placement, payment and profile write paid for a Redis round trip AND a
+        # Postgres round trip before the response could go out. `clear_bounded`
+        # drops this instance's copy instantly (so the write's own instance is
+        # already fresh) and gives the shared layers a 0.25 s budget; every shared
+        # entry has a TTL anyway, so blowing the budget degrades to "at most a few
+        # more seconds of staleness on another instance" instead of "the user's
+        # request hangs on a slow cache".
+        await read_cache.clear_bounded()
     return response
 
 

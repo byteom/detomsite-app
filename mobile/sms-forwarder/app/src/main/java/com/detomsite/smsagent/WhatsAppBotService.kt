@@ -115,8 +115,10 @@ class WhatsAppBotService : Service() {
 
     private fun baseUrl(): String {
         val p = getSharedPreferences("agent", Context.MODE_PRIVATE)
-        return (p.getString("base_url", "").orEmpty()
-            .substringBefore("/api/v1").trimEnd('/'))
+        // Normalised for the same reason as the SMS path: a value saved before
+        // normalisation (or typed without https://) would otherwise make the
+        // WhatsApp queue poll fail forever with no visible error.
+        return normalizeBackendUrl(p.getString("base_url", "").orEmpty())
     }
 
     private suspend fun awaitOutbox() {

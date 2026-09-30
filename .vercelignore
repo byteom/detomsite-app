@@ -34,3 +34,17 @@
 
 # Local build output — Vercel runs the build itself.
 /frontend/*/dist/
+
+# SECRETS — never upload. Deploys run from the repo root, and .gitignore does
+# NOT stop the Vercel CLI: it uploads by .vercelignore, so backend/.env was
+# being shipped to production on every backend deploy. That file holds real
+# values (SUPABASE keys, JWT_SECRET, SMS_FORWARD_KEY), and pydantic-settings
+# reads it via env_file=".env" at runtime — so the deployed server silently
+# preferred the committed file over the Vercel environment variables. Set
+# secrets in Vercel (`vercel env add`), never in a file.
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+**/.env.example

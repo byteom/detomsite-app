@@ -146,6 +146,12 @@ create table if not exists public.notifications (
 );
 create index if not exists idx_notifications_target_role on public.notifications (target_role);
 
+-- Inline admin action carried by a notification (e.g. "confirm this order"
+-- straight from the bell). '' / 'none' = no action.
+alter table public.notifications add column if not exists action text not null default '';
+alter table public.notifications add column if not exists action_state text not null default 'none';
+create index if not exists idx_notifications_action on public.notifications (action, action_state);
+
 -- ─── App settings (payment toggles, UPI id, etc.) ───
 create table if not exists public.app_settings (
   key text primary key,

@@ -523,11 +523,17 @@ class LocalAuthLogin(BaseModel):
 class LocalPhoneOnboarding(BaseModel):
     """Students joining from the student portal phone gate — name + mobile.
     A real account (and its JWT) is created behind the scenes so the rest of
-    the order/payment flow works exactly like a password-login account."""
+    the order/payment flow works exactly like a password-login account.
+
+    ``password`` is required to SIGN BACK IN to an account that already exists
+    (see the endpoint). It is ignored when creating a brand-new account, where
+    the server generates one and returns it once.
+    """
     name: str = Field(..., min_length=1, max_length=100)
     phone: str = Field(..., min_length=7, max_length=20)
     campus: str = Field(default="", max_length=100)
     default_delivery_location: str = Field(default="", max_length=300)
+    password: str = Field(default="", max_length=128)
 
 
 class LocalAuthUser(BaseModel):
@@ -545,6 +551,11 @@ class LocalAuthResponse(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     user: LocalAuthUser
+    # Returned ONLY on the call that CREATES a phone account, and only once:
+    # it is the account's password, which the student must save to sign back in.
+    # Never populated for an account that already existed — that would hand a
+    # fresh password to anyone who knows a phone number.
+    generated_password: Optional[str] = None
 
 
 # ─── Helper to extract current user from JWT ───
@@ -770,13 +781,31 @@ async def local_login(data: LocalAuthLogin, request: Request):
 async def local_phone_onboarding(data: LocalPhoneOnboarding, request: Request):
     """Phone-first student onboarding (the student portal RoleGate).
 
-    Creates or re-uses a ``student`` account keyed by phone and returns a real
-    JWT, so payments/order APIs that need an authenticated user keep working —
-    the student never has to remember a password.
+    Creates a ``student`` account keyed by phone and returns a real JWT, so
+    payments/order APIs that need an authenticated user keep working.
+
+    SECURITY FIX (account takeover). This used to hand a valid access token to
+    ANYONE who posted a phone number — a brand-new account when the number was
+    unknown, and **the victim's own account** when it was not. A phone number is
+    not a secret: campus numbers are often sequential, visible, or simply known
+    by a classmate, so "know the number" was equivalent to "log in as them" and
+    handed over their orders, delivery address and payment state. Proven live
+    (see tests/test_phone_auth_takeover.py).
+
+    Creating an account stays frictionless, but the generated password is now
+    RETURNED ONCE so the student can save it, and signing back in REQUIRES it.
+    The password was always generated and hashed here; it was simply thrown
+    away, so returning it costs nothing and breaks nobody.
     """
     ip = rate_ip(request)
-    if not rate_allow("phone_onboard", f"{data.phone}:{ip}", max_attempts=30, window_sec=300):
+    # Throttled per PHONE *and* per IP as two INDEPENDENT buckets. The old
+    # single bucket was keyed on (phone, ip), so an attacker guessing passwords
+    # could rotate source addresses and try indefinitely; neither limit can now
+    # be side-stepped by changing the other.
+    if not rate_allow("phone_onboard_ip", ip, max_attempts=20, window_sec=300):
         raise HTTPException(status_code=429, detail="Too many attempts from this device — please wait a few minutes.")
+    if not rate_allow("phone_onboard_no", data.phone, max_attempts=10, window_sec=300):
+        raise HTTPException(status_code=429, detail="Too many attempts for this number — please wait a few minutes.")
 
     phone = _normalize_phone(data.phone.strip())
     digits = "".join(ch for ch in phone if ch.isdigit())
@@ -785,14 +814,29 @@ async def local_phone_onboarding(data: LocalPhoneOnboarding, request: Request):
 
     username = f"stu_{digits[-10:]}"
     name = (data.name or "").strip() or "Student"
+    # One wording for "no password" and "wrong password" alike, so the response
+    # never reveals whether a number is registered.
+    _signed_in_msg = (
+        "This number is already registered. Enter the password you were given when "
+        'you joined, or use "Forgot password" to reset it.'
+    )
 
     user = await _db(db.get_user_by_username, username)
+    generated_password: str | None = None
+
     if user:
-        # Returning phone student — just re-issue a fresh token for them.
-        pass
+        # RETURNING student — this is a LOGIN, so it needs proof of possession of
+        # the account. Without it we would be the vulnerability described above.
+        if not data.password:
+            raise HTTPException(status_code=401, detail=_signed_in_msg)
+        stored_hash = user.get("password_hash") or ""
+        ok = await asyncio.to_thread(verify_password, data.password, stored_hash)
+        if not ok:
+            raise HTTPException(status_code=401, detail=_signed_in_msg)
+        logger.info(f"Phone sign-in for {username}")
     else:
         pick_name = name or phone
-        random_pw = secrets.token_urlsafe(16)
+        random_pw = secrets.token_urlsafe(9)
         password_hash_value = await asyncio.to_thread(hash_password, random_pw)
         new_user, conflict = await _db(
             db.register_user,
@@ -806,6 +850,8 @@ async def local_phone_onboarding(data: LocalPhoneOnboarding, request: Request):
         if conflict or not new_user:
             raise HTTPException(status_code=409, detail="Could not create your student account — please try again.")
         user = new_user
+        # Shown to the student exactly once, so they can sign back in.
+        generated_password = random_pw
         logger.info(f"Phone-onboarding created student account {username}")
 
     token_data = {
@@ -828,6 +874,10 @@ async def local_phone_onboarding(data: LocalPhoneOnboarding, request: Request):
             role="student",
             created_at=user["created_at"],
         ),
+        # Non-null ONLY on the call that created the account — the one moment
+        # the student can be shown their password. Every later sign-in returns
+        # null, so this can never be used to reset someone's password.
+        generated_password=generated_password,
     )
 
 
@@ -927,9 +977,71 @@ async def create_session(data: LocalSessionCreate, request: Request, _user: dict
     return await _db(persist_user_profile, data.email, data.name, data.role)
 
 
+# Fields a shop row carries that must NEVER reach an unauthenticated caller.
+#
+# PENTEST FIX (data exposure). ``GET /shops`` and ``GET /shops/{id}`` are
+# deliberately public — a student has to browse menus before logging in — but
+# they were returning the RAW store row, which also carried:
+#
+#   admin_dues_balance / admin_dues_last_paid_at — the platform's private ledger
+#       of what each vendor owes. Purely internal money data.
+#   revenue_today / orders_today — a vendor's live business metrics. Leaking
+#       these to any anonymous visitor is competitive intelligence.
+#   shopkeeper_email / whatsapp_number — the vendor's private contact details.
+#       ``phone`` is already public by design (students tap to call the shop),
+#       but the vendor's login email and personal WhatsApp are not.
+#
+# None of these are read by any student-facing screen: they are only used by the
+# admin dashboard and the shopkeeper's own dashboard, both of which are behind
+# ``_require_admin`` / an authenticated vendor session. So dropping them from the
+# public projection breaks nothing and closes the leak.
+_PUBLIC_SHOP_FIELDS = frozenset({
+    "id", "name", "category", "description", "rating",
+    "opening_time", "closing_time", "present", "status",
+    "approval_status", "phone", "shop_image", "prep_time",
+    "upi_id", "upi_enabled", "cod_enabled", "is_featured",
+    "ordering_position", "current_token", "shopkeeper_name",
+})
+
+
+def _public_shop(shop: dict) -> dict:
+    """Strip internal/vendor-private fields from a shop row for public callers."""
+    return {k: v for k, v in shop.items() if k in _PUBLIC_SHOP_FIELDS}
+
+
+def _optional_user(authorization: Optional[str] = Header(None)) -> Optional[dict]:
+    """Best-effort identity for endpoints that are public but richer when logged in.
+
+    Returns None instead of raising, so a public endpoint stays public — it just
+    serves the full row to a staff member and the redacted one to everyone else.
+    """
+    if not authorization:
+        return None
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return None
+    try:
+        return decode_token(token)
+    except Exception:  # noqa: BLE001 - a bad token is simply "not logged in"
+        return None
+
+
+def _is_staff(user: Optional[dict]) -> bool:
+    return bool(user) and user.get("role") in ("admin", "shopkeeper", "vendor")
+
+
 @router.get("/shops")
-async def shops(public_only: bool = False):
-    return await _cached_read(10, "shops", db.list_shops, public_only=public_only)
+async def shops(public_only: bool = False, user: Optional[dict] = Depends(_optional_user)):
+    """List shops.
+
+    ``public_only`` keeps the browser-facing menu list to APPROVED, non-removed
+    shops. The response is redacted unless the caller is staff, because this
+    endpoint is reachable without a token.
+    """
+    rows = await _cached_read(10, "shops", db.list_shops, public_only=public_only)
+    if _is_staff(user):
+        return rows
+    return [_public_shop(s) for s in rows]
 
 
 @router.post("/shops")
@@ -946,11 +1058,15 @@ async def patch_shop(shop_id: str, data: LocalShopUpdate, _admin: dict = Depends
 
 
 @router.get("/shops/{shop_id}")
-async def shop(shop_id: str):
+async def shop(shop_id: str, user: Optional[dict] = Depends(_optional_user)):
     result = await _db(db.get_shop, shop_id)
     if not result:
         raise HTTPException(status_code=404, detail="Shop not found")
-    return result
+    # Same redaction as the list endpoint: this one is public too (the student
+    # app resolves the shop to read its UPI id for the payment QR).
+    if _is_staff(user):
+        return result
+    return _public_shop(result)
 
 
 @router.get("/products")
@@ -1123,12 +1239,26 @@ async def add_order(data: LocalOrderCreate, current_user: dict = Depends(get_cur
 
     # Fire the vendor's phone notification without blocking the student's
     # response — the web push runs in a worker thread (fire-and-forget).
-    try:
-        asyncio.get_running_loop().create_task(
-            push_service.notify_shop_new_order_async(order)
-        )
-    except Exception as e:
-        logger.warning(f"Could not schedule order push notification: {e}")
+    #
+    # PREPAID ORDERS ARE HELD BACK UNTIL PAID. A UPI order must not reach the
+    # shop before the money is in: an unpaid order that the kitchen starts
+    # preparing is a lost meal and a wasted prep slot. The notification is
+    # therefore sent from the payment-confirmed path instead (see
+    # _notify_shop_of_paid_order), so a shop only ever sees work it will be paid
+    # for.
+    #
+    # COD IS THE EXCEPTION AND MUST STAY IMMEDIATE. Cash is collected ON
+    # DELIVERY, so payment can only ever be confirmed after the shop has already
+    # cooked and handed the order over. Gating COD on payment would mean the shop
+    # never learns about the order and the student waits forever.
+    is_cash_on_delivery = str(order.get("payment_method") or "").upper() == "COD"
+    if is_cash_on_delivery:
+        try:
+            asyncio.get_running_loop().create_task(
+                push_service.notify_shop_new_order_async(order)
+            )
+        except Exception as e:
+            logger.warning(f"Could not schedule order push notification: {e}")
 
     # SMS the shopkeeper (and a copy to the admin) + queue the shopkeeper's
     # WhatsApp. This MUST be awaited, not fired-and-forgotten: on the serverless
@@ -1136,12 +1266,100 @@ async def add_order(data: LocalOrderCreate, current_user: dict = Depends(get_cur
     # returns, so a create_task here would silently drop the order's WhatsApp
     # notification (which the phone bot then never receives). Awaiting keeps
     # the ordering latency at ~SMS-log cost and guarantees the notification.
+    if is_cash_on_delivery:
+        try:
+            await _notify_order_via_sms(order)
+        except Exception as e:
+            logger.warning(f"Could not send order notifications: {e}")
+    else:
+        logger.info(
+            f"Order {order.get('id')} ({order.get('token')}) is prepaid — holding it back "
+            f"from the shop until payment is confirmed."
+        )
+
+    # The admin's confirmation queue. Awaited for the same serverless reason as
+    # the WhatsApp above — a fire-and-forget notification here is exactly how an
+    # order ends up placed but never confirmed.
+    #
+    # The admin still sees UNPAID prepaid orders on purpose: they are the safety
+    # net. If a bank credit is never matched (SMS agent not installed, key
+    # wrong, no SMS), the shop deliberately never hears about the order, so the
+    # admin is the only person who can see it and release it by hand. Without
+    # this a stranded payment would be invisible and simply lost.
+    try:
+        await _notify_admin_of_new_order(order)
+    except Exception as e:
+        logger.warning(f"Could not queue the admin confirmation for {order.get('id')}: {e}")
+
+    return order
+
+
+async def _notify_shop_of_paid_order(order: dict) -> None:
+    """Tell the shop an order is theirs — called when a prepaid order is PAID.
+
+    This is the release point for held-back orders. It is deliberately
+    fire-and-forget-safe: every channel is wrapped so a delivery failure can
+    never break the payment confirmation that already succeeded. A shop that
+    misses the WhatsApp still has the order in its portal, because the order
+    itself is only visible to the shop once it is paid.
+    """
+    if not order or not order.get("id"):
+        return
+    try:
+        asyncio.get_running_loop().create_task(
+            push_service.notify_shop_new_order_async(order)
+        )
+    except Exception as e:
+        logger.warning(f"Could not schedule paid-order push for {order.get('id')}: {e}")
     try:
         await _notify_order_via_sms(order)
     except Exception as e:
-        logger.warning(f"Could not send order notifications: {e}")
+        logger.warning(f"Could not send paid-order notifications for {order.get('id')}: {e}")
 
-    return order
+
+async def _notify_admin_of_new_order(order: dict) -> None:
+    """Put a freshly placed order in the ADMIN's confirmation queue.
+
+    Writes one ``target_role="admin"`` notification carrying an inline
+    ``action="confirm_order"``, which is what puts a Confirm button directly in
+    the admin's notification bell (and on the Approvals page). Once the admin
+    confirms, the student can download their payment QR and pay from their own
+    UPI app.
+
+    The admin's phone is also pinged (web push) so the queue is noticed even when
+    the portal sits on another tab. Never raises.
+    """
+    if not order or not order.get("id"):
+        return
+    token = order.get("token")
+    student = str(order.get("student_name") or "").strip() or "A student"
+    shop = str(order.get("shop_name") or "").strip() or "a shop"
+    total = order.get("total") or 0
+    method = str(order.get("payment_method") or "UPI").upper()
+    method_label = "Cash on Delivery" if method == "COD" else method
+    message = (
+        f"{student} ordered {order.get('items') or 'food'} from {shop} — "
+        f"{method_label} ₹{total}. Tap Confirm to approve the order."
+    )
+    try:
+        await _db(
+            db.create_notification,
+            title=f"New order #{token} — confirm",
+            message=message,
+            order_id=order["id"],
+            status=order.get("status"),
+            target_role="admin",
+            action="confirm_order",
+            action_state="pending",
+        )
+    except Exception as e:
+        logger.warning(f"Admin order notification error for {order.get('id')}: {e}")
+        return
+    _push_admin(
+        f"New order #{token} — confirm",
+        message,
+        tag=f"order-confirm-{order['id']}",
+    )
 
 
 @router.patch("/orders/{order_id}/status")
@@ -1857,6 +2075,12 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
 
         await _db(db.update_payment_status, payment["id"], "Success")
 
+        # RELEASE POINT: a prepaid order was held back from the shop at creation
+        # time, so the bank credit matching here is the moment the shop finally
+        # hears about it. Without this the student would have paid for an order
+        # the kitchen never knew existed.
+        await _notify_shop_of_paid_order(order)
+
         # The order is settled the moment the bank evidence matches, so it goes
         # straight to Completed — the student has paid and the platform has
         # confirmed it, so there is no prep/ready state left to walk through.
@@ -2346,6 +2570,18 @@ async def patch_payment_status(payment_id: str, data: LocalPaymentStatusUpdate, 
     payment = await _db(db.update_payment_status, payment_id, data.status)
     if not payment:
         raise HTTPException(status_code=404, detail="Payment not found")
+
+    # RELEASE POINT (manual path). This is also the safety net for a stranded
+    # payment: if the bank SMS never matched (agent not installed, key wrong), the
+    # admin can mark the payment paid by hand and the shop is notified here. A
+    # held-back order must never be a dead end with no way out.
+    if str(data.status or "").upper() == "SUCCESS":
+        order_id = str(payment.get("order_id") or "")
+        if order_id:
+            order = await _db(db.get_order, order_id)
+            if order:
+                await _notify_shop_of_paid_order(order)
+
     return payment
 
 
@@ -2647,6 +2883,25 @@ async def create_multi_shop_order(data: LocalMultiShopOrder, current_user: dict 
                     await _notify_shop_via_whatsapp(wa_order, shop, wa_phone)
             except Exception as e:
                 logger.warning(f"Could not schedule sub-order WhatsApp for {sub.get('id')}: {e}")
+
+    # The admin's confirmation queue, one row per shop sub-order. Awaited (not
+    # fire-and-forget) for the same serverless reason as the single-shop path:
+    # a dropped background task here is exactly how a combo order ends up placed
+    # but never confirmed.
+    for sub in parent.get("sub_orders", []):
+        try:
+            await _notify_admin_of_new_order({
+                "id": sub["id"],
+                "token": sub["token"],
+                "shop_name": sub.get("shop_name") or "",
+                "items": sub.get("items_summary") or "",
+                "total": sub.get("subtotal") or 0,
+                "student_name": parent.get("student_name", ""),
+                "payment_method": parent.get("payment_method", "UPI"),
+                "status": sub.get("status", ""),
+            })
+        except Exception as e:
+            logger.warning(f"Could not queue the admin confirmation for {sub.get('id')}: {e}")
 
     return parent
 

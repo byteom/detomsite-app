@@ -29,6 +29,9 @@ const DEVICE_KEY = 'detomsite-checkout-profile'
 export interface CheckoutProfile {
   phone?: string
   location?: string
+  /* Carried from checkout to the payment page so the delivery slot survives the
+     hop between the two screens. */
+  slot?: string
 }
 
 export function getCheckoutProfile(): CheckoutProfile {

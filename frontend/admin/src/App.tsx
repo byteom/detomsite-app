@@ -1,6 +1,8 @@
-import { useState, useEffect, FormEvent, useRef } from 'react'
+import { useState, useEffect, FormEvent, useRef, useCallback } from 'react'
 import { BrowserRouter as Router, Routes, Route, Link, useNavigate, useLocation } from 'react-router-dom'
-import api from './services/api'
+import api, { dedupeGet } from './services/api'
+import { usePolling } from './hooks/usePolling'
+import ApprovalsPage from './pages/ApprovalsPage'
 
 function apiError(e: any, fb = 'Request failed') {
   const d = e?.response?.data?.detail
@@ -153,15 +155,43 @@ function Layout({ children }: { children: React.ReactNode }) {
     return () => document.removeEventListener('mousedown', onOutside)
   }, [])
 
-  useEffect(() => {
-    // Admin bell — vendor product changes & new registrations land here.
-    // Only polls while the tab is actually visible, so a backgrounded admin
-    // tab stops hammering the backend.
-    const load = () => { if (document.visibilityState === 'visible') api.get('/admin/notifications').then(r => setNotifs(r.data || [])).catch(() => {}) }
-    load(); const t = setInterval(load, 30000); return () => clearInterval(t)
+  const [busyConfirm, setBusyConfirm] = useState<string>('')
+  const [notifMsg, setNotifMsg] = useState('')
+
+  const loadNotifs = useCallback(() => {
+    if (document.visibilityState !== 'visible') return
+    dedupeGet('/admin/notifications')
+      .then((r: any) => setNotifs(r.data || []))
+      .catch(() => { /* keep the last known bell through a network blip */ })
   }, [])
+
+  /* The admin bell — vendor product changes, new registrations, and every new
+     order waiting for a Confirm tap. Visibility-aware, de-duplicated and never
+     overlapping a tick, so the portal stops feeling like it reloads itself in
+     the background. */
+  const { pollNow: reloadNotifs } = usePolling(loadNotifs, 20000, [])
+
+  /* Confirm straight from the bell: the order moves to Confirmed, the queue row
+     is settled server-side, and the bell refreshes immediately so the button can
+     never sit there stale. */
+  const confirmFromBell = async (n: any) => {
+    if (!n?.order_id || busyConfirm) return
+    setBusyConfirm(n.id)
+    setNotifMsg('')
+    try {
+      const r = await api.post(`/admin/orders/${n.order_id}/confirm`, { notification_id: n.id })
+      setNotifMsg(r.data?.message || 'Order confirmed')
+      setNotifs(list => list.map(x => (x.id === n.id ? { ...x, action_state: 'done' } : x)))
+      reloadNotifs()
+    } catch (e: any) {
+      setNotifMsg(apiError(e, 'Could not confirm this order'))
+    } finally {
+      setBusyConfirm('')
+    }
+  }
   const nav = [
     { p: '/dashboard', l: 'Dashboard' },
+    { p: '/approvals', l: 'Approvals' },
     { p: '/users', l: 'Users' },
     { p: '/vendors', l: 'Vendors' },
     { p: '/orders', l: 'Orders' },
@@ -173,6 +203,14 @@ function Layout({ children }: { children: React.ReactNode }) {
     { p: '/reviews', l: 'Reviews' },
     { p: '/settings', l: 'Settings' },
   ]
+
+  /* How many orders still owe the admin a Confirm tap. Derived from the rows the
+     bell already fetched — no extra request, so the badge is always in step with
+     the list it labels. */
+  const pendingConfirmCount = notifs.filter(
+    n => n?.action === 'confirm_order' && n?.action_state === 'pending' && n?.order_id,
+  ).length
+
   return (
     <div className="min-h-screen bg-gray-950">
       <nav className="sticky top-0 z-50 border-b border-gray-800 bg-gray-950/90 backdrop-blur-lg">
@@ -190,18 +228,53 @@ function Layout({ children }: { children: React.ReactNode }) {
             <div ref={notifRef} className="relative">
               <button onClick={() => setNotifOpen(!notifOpen)} className="rounded-pill px-2 py-2 text-sm text-gray-400 transition-all hover:bg-gray-800 hover:text-white">
                 <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M6 9a6 6 0 1 1 12 0c0 5 2 6 2 6H4s2-1 2-6Z" /><path d="M10 20a2.2 2.2 0 0 0 4 0" /></svg>
-                {notifs.length > 0 && <span className="ml-1 text-xs font-bold text-gold">{notifs.length}</span>}
+                {pendingConfirmCount > 0
+                  ? <span className="ml-1 inline-flex h-5 min-w-[20px] items-center justify-center rounded-pill bg-gold px-1.5 text-[11px] font-black text-black">{pendingConfirmCount}</span>
+                  : notifs.length > 0 && <span className="ml-1 text-xs font-bold text-gray-500">{notifs.length}</span>}
               </button>
               {notifOpen && (
-                <div className="absolute right-0 top-12 z-50 w-80 rounded-card border border-gray-800 bg-gray-900 p-3 shadow-2xl">
-                  <h3 className="mb-2 px-1 text-sm font-bold text-gold">Notifications</h3>
-                  <div className="max-h-72 space-y-1 overflow-y-auto">
-                    {notifs.map(n => (
-                      <div key={n.id} className="rounded-btn bg-gray-800/60 px-3 py-2.5 text-sm">
-                        <p className="font-semibold text-white">{n.title}</p>
-                        <p className="text-xs text-gray-400">{n.message}</p>
-                      </div>
-                    ))}
+                <div className="absolute right-0 top-12 z-50 w-96 rounded-card border border-gray-800 bg-gray-900 p-3 shadow-2xl">
+                  <div className="mb-2 flex items-center justify-between px-1">
+                    <h3 className="text-sm font-bold text-gold">Notifications</h3>
+                    {pendingConfirmCount > 0 && (
+                      <Link to="/approvals" onClick={() => setNotifOpen(false)} className="text-[11px] font-bold text-gold hover:underline">
+                        {pendingConfirmCount} to confirm →
+                      </Link>
+                    )}
+                  </div>
+                  {notifMsg && (
+                    <p className="mb-2 rounded-btn border border-gray-700 bg-gray-800 px-2.5 py-1.5 text-[11px] font-semibold text-gray-200">{notifMsg}</p>
+                  )}
+                  <div className="max-h-96 space-y-1.5 overflow-y-auto">
+                    {notifs.map(n => {
+                      /* An order notification that still owes the admin a tap
+                         renders its Confirm button right here in the bell. */
+                      const actionable = n.action === 'confirm_order' && n.action_state === 'pending' && n.order_id
+                      return (
+                        <div key={n.id}
+                          className={`rounded-btn px-3 py-2.5 text-sm ${actionable ? 'border border-gold/50 bg-gold/10' : 'bg-gray-800/60'}`}>
+                          <div className="flex items-start justify-between gap-2">
+                            <p className="font-semibold text-white">{n.title}</p>
+                            {actionable && (
+                              <span className="shrink-0 rounded-pill bg-gold px-2 py-0.5 text-[10px] font-black uppercase tracking-wide text-black">Confirm</span>
+                            )}
+                          </div>
+                          <p className="text-xs text-gray-400">{n.message}</p>
+                          {actionable && (
+                            <div className="mt-2 flex gap-2">
+                              <button onClick={() => confirmFromBell(n)} disabled={busyConfirm === n.id}
+                                className="rounded-pill bg-gold px-3 py-1.5 text-xs font-black text-black transition-colors hover:bg-gold/80 disabled:opacity-50">
+                                {busyConfirm === n.id ? 'Confirming…' : 'Confirm order'}
+                              </button>
+                              <Link to="/orders" onClick={() => setNotifOpen(false)}
+                                className="rounded-pill bg-gray-800 px-3 py-1.5 text-xs font-bold text-gray-300 hover:bg-gray-700">
+                                View
+                              </Link>
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
                     {notifs.length === 0 && <p className="px-3 py-2 text-sm text-gray-500">No notifications</p>}
                   </div>
                 </div>
@@ -986,21 +1059,29 @@ function OrdersAdminPage() {
      checks every 10 s, because that is exactly the window in which the shop's
      phone bot flips an order to Completed and the admin needs to see it land.
      Once nothing is pending it relaxes to 30 s, so an idle admin console is
-     not hammering the backend all day. */
+     not hammering the backend all day.
+
+     This used to list `pendingCount` in the effect's dependency array, so every
+     single tick that changed the pending count tore the interval down,
+     re-created it AND fired an extra immediate request — which is precisely
+     the "the orders page keeps reloading" behaviour. `usePolling` takes the
+     cadence as a function and re-times the timer WITHOUT re-running the effect
+     or firing an extra request. */
   const [pendingCount, setPendingCount] = useState(0)
-  useEffect(() => {
-    const load = () => {
-      if (document.visibilityState !== 'visible') return
-      api.get('/admin/orders').then(r => {
-        const list = r.data || []
-        setOrders(list)
-        setPendingCount(list.filter((o: any) => o.status === 'Pending Payment').length)
-      }).finally(() => setLoading(false))
-    }
-    load()
-    const t = setInterval(load, pendingCount > 0 ? 10000 : 30000)
-    return () => clearInterval(t)
-  }, [pendingCount])
+  const pendingRef = useRef(0)
+  pendingRef.current = pendingCount
+
+  const loadOrders = useCallback(() => {
+    if (document.visibilityState !== 'visible') return
+    return dedupeGet('/admin/orders').then((r: any) => {
+      const list = r.data || []
+      setOrders(list)
+      setPendingCount(list.filter((o: any) => o.status === 'Pending Payment').length)
+    }).catch(() => { /* keep the last known list through a blip */ })
+      .finally(() => setLoading(false))
+  }, [])
+
+  usePolling(loadOrders, () => (pendingRef.current > 0 ? 10000 : 30000), [])
   const statuses = ['Pending Acceptance', 'Pending Payment', 'Accepted', 'Completed', 'Cancelled']
   const filtered = orders.filter((o: any) => {
     if (fStatus !== 'all' && o.status !== fStatus) return false
@@ -1050,18 +1131,37 @@ function OrdersAdminPage() {
                   <td className="px-4 py-3"><span className={`rounded-sm px-2 py-0.5 text-xs ${o.status === 'Completed' ? 'bg-primary-dark/30 text-primary' : o.status === 'Cancelled' ? 'bg-red-900/30 text-red-400' : 'bg-gold-light/20 text-gold'}`}>{o.status}</span></td>
                   <td className="px-4 py-3 text-gray-500">{fmtTime(o.created_at) || o.created_at || '—'}</td>
                   <td className="px-4 py-3">
-                    <button
-                      onClick={async () => {
-                        try {
-                          const r = await api.get(`/admin/orders/${o.id}/whatsapp-link`)
-                          window.open(r.data.url, '_blank')
-                        } catch (e: any) {
-                          alert(apiError(e, 'Could not build WhatsApp link for this shop'))
-                        }
-                      }}
-                      title="Send this order to the shop's WhatsApp from your number"
-                      className="rounded bg-emerald-900/40 px-2 py-1 text-xs font-semibold text-emerald-400 hover:bg-emerald-800/50"
-                    >WhatsApp</button>
+                    <div className="flex flex-wrap gap-1.5">
+                      {/* Confirm is offered straight from the order row too — an
+                          admin triaging a list should never have to open the
+                          bell for the one order they are looking at. */}
+                      {['Pending Payment', 'Pending Acceptance', 'Pending', 'Placed', 'Accepted'].includes(o.status) && (
+                        <button
+                          onClick={async () => {
+                            try {
+                              const r = await api.post(`/admin/orders/${o.id}/confirm`)
+                              setOrders(list => list.map(x => x.id === o.id ? { ...x, status: r.data?.order?.status || 'Confirmed' } : x))
+                            } catch (e: any) {
+                              alert(apiError(e, 'Could not confirm this order'))
+                            }
+                          }}
+                          title="Mark this order Confirmed — notifies the student and WhatsApps the shop"
+                          className="rounded bg-gold px-2 py-1 text-xs font-black text-black hover:bg-gold/80"
+                        >Confirm</button>
+                      )}
+                      <button
+                        onClick={async () => {
+                          try {
+                            const r = await api.get(`/admin/orders/${o.id}/whatsapp-link`)
+                            window.open(r.data.url, '_blank')
+                          } catch (e: any) {
+                            alert(apiError(e, 'Could not build WhatsApp link for this shop'))
+                          }
+                        }}
+                        title="Send this order to the shop's WhatsApp from your number"
+                        className="rounded bg-emerald-900/40 px-2 py-1 text-xs font-semibold text-emerald-400 hover:bg-emerald-800/50"
+                      >WhatsApp</button>
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -1825,6 +1925,7 @@ export default function App() {
             <Layout>
               <Routes>
                 <Route path="/dashboard" element={<Dashboard />} />
+                <Route path="/approvals" element={<ApprovalsPage />} />
                 <Route path="/users" element={<UsersPage />} />
                 <Route path="/vendors" element={<VendorsPage />} />
                 <Route path="/orders" element={<OrdersAdminPage />} />

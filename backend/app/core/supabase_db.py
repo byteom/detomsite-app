@@ -175,6 +175,68 @@ def _release(conn: Any, discard: bool = False) -> None:
     _putconn_discarding(pool, conn)
 
 
+def _next_suffixed_id(cursor: Any, table: str, prefix: str) -> str:
+    """Propose the next ``<prefix><n>`` primary key for ``table``.
+
+    PENTEST/RELIABILITY FIX — mirrors ``local_demo_db._next_suffixed_id``. The
+    original code read MAX(id) and then INSERTed that id as a second statement.
+    Nothing serialised the gap, so two concurrent writers derived the SAME id and
+    the loser's INSERT died on the primary key. The callers catch and log, so the
+    app looked healthy while the row was silently gone.
+
+    For ``notifications`` that meant a real, paid order never reached the admin's
+    "confirm this order" queue and was therefore never approved. MAX (rather than
+    COUNT) only protects against DELETED rows, never against concurrency.
+
+    This only PROPOSES an id; the caller must INSERT it through
+    :func:`_insert_with_suffixed_id`, which retries on the real UNIQUE violation.
+    """
+    cursor.execute(
+        f"SELECT COALESCE(MAX(CAST(SUBSTRING(id FROM {len(prefix) + 1}) AS INTEGER)), 0) + 1 AS next FROM {table}"
+    )
+    return f"{prefix}{cursor.fetchone()['next']}"
+
+
+def _insert_with_suffixed_id(
+    cursor: Any,
+    table: str,
+    prefix: str,
+    insert_sql: str,
+    params_for,
+    attempts: int = 25,
+) -> str:
+    """INSERT a row with a generated id, retrying on a primary-key collision.
+
+    The candidate id and the INSERT are attempted together, so a collision costs
+    one extra MAX read instead of losing the write. After a UNIQUE violation the
+    transaction is rolled back to a clean state (``ROLLBACK TO SAVEPOINT``) before
+    retrying, since Postgres aborts the whole transaction on a constraint error.
+
+    ``params_for(row_id)`` builds the parameter tuple for ``insert_sql``.
+    """
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        row_id = _next_suffixed_id(cursor, table, prefix)
+        try:
+            if attempt:
+                # A constraint violation poisoned the transaction; unwind just our
+                # own work so the retry starts clean.
+                cursor.execute("ROLLBACK TO SAVEPOINT suffixed_id_insert")
+            cursor.execute("SAVEPOINT suffixed_id_insert")
+            cursor.execute(insert_sql, params_for(row_id))
+            return row_id
+        except Exception as exc:  # noqa: BLE001
+            sqlstate = getattr(exc, "pgcode", None)
+            is_unique = sqlstate == "23505" or "duplicate key" in str(exc).lower()
+            if not is_unique:
+                raise
+            last_error = exc
+            continue
+    raise RuntimeError(
+        f"Could not allocate a unique id for {table} after {attempts} attempts"
+    ) from last_error
+
+
 def _putconn_discarding(pool: Any, conn: Any) -> None:
     """Hand a dead connection back so the pool forgets its slot.
 
@@ -307,6 +369,16 @@ _MIGRATIONS = [
         paid_at timestamptz
     )
     """,
+    # Admin approval queue. A notification can carry ONE inline action the admin
+    # can take straight from the bell (today: "confirm" a freshly placed order).
+    #   action       — '' | 'confirm_order'
+    #   action_state — 'none' | 'pending' | 'done' | 'dismissed'
+    # Keeping the action ON the notification (instead of a side table) means the
+    # bell, the Approvals page and the confirm endpoint all read the same row, so
+    # a button can never point at an order that was never queued.
+    "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS action text NOT NULL DEFAULT ''",
+    "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS action_state text NOT NULL DEFAULT 'none'",
+    "CREATE INDEX IF NOT EXISTS idx_notifications_action ON notifications (action, action_state)",
     # Browser push subscriptions for vendor order notifications.
     """
     CREATE TABLE IF NOT EXISTS push_subscriptions (
@@ -761,25 +833,17 @@ def create_product(values: dict[str, Any]) -> dict[str, Any]:
 def _create_product_impl(values: dict[str, Any]) -> dict[str, Any]:
     with _DBContext(_connect()) as connection:
         with connection.cursor() as cursor:
-            product_id = values.get("id")
-            if not product_id:
-                # Collision-proof: COUNT(*) + 1 reuses IDs after a delete, which
-                # breaks inserts with a duplicate-key error. MAX(numeric suffix)
-                # keeps the next ID unique even after rows are removed.
-                cursor.execute(
-                    "SELECT COALESCE(MAX(CAST(SUBSTRING(id FROM 2) AS INTEGER)), 0) + 1 AS next FROM products"
-                )
-                product_id = f"p{cursor.fetchone()['next']}"
-            cursor.execute(
-                """
+            _product_sql = """
                 INSERT INTO products (
                     id, shop_id, name, description, price, pending_price,
                     category, inventory, prep_time, available, is_combo, combo_items
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    product_id,
+                """
+
+            def _product_params(rid):
+                return (
+                    rid,
                     values["shop_id"],
                     values["name"],
                     values.get("description", ""),
@@ -791,8 +855,18 @@ def _create_product_impl(values: dict[str, Any]) -> dict[str, Any]:
                     bool(values.get("available", True)),
                     bool(values.get("is_combo", False)),
                     str(values.get("combo_items", "") or ""),
-                ),
-            )
+                )
+
+            product_id = values.get("id")
+            if product_id:
+                # Caller-supplied id: honour it verbatim (imports / fixtures).
+                cursor.execute(_product_sql, _product_params(product_id))
+            else:
+                # MAX (not COUNT) so deletes can never reuse an id, AND a retry on
+                # a concurrent collision (see _insert_with_suffixed_id).
+                product_id = _insert_with_suffixed_id(
+                    cursor, "products", "p", _product_sql, _product_params,
+                )
             cursor.execute("SELECT * FROM products WHERE id = %s", (product_id,))
             row = cursor.fetchone()
             return dict(row)
@@ -1650,51 +1724,149 @@ def create_notification(
     order_id: str | None = None,
     status: str | None = None,
     target_role: str | None = None,
+    action: str = "",
+    action_state: str = "none",
     connection: Any | None = None,
 ) -> dict[str, Any] | None:
+    """Insert one notification.
+
+    ``action``/``action_state`` carry an INLINE admin action for the notification
+    bell (e.g. ``action="confirm_order"``, ``action_state="pending"``). They are
+    keyword-only in practice and default to "no action", so every existing caller
+    keeps working untouched.
+    """
     owns_connection = connection is None
     active_connection = connection or _connect()
     cursor = None
     try:
         cursor = active_connection.cursor()
-        # Collision-proof id (MAX, not COUNT) so deleted notification rows can
-        # never make the next insert fail with a duplicate-key error.
-        cursor.execute(
-            "SELECT COALESCE(MAX(CAST(SUBSTRING(id FROM 2) AS INTEGER)), 0) + 1 AS next FROM notifications"
-        )
-        notification_id = f"n{cursor.fetchone()['next']}"
-        cursor.execute(
-            "INSERT INTO notifications (id, title, message, order_id, status, target_role) VALUES (%s, %s, %s, %s, %s, %s)",
-            (notification_id, title, message, order_id, status, target_role),
+        # MAX (not COUNT) so deletes can never reuse an id, AND a retry on a
+        # concurrent collision so a lost insert can never drop the admin's
+        # "confirm this order" queue row (see _insert_with_suffixed_id).
+        notification_id = _insert_with_suffixed_id(
+            cursor, "notifications", "n",
+            """INSERT INTO notifications (id, title, message, order_id, status, target_role, action, action_state)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            lambda rid: (rid, title, message, order_id, status, target_role, action or "", action_state or "none"),
         )
         cursor.execute("SELECT * FROM notifications WHERE id = %s", (notification_id,))
         row = cursor.fetchone()
         if owns_connection:
             active_connection.commit()
         return dict(row) if row else None
+    except (psycopg2.errors.UndefinedColumn,):
+        # A deployment whose notifications table predates the inline-action
+        # columns. Apply the migrations and retry once so the bell never 500s.
+        logger.warning("Missing notification action columns — applying auto-migrations and retrying")
+        if owns_connection:
+            _release(active_connection)
+            active_connection = None
+        _apply_migrations()
+        return create_notification(
+            title, message, order_id, status, target_role, action, action_state, connection=None
+        )
     finally:
         if cursor is not None:
             try:
                 cursor.close()
             except Exception:
                 pass
-        if owns_connection:
+        if owns_connection and active_connection is not None:
             _release(active_connection)
+
+
+# How many rows the bell renders. 20 was small enough that a busy lunch rush
+# pushed a still-actionable "confirm this order" row off the end of the list
+# while the admin was looking at it — the order then silently never got
+# confirmed. 60 keeps a full service's worth of history visible.
+NOTIFICATION_LIST_LIMIT = 60
 
 
 def list_notifications(role: str | None = None) -> list[dict[str, Any]]:
     """List notifications. When ``role`` is given, only notifications targeted at
-    that exact role are returned (strict role separation)."""
+    that exact role are returned (strict role separation).
+
+    Rows that still carry a PENDING admin action are always kept at the top (and
+    never truncated away) so an un-confirmed order can't fall off the bell.
+    """
     with _DBContext(_connect()) as connection:
         with connection.cursor() as cursor:
             if role:
                 cursor.execute(
-                    "SELECT * FROM notifications WHERE target_role = %s ORDER BY created_at DESC LIMIT 20",
-                    (role,),
+                    """SELECT * FROM notifications
+                       WHERE target_role = %s
+                       ORDER BY (CASE WHEN action <> '' AND action_state = 'pending' THEN 0 ELSE 1 END),
+                                created_at DESC
+                       LIMIT %s""",
+                    (role, NOTIFICATION_LIST_LIMIT),
                 )
             else:
-                cursor.execute("SELECT * FROM notifications ORDER BY created_at DESC LIMIT 20")
+                cursor.execute(
+                    """SELECT * FROM notifications
+                       ORDER BY (CASE WHEN action <> '' AND action_state = 'pending' THEN 0 ELSE 1 END),
+                                created_at DESC
+                       LIMIT %s""",
+                    (NOTIFICATION_LIST_LIMIT,),
+                )
             return _rows_to_dicts(cursor.fetchall())
+
+
+def list_actionable_notifications(action: str, action_state: str = "pending") -> list[dict[str, Any]]:
+    """Every notification carrying a given inline action in a given state.
+
+    Powers the admin "Approvals" queue — a narrow, indexed read (no scan of the
+    whole table) so the page stays instant even with a long notification history.
+    """
+    with _DBContext(_connect()) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """SELECT * FROM notifications
+                   WHERE action = %s AND action_state = %s
+                   ORDER BY created_at DESC
+                   LIMIT 50""",
+                (action, action_state),
+            )
+            return _rows_to_dicts(cursor.fetchall())
+
+
+def set_notification_action_state(
+    notification_id: str, action_state: str
+) -> dict[str, Any] | None:
+    """Move a notification's inline action to a new state (pending → done).
+
+    Returns the updated row, or ``None`` when the id doesn't exist. A row whose
+    action was already settled returns that row unchanged, which is what makes
+    the confirm button safe to double-tap.
+    """
+    try:
+        return _set_notification_action_state_impl(notification_id, action_state)
+    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
+        logger.warning("Missing notification action columns — applying auto-migrations and retrying")
+        _apply_migrations()
+        return _set_notification_action_state_impl(notification_id, action_state)
+
+
+def _set_notification_action_state_impl(
+    notification_id: str, action_state: str
+) -> dict[str, Any] | None:
+    connection = _connect()
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                """UPDATE notifications SET action_state = %s
+                   WHERE id = %s
+                   RETURNING *""",
+                (action_state, notification_id),
+            )
+            row = _rows_to_dicts(cur.fetchall())[0] if cur.rowcount else None
+            if row:
+                connection.commit()
+            return row
+    except Exception:
+        connection.rollback()
+        return None
+    finally:
+        _release(connection)
 
 
 # ─── Web push subscriptions (vendor order notifications) ───
@@ -1947,22 +2119,19 @@ def create_site_feedback(values: dict[str, Any]) -> dict[str, Any] | None:
 def _create_site_feedback_impl(values: dict[str, Any]) -> dict[str, Any] | None:
     with _DBContext(_connect()) as connection:
         with connection.cursor() as cursor:
-            # Collision-proof id (MAX, not COUNT) so deleted rows never cause
-            # the next insert to fail with a duplicate-key error.
-            cursor.execute(
-                "SELECT COALESCE(MAX(CAST(SUBSTRING(id FROM 3) AS INTEGER)), 0) + 1 AS next FROM site_feedback"
-            )
-            feedback_id = f"fb{cursor.fetchone()['next']}"
-            cursor.execute(
-                """
+            # MAX (not COUNT) so deletes can never reuse an id, AND a retry on a
+            # concurrent collision (see _insert_with_suffixed_id).
+            _fb_sql = """
                 INSERT INTO site_feedback (
                     id, user_id, username, name, email, category,
                     subject, message, page, status, source
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'Open', %s)
-                """,
-                (
-                    feedback_id,
+                """
+            feedback_id = _insert_with_suffixed_id(
+                cursor, "site_feedback", "fb", _fb_sql,
+                lambda rid: (
+                    rid,
                     values.get("user_id"),
                     values.get("username", ""),
                     values.get("name", ""),
@@ -2094,10 +2263,6 @@ def create_review(values: dict[str, Any]) -> dict[str, Any] | None:
 def _create_review_impl(values: dict[str, Any]) -> dict[str, Any] | None:
     with _DBContext(_connect()) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT COALESCE(MAX(CAST(SUBSTRING(id FROM 3) AS integer)), 0) + 1 AS next_id FROM reviews")
-            # fetchone() returns a RealDictRow (RealDictCursor), so index by column name
-            next_id = cursor.fetchone()["next_id"]
-            review_id = f"rv{next_id}"
             shop_name = values.get("shop_name", "")
             if not shop_name and values.get("shop_id"):
                 try:
@@ -2107,11 +2272,14 @@ def _create_review_impl(values: dict[str, Any]) -> dict[str, Any] | None:
                         shop_name = row["name"]
                 except Exception:
                     pass
-            cursor.execute(
+            # MAX (not COUNT) so deletes can never reuse an id, AND a retry on a
+            # concurrent collision (see _insert_with_suffixed_id).
+            review_id = _insert_with_suffixed_id(
+                cursor, "reviews", "rv",
                 """INSERT INTO reviews (id, user_id, username, student_name, shop_id, shop_name, rating, comment)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                (
-                    review_id,
+                lambda rid: (
+                    rid,
                     values.get("user_id"),
                     values.get("username", ""),
                     values.get("student_name", ""),
@@ -2618,26 +2786,54 @@ def create_parent_order(
 
             # The parent row MUST exist before its sub-orders (FK constraint in
             # PostgreSQL is checked immediately, not at commit).
-            cur.execute(
-                """INSERT INTO parent_orders (
-                       id, token, date_key, student_name, student_phone, student_email,
-                       student_id, owner_user_id, total, payment_method, payment_status,
-                       delivery_location, status, created_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Pending', %s, 'Pending', NOW())""",
-                (
-                    parent_id,
-                    token,
-                    _day_key(),
-                    student_name,
-                    student_phone,
-                    student_email,
-                    student_id,
-                    owner_user_id,
-                    grand_total,
-                    payment_method,
-                    delivery_location,
-                ),
-            )
+            #
+            # PENTEST/RELIABILITY FIX. ``consume_token()`` read MAX(token)+1 on a
+            # SEPARATE, already-released connection, so between that read and this
+            # INSERT another student can claim the same token. The single-order
+            # path (``create_order``) already retries on UniqueViolation; this one
+            # did not, so a collision raised out of the endpoint as a 500 and the
+            # student's order was lost — AFTER ``consume_batch_stock`` had already
+            # decremented stock for every line, leaving the shop's inventory short
+            # for an order that does not exist.
+            #
+            # A SAVEPOINT (not a full rollback) is used so the batch stock already
+            # consumed in THIS transaction survives the retry.
+            parent_row = None
+            for _attempt in range(5):
+                try:
+                    cur.execute("SAVEPOINT parent_order_insert")
+                    cur.execute(
+                        """INSERT INTO parent_orders (
+                           id, token, date_key, student_name, student_phone, student_email,
+                           student_id, owner_user_id, total, payment_method, payment_status,
+                           delivery_location, status, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Pending', %s, 'Pending', NOW())""",
+                        (
+                            parent_id,
+                            token,
+                            _day_key(),
+                            student_name,
+                            student_phone,
+                            student_email,
+                            student_id,
+                            owner_user_id,
+                            grand_total,
+                            payment_method,
+                            delivery_location,
+                        ),
+                    )
+                    parent_row = True
+                    break
+                except psycopg2.errors.UniqueViolation:
+                    # Another parent order took this token a moment ago. Undo only
+                    # the failed INSERT, then re-read the next free token.
+                    cur.execute("ROLLBACK TO SAVEPOINT parent_order_insert")
+                    if _attempt == 4:
+                        raise
+                    token = consume_token()
+                    parent_id = f"{today_key}-{token}"
+            if parent_row is None:  # pragma: no cover - the loop raises instead
+                raise RuntimeError("Could not allocate a unique parent-order token")
 
             for idx, (shop, order_item_rows, subtotal, commission, shop_phone, shop_whatsapp) in enumerate(pending_subs, start=1):
                 sub_order_id = f"{parent_id}-{idx}"

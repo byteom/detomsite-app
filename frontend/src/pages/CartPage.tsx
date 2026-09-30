@@ -96,7 +96,7 @@ export function CartPage() {
               </div>
               <button onClick={() => navigate('/payment')}
                 className="mt-5 w-full rounded-btn bg-primary px-5 py-3 text-sm font-bold text-white shadow-gold transition-all hover:bg-primary-dark hover:shadow-gold-lg">
-                Proceed to Payment →
+                Proceed to Checkout →
               </button>
             </div>
           </div>

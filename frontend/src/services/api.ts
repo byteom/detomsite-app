@@ -5,10 +5,28 @@ import axios from "axios";
 import { clearLocalSession } from '../utils/session';
 
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || "http://localhost:8000/api/v1",
+  /* PENTEST/RELIABILITY FIX. The old fallback was
+   * `"http://localhost:8000/api/v1"`. If VITE_API_URL is ever missing from the
+   * build environment (a typo'd project, a new Vercel project, a local build
+   * without .env.local), Vite inlines the fallback verbatim and EVERY request
+   * from a real user is sent to their own machine — where nothing listens. The
+   * symptom is the app loading and then failing every call with a network error
+   * that looks exactly like "no internet", which is close to undebuggable.
+   *
+   * The same class of bug shipped to production once already: this project's
+   * VITE_API_URL pointed at a retired Render host while every other portal used
+   * the Vercel backend, so the main portal was the only one that failed.
+   *
+   * Defaulting to the REAL production API (rather than localhost) means a
+   * missing env var degrades to "works" instead of "silently dead". Local dev
+   * overrides it with its own .env.local. */
+  baseURL: import.meta.env.VITE_API_URL || "https://detomsite-backend.vercel.app/api/v1",
   headers: {
     "Content-Type": "application/json",
   },
+  // Match the other portals: give up after 20 s so a cold start shows a real
+  // message instead of an endless spinner.
+  timeout: 20000,
 });
 
 // Add token to requests
@@ -34,11 +52,31 @@ api.interceptors.response.use(
     }
     return response;
   },
-  (error) => {
+  async (error) => {
     const request = error.config;
     if (request && sessionChanged(request)) {
       return Promise.reject(new axios.CanceledError('Session changed during request'));
     }
+
+    /* Cold-start retry.
+     *
+     * The API is serverless: the first request after a quiet period pays the
+     * instance boot cost (measured up to ~14 s in production). One unlucky
+     * request would time out and leave a blank page with no way back, so an
+     * idempotent GET that fails on timeout / network error / 5xx is retried
+     * after a short backoff — by then the instance is warm (~0.4 s). Writes are
+     * NEVER retried: re-sending "Place Order" would create two orders. */
+    const cfg = request as (typeof request & { _retries?: number }) | undefined
+    const method = (cfg?.method || 'get').toLowerCase()
+    const attempts = cfg?._retries ?? 0
+    const status = error.response?.status
+    const retryable = status === undefined || status === 408 || status === 429 || status >= 500
+    if (cfg && method === 'get' && attempts < 2 && retryable) {
+      cfg._retries = attempts + 1
+      await new Promise((r) => setTimeout(r, 1500 * attempts))
+      return api.request(cfg)
+    }
+
     // No refresh endpoint exists: never retry with another account's token.
     const isAuthCall = /login|register|auth/i.test(request?.url || '');
     if (error.response?.status === 401 && !isAuthCall && localStorage.getItem('access_token')) {

@@ -24,23 +24,46 @@ def _smtp_configured() -> bool:
     return bool(settings.SMTP_HOST)
 
 
+def email_delivery_configured() -> bool:
+    """True when this deployment can actually DELIVER an email.
+
+    PENTEST/RELIABILITY FIX. Without this, a flow that emails a one-time code
+    (forgot-password, forgot-username, phone onboarding) cannot notice that no
+    mail provider exists at all, so it reports "we sent you a code" while the
+    code only ever reached the server log. Callers use this to fail honestly
+    instead of sending the user to an inbox that will stay empty.
+
+    ``_deliver`` prefers Resend over SMTP, so either one satisfies it.
+    """
+    return bool(settings.RESEND_API_KEY or settings.SMTP_HOST)
+
+
 def _send_smtp(to_email: str, subject: str, html_body: str, text_body: str) -> bool:
     """Deliver an email over SMTP. Returns True when accepted by the server.
     smtplib is blocking, so callers must run this off the event loop — the
     public EmailService methods wrap it in asyncio.to_thread."""
     if not _smtp_configured():
-        # No mail server configured. Log clearly (warning in production) so a
-        # "successful" reset email is never silently swallowed.
+        # No mail server configured. PENTEST/RELIABILITY FIX: this used to
+        # `return True`, i.e. "email sent", while nothing had been sent at all.
+        # Every caller ignored the return value anyway, so the whole chain
+        # reported success and the user was told "a 6-digit code was sent to
+        # your registered email" while the code only ever reached the log file.
+        # That is exactly why forgot-password looked broken with nothing to
+        # debug: the API said it worked, so nobody checked the mail server.
+        #
+        # Return False so a caller CAN detect an undelivered message, and say so
+        # plainly instead of claiming a success that never happened.
         if settings.DEBUG:
             logger.info(
                 f"[EMAIL] To: {to_email} | Subject: {subject}\n"
                 f"{text_body}"
             )
         else:
-            logger.warning(
-                f"[EMAIL] SMTP not configured — could NOT deliver to {to_email} | Subject: {subject}"
+            logger.error(
+                f"[EMAIL] SMTP not configured — could NOT deliver to {to_email} | "
+                f"Subject: {subject}"
             )
-        return True
+        return False
 
     message = MIMEMultipart("alternative")
     message["Subject"] = subject

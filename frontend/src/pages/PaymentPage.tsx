@@ -1,15 +1,10 @@
 import { FormEvent, useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import QRCode from 'qrcode'
 import api from '../services/api'
-import { LocalPaymentSettings, LocalParentOrder } from '../types/localApi'
-import { clearCart, getCartByShop, toPaymentGroup } from '../utils/cart'
+import { LocalPaymentSettings } from '../types/localApi'
+import { getCartByShop } from '../utils/cart'
 import { getCheckoutProfile, getLocalSession, rememberCheckout } from '../utils/session'
 import { PhoneInput, isValidMobile } from '../components/PhoneInput'
-
-const UPI_LIMIT = 100000
-
-function upiAmount(am: number) { const n = Number(am); return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0 }
 
 /* Delivery is a single fixed drop point: the VIT-AP main gate (enforced
    server-side too), so the checkout shows it as a read-only field. */
@@ -20,8 +15,13 @@ export function PaymentPage() {
   const navigate = useNavigate()
   const session = getLocalSession()
   const [ps, setPs] = useState<LocalPaymentSettings | null>(null)
-  const [method, setMethod] = useState<'manual' | 'cod'>('manual')
-  const [slot, setSlot] = useState<'Afternoon' | 'Night'>('Afternoon')
+  /* Payment is no longer chosen at checkout. The student places the order and
+     pays by QR on the NEXT page, so the method is DERIVED: UPI whenever the
+     admin has a UPI ID configured, Cash on Delivery only when they do not.
+     There is no toggle to get wrong and no QR on the checkout screen. */
+  const [slot, setSlot] = useState<'Afternoon' | 'Night'>(
+    () => (getCheckoutProfile().slot === 'Night' ? 'Night' : 'Afternoon'),
+  )
   /* Phone + location are restored from the remembered checkout profile so a
      returning student does not retype their number after logging out and back
      in — the "we get out and come back" case. The session wins when it has a
@@ -30,109 +30,44 @@ export function PaymentPage() {
   // One fixed drop point, so the location is constant rather than user-editable.
   const loc = DEFAULT_LOC
   const [phone, setPhone] = useState(() => session?.phone || remembered.phone || '')
-  const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const groups = getCartByShop()
   const total = groups.reduce((sum, g) => sum + g.subtotal, 0)
   const manualReady = Boolean(ps?.manual_enabled && ps.upi_id)
-  const upiUrl = manualReady
-    ? `upi://pay?pa=${encodeURIComponent((ps?.upi_id || '').trim())}&pn=${encodeURIComponent((ps?.receiver_name || 'DETOMSITE').trim())}&am=${upiAmount(total).toFixed(2)}&cu=INR&tn=${encodeURIComponent(`Detomsite ${total}`)}`
-    : ''
-  const [upiQrCode, setUpiQrCode] = useState('')
+  /* Derived, not chosen: UPI when it is configured, COD as the fallback. Until
+     the settings load we assume UPI so a slow response never silently pushes a
+     student onto cash. */
+  const method: 'manual' | 'cod' = manualReady ? 'manual' : 'cod'
 
   useEffect(() => {
     api.get<LocalPaymentSettings>('/local/payment-settings')
       .then(r => setPs(r.data)).catch(() => setError('Cannot load payment settings'))
   }, [])
 
-  /* Payment settings load async — if UPI isn't configured on the server the
-     "UPI" tab disappears, so stop the form from silently keeping a
-     'manual' selection the shop can't accept. */
-  useEffect(() => {
-    if (ps && !manualReady && method === 'manual') setMethod('cod')
-  }, [ps, manualReady, method])
-
-  useEffect(() => {
-    let active = true
-    if (!upiUrl) {
-      setUpiQrCode('')
-      return () => { active = false }
-    }
-    QRCode.toDataURL(upiUrl, { width: 220, margin: 2, errorCorrectionLevel: 'M' })
-      .then(url => { if (active) setUpiQrCode(url) })
-      .catch(() => { if (active) setUpiQrCode('') })
-    return () => { active = false }
-  }, [upiUrl])
-
   /* GPS "use my location" removed: delivery is VIT-AP campus only, and a GPS
      reverse-geocode (city/state/country) would push off-campus text into the
      order. The VIT-AP select below is the only delivery input. */
 
-  const submit = async (e: FormEvent) => {
+  const submit = (e: FormEvent) => {
     e.preventDefault()
     setError('')
     if (!groups.length) { setError('Cart empty'); return }
     if (!isValidMobile(phone)) { setError('Please enter a valid 10-digit mobile number'); return }
     if (!isVitAp(loc)) { setError('Delivery is VIT-AP main gate only.'); return }
 
-    /* Remember the number + gate BEFORE the network calls: if the order or the
-       payment POST fails, the student still must not have to retype their
-       number on the retry (this was the "get out and come back" complaint). */
-    rememberCheckout({ phone: phone.replace(/\s/g, ''), location: loc })
+    /* Remember the number + gate BEFORE moving on: if the payment page fails to
+       load, the student still must not have to retype their number on the retry
+       (this was the "get out and come back" complaint). */
+    rememberCheckout({ phone: phone.replace(/\s/g, ''), location: loc, slot })
 
-    if (method === 'manual') {
-      if (!manualReady) { setError('Manual payment not configured'); return }
-      /* No UTR paste anymore: the student pays from the QR / "Scan for
-         better option" button and the admin verifies the payment. */
-    }
+    if (method === 'manual' && !manualReady) { setError('This shop has not set up UPI payments yet — please try again later.'); return }
 
-    setLoading(true)
-    try {
-      // Step 1: Create the multi-shop parent order (ONE token for all shops).
-      const order = await api.post<LocalParentOrder>('/local/orders/multi', {
-        shops: groups.map(g => toPaymentGroup(g)),
-        student_name: session?.name || 'Student',
-        student_phone: phone,
-        student_email: session?.email || '',
-        delivery_location: loc,
-        delivery_slot: slot,
-        payment_method: method === 'cod' ? 'COD' : 'UTR',
-      })
-
-      // Step 2: record the payment (no UTR anymore — the row carries the
-      // server-priced amount and the ADMIN verifies it; the frontend never
-      // decides payment success). If the save fails the ORDER already exists
-      // — never re-submit it (that created duplicate orders); flag it so the
-      // result page can tell the student.
-      let paymentPending = false
-      if (method === 'manual') {
-        try {
-          await api.post('/local/payments', {
-            order_id: order.data.id,
-            amount: total,
-            method: 'Manual UTR',
-            utr_number: '',
-          })
-        } catch (err: any) {
-          paymentPending = true
-          const detail = err?.response?.data?.detail || ''
-          if (detail) sessionStorage.setItem('payment_pending_detail', String(detail))
-        }
-      }
-
-      clearCart()
-      if (paymentPending) sessionStorage.setItem('payment_pending', '1')
-      navigate(`/order-result/${order.data.id}`)
-    } catch (err: any) {
-      setError(err?.response?.data?.detail || 'Order could not be placed')
-    } finally {
-      setLoading(false)
-    }
+    /* Checkout only COLLECTS the details — it places no order. The order is
+       created on the payment page, where the student sees the QR and the exact
+       amount first and then commits with "Place Order". Nothing reaches the
+       vendors until that final tap, so an abandoned checkout leaves no order. */
+    navigate('/pay')
   }
-
-  const canPay = method === 'cod'
-    ? true
-    : manualReady
 
   return (
     <div className="min-h-screen bg-white">
@@ -167,87 +102,14 @@ export function PaymentPage() {
                 <PhoneInput value={phone} onChange={setPhone} placeholder="98765 43210" required />
               </div>
 
-              <h2 className="mb-4 text-lg font-bold text-primary-dark">Payment Method</h2>
-
-              <div className="mb-4 flex gap-3">
-                {manualReady && (
-                  <button type="button" onClick={() => setMethod('manual')}
-                    className={`flex-1 rounded-btn border-2 p-4 text-center transition-all ${
-                      method === 'manual' ? 'border-emerald-500 bg-primary-light/30 shadow-emerald-sm' : 'border-gray-200 hover:border-emerald-300'
-                    }`}>
-                    <span className="mx-auto mb-1 flex h-8 w-8 items-center justify-center rounded-pill bg-primary-light text-primary"><svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="5" width="20" height="14" rx="2" /><path d="M2 10h20" /></svg></span>
-                    <span className={`text-xs font-bold ${method === 'manual' ? 'text-primary' : 'text-gray-500'}`}>UPI (UTR)</span>
-                  </button>
-                )}
-                <button type="button" onClick={() => setMethod('cod')}
-                  className={`flex-1 rounded-btn border-2 p-4 text-center transition-all ${
-                    method === 'cod' ? 'border-emerald-500 bg-primary-light/30 shadow-emerald-sm' : 'border-gray-200 hover:border-emerald-300'
-                  }`}>
-                  <span className="mx-auto mb-1 flex h-8 w-8 items-center justify-center rounded-pill bg-primary-light text-primary">💵</span>
-                  <span className={`text-xs font-bold ${method === 'cod' ? 'text-primary' : 'text-gray-500'}`}>Cash on Delivery</span>
-                </button>
+              <div className="mt-4">
+                <label className="mb-1.5 block text-sm font-bold text-primary-dark">Delivery slot</label>
+                <select value={slot} onChange={e => setSlot(e.target.value as 'Afternoon' | 'Night')}
+                  className="rounded-btn border-2 border-gray-200 px-4 py-2.5 text-sm text-gray-900 outline-none focus:border-primary">
+                  <option value="Afternoon">Afternoon slot · deliver 1:00 – 1:30 PM</option>
+                  <option value="Night">Night slot · deliver 7:30 – 8:00 PM</option>
+                </select>
               </div>
-
-              {method === 'manual' && (
-                <div className="space-y-4">
-                  {total > UPI_LIMIT && (
-                    <div className="flex items-start gap-2.5 rounded-btn border-2 border-amber-300 bg-amber-50 p-4">
-                      <svg className="h-5 w-5 shrink-0 text-gold-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3 2 20h20L12 3Z" /><path d="M12 10v4M12 17.5v.5" /></svg>
-                      <div className="text-xs leading-relaxed text-gold-dark">
-                        <p className="font-bold">₹{total.toLocaleString('en-IN')} is above the UPI transaction limit (₹{UPI_LIMIT.toLocaleString('en-IN')}).</p>
-                        <p className="mt-1">Banks cap UPI per payment — above the limit the bank rejects the transaction with “exceeded the bank limit … retry with a smaller amount”, and <b>no money is debited</b>. Please choose a smaller order, or split it into two payments.</p>
-                      </div>
-                    </div>
-                  )}
-                  <div className="rounded-btn bg-primary-light/30 border border-primary-light/50 p-4">
-                    <p className="text-sm font-semibold text-primary">UPI Payment — Pay ₹{total} ONCE (one bill for {groups.length} shop{groups.length > 1 ? 's' : ''})</p>
-                    {manualReady ? (
-                      <div className="mt-2 text-sm text-gray-600">
-                        <p>Pay to: {ps?.receiver_name || 'Merchant'} — if your UPI app shows a DIFFERENT name, STOP and pay via mobile number instead</p>
-                        <p className="font-mono font-bold text-primary">{ps?.upi_id}</p>
-                        {ps?.instructions && <p className="mt-1 text-gray-500">{ps.instructions}</p>}
-                        {upiQrCode && (
-                          <div className="mt-4 flex flex-col items-center rounded-btn border border-primary-light/60 bg-white p-4 text-center">
-                            <img src={upiQrCode} alt={`Scan ONCE to pay ₹${total}`} className="h-52 w-52" />
-                            <p className="mt-2 text-sm font-bold text-primary-dark">Scan ONCE to pay ₹{total} (no second scan)</p>
-                            <p className="mt-1 text-xs text-gray-500">This is the ONLY QR — the order-result page shows no second QR. Pay once.</p>
-                          </div>
-                        )}
-                        <a
-                          href={upiUrl}
-                          className="mt-3 flex w-full items-center justify-center gap-2 rounded-btn bg-primary px-4 py-3 text-sm font-bold text-white transition-all hover:bg-primary">
-                          <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 2 .7 2.9a2 2 0 0 1-.4 2.1L8.1 10a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.9.6 2.9.7a2 2 0 0 1 1.6 2Z" /></svg>
-                          Pay via UPI App (GPay / PhonePe / Paytm)
-                        </a>
-                        <p className="mt-2 text-xs text-primary">Pay FIRST in your UPI app (QR above or the "Scan for better option" button) — then tap "Place Order". The admin verifies the payment; nothing to paste.</p>
-                        <p className="mt-1 text-[11px] text-amber-700">If the app warns "THIS PAYMENT MAY FAIL AS PER UPI RISK POLICY": STOP — the VPA name check failed. Pay the same VPA via mobile number instead, or verify receiver name. Do NOT retry blindly.</p>
-                      </div>
-                    ) : <p className="mt-2 text-sm text-gray-400">Admin hasn't configured payment yet</p>}
-                  </div>
-                  <div className="grid gap-3 md:grid-cols-2">
-                    {upiUrl ? (
-                      <a href={upiUrl}
-                        className="flex items-center justify-center gap-2 rounded-btn bg-primary px-4 py-2.5 text-sm font-bold text-white shadow-gold transition-all hover:bg-primary-dark">
-                        <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2" /><path d="M17 3h2a2 2 0 0 1 2 2v2" /><path d="M21 17v2a2 2 0 0 1-2 2h-2" /><path d="M7 21H5a2 2 0 0 1-2-2v-2" /><path d="M7 12h10" /></svg>
-                        Scan for better option
-                      </a>
-                    ) : null}
-                    <select value={slot} onChange={e => setSlot(e.target.value as 'Afternoon' | 'Night')}
-                      className="rounded-btn border-2 border-gray-200 px-4 py-2.5 text-sm text-gray-900 outline-none focus:border-primary">
-                      <option value="Afternoon">Afternoon slot · deliver 1:00 – 1:30 PM</option>
-                      <option value="Night">Night slot · deliver 7:30 – 8:00 PM</option>
-                    </select>
-                  </div>
-                  <p className="text-xs text-gray-500">Pay in your UPI app first (scan the QR, or use <b>Scan for better option</b> to open the app directly), then tap <b>Place Order</b>. Nothing to paste — the admin verifies the payment. No screenshot upload. No second QR after.</p>
-                </div>
-              )}
-
-              {method === 'cod' && (
-                <div className="rounded-btn bg-amber-50/70 border border-amber-200 p-4 text-sm text-amber-700">
-                  💵 You'll pay cash to each shop when they deliver. No COD fee.
-                  <p className="mt-1 text-xs text-amber-600/80">For a multi-shop order each shop collects its own share on delivery. Cash on Delivery orders can't be edited or cancelled after a shop accepts them.</p>
-                </div>
-              )}
 
               {error && <p className="mt-4 rounded-lg bg-red-50 border border-red-200 px-4 py-2 text-sm font-medium text-red-600">{error}</p>}
             </div>
@@ -266,13 +128,12 @@ export function PaymentPage() {
                 </div>
                 <p className="pt-1 text-xs text-gray-400">No delivery fee, no taxes, no COD fee. Each shop's flat ₹10 per order is on them, never you.</p>
               </div>
-              <button type="submit" disabled={loading || !canPay}
-                className="mt-5 w-full rounded-btn bg-primary px-5 py-3 text-sm font-bold text-white shadow-gold transition-all hover:bg-primary-dark disabled:opacity-40">
-                {loading ? 'Placing order...' : method === 'cod' ? `Place COD Order · ₹${total}` : `Place Order · ₹${total}`}
+              <button type="submit" className="mt-5 w-full rounded-btn bg-primary px-5 py-3 text-sm font-bold text-white shadow-gold transition-all hover:bg-primary-dark">
+                Proceed to Pay →
               </button>
-              {!manualReady && method === 'manual' && (
-                <p className="mt-3 text-center text-xs font-medium text-gray-400">UPI not configured — use COD instead.</p>
-              )}
+              <p className="mt-3 text-center text-[11px] font-medium text-gray-400">
+                Next page shows the QR and the amount. Your order is placed only when you tap Place Order.
+              </p>
             </div>
           </form>
         )}

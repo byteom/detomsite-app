@@ -276,6 +276,8 @@ async def create_notification(
     message: str,
     order_id: str | None = None,
     status: str | None = None,
+    action: str = "",
+    action_state: str = "none",
 ) -> dict[str, Any]:
     database = _database()
     next_id = await database.local_notifications.count_documents({}) + 1
@@ -286,6 +288,8 @@ async def create_notification(
         "order_id": order_id,
         "status": status,
         "is_read": 0,
+        "action": action or "",
+        "action_state": action_state or "none",
         "created_at": datetime.utcnow().isoformat(),
         "sequence": next_id,
     }

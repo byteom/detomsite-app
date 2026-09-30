@@ -690,10 +690,274 @@ async def vendor_logs(shop_id: str, admin: dict = Depends(verify_admin)):
 
 @router.get("/notifications")
 async def admin_notifications(admin: dict = Depends(verify_admin)):
-    """Get notifications targeted at admins."""
+    """Notifications targeted at admins, each carrying whatever inline action it
+    owns (``action`` / ``action_state``) so the bell can render a Confirm button
+    without a second request.
+
+    Cached for only 5 s (not the usual 10) and the cache is dropped the moment an
+    order is placed or confirmed, because a stale bell is exactly what made
+    "the admin never saw the order" happen.
+    """
     return await read_cache.cached_read(
-        10, "admin-notifications", db.list_notifications, role="admin"
+        5, "admin-notifications", db.list_notifications, role="admin"
     )
+
+
+# ─── Order confirmation queue (the bell's "Confirm" button) ───
+
+# Order states an admin is allowed to confirm. Anything terminal (Cancelled,
+# Completed, Delivered, Refunded…) is refused so a late tap on an old
+# notification can never resurrect a finished or cancelled order.
+CONFIRMABLE_ORDER_STATUSES = (
+    "Pending",
+    "Placed",
+    "Pending Payment",
+    "Pending Acceptance",
+    "Accepted",
+)
+
+# The notification action name the frontend renders as a Confirm button.
+CONFIRM_ORDER_ACTION = "confirm_order"
+
+
+class ConfirmOrderRequest(BaseModel):
+    """Optional body for the confirm call.
+
+    ``notification_id`` is what the bell passes so the matching queue row is
+    settled in the SAME request; the Orders page omits it and confirms by order
+    id alone. Both paths are idempotent.
+    """
+    notification_id: Optional[str] = Field(default=None, max_length=40)
+
+
+def _sms_log_fn(sub_order_id: str, phone: str, message: str, status: str) -> dict | None:
+    """Bound to the active store's sync ``log_sms`` (runs in a worker thread)."""
+    return db.log_sms(
+        sub_order_id=sub_order_id,
+        phone=phone,
+        message=message,
+        status=status,
+        direction="out",
+    )
+
+
+def _confirmable_shape(order: dict, shop: dict | None, notification: dict | None) -> dict:
+    """The payload the admin Approvals queue renders per pending order."""
+    shop = shop or {}
+    return {
+        "notification_id": (notification or {}).get("id", ""),
+        "order_id": order.get("id", ""),
+        "token": order.get("token"),
+        "shop_id": order.get("shop_id", ""),
+        "shop_name": order.get("shop_name") or shop.get("name", ""),
+        "student_name": order.get("student_name", ""),
+        "student_phone": order.get("student_phone", ""),
+        "items": order.get("items", ""),
+        "total": order.get("total", 0),
+        "payment_method": order.get("payment_method", "UPI"),
+        "delivery_location": order.get("delivery_location", ""),
+        "status": order.get("status", ""),
+        "created_at": order.get("created_at", ""),
+        "title": (notification or {}).get("title", ""),
+        "message": (notification or {}).get("message", ""),
+        "action": (notification or {}).get("action", ""),
+        "action_state": (notification or {}).get("action_state", ""),
+    }
+
+
+@router.get("/order-confirmations")
+async def list_order_confirmations(admin: dict = Depends(verify_admin)):
+    """Every order still waiting for the admin to press Confirm.
+
+    Backs the bell badge AND the Approvals page. Reads only the indexed
+    ``(action, action_state)`` slice of the notifications table (never the whole
+    list), then resolves the referenced orders concurrently, so the queue stays
+    instant no matter how long the notification history is.
+
+    An order that has meanwhile moved on by itself (paid, cancelled, already
+    confirmed) is dropped from the queue rather than shown as still-actionable.
+    """
+    rows = await _db(db.list_actionable_notifications, CONFIRM_ORDER_ACTION, "pending")
+    get_sub = getattr(db, "get_sub_order", None)
+
+    async def _resolve(row: dict) -> dict | None:
+        order_id = str(row.get("order_id") or "")
+        if not order_id:
+            return None
+        order = await _db(db.get_order, order_id)
+        is_sub = False
+        if not order:
+            # A multi-shop (combo) order's per-shop rows live in shop_sub_orders.
+            sub = await _db(get_sub, order_id) if get_sub else None
+            if not sub:
+                return None
+            order = _sub_order_shape(sub)
+            is_sub = True
+        if str(order.get("status") or "") not in CONFIRMABLE_ORDER_STATUSES:
+            return None
+        shop = await _db(db.get_shop, order.get("shop_id") or "")
+        if not shop and is_sub:
+            shop = (order.get("shop") or {}) or None
+        return _confirmable_shape(order, shop, row)
+
+    resolved = await asyncio.gather(*[_resolve(r) for r in rows or []], return_exceptions=True)
+    return [r for r in resolved if isinstance(r, dict)]
+
+
+@router.post("/orders/{order_id}/confirm")
+async def admin_confirm_order(
+    order_id: str,
+    data: Optional[ConfirmOrderRequest] = Body(default=None),
+    admin: dict = Depends(verify_admin),
+):
+    """Confirm one order — the action behind the bell's Confirm button.
+
+    What one tap does, in order:
+      1. the order moves to **Confirmed** (and reads "confirmed" in every portal),
+      2. the shopkeeper gets the confirmation **on WhatsApp automatically**,
+      3. the "order confirmed" SMS goes out to the student's phone,
+      4. the queue row is settled so the button can never fire twice.
+
+    Steps 2–4 are best-effort: the order IS confirmed even if WhatsApp is down,
+    because a message that failed to send must never cost the student their
+    order. Idempotent — confirming an already-confirmed order returns the same
+    success payload instead of erroring, so a double tap is harmless.
+    """
+    order = await _db(db.get_order, order_id)
+    is_sub_order = False
+    if not order:
+        # A multi-shop (combo) order's per-shop rows live in shop_sub_orders.
+        getter = getattr(db, "get_sub_order", None)
+        sub = await _db(getter, order_id) if getter else None
+        if not sub:
+            raise HTTPException(status_code=404, detail="Order not found")
+        order = _sub_order_shape(sub)
+        is_sub_order = True
+
+    current = str(order.get("status") or "")
+    if current in ("Cancelled", "Completed", "Delivered", "Refunded", "Failed"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"This order is already {current.lower()} — it can no longer be confirmed.",
+        )
+
+    already = current == "Confirmed"
+    if not already:
+        if current not in CONFIRMABLE_ORDER_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=f"This order is {current} and can no longer be confirmed.",
+            )
+        if is_sub_order:
+            updated = await _db(db.update_sub_order_status, order_id, "Confirmed")
+        else:
+            # ``update_order_status`` also writes the student's notification, so
+            # the student bell and order page update from the same write.
+            updated = await _db(db.update_order_status, order_id, "Confirmed")
+        if not updated:
+            raise HTTPException(status_code=500, detail="Could not confirm this order — please try again.")
+        order = updated
+
+    shop = await _db(db.get_shop, order.get("shop_id") or "")
+    if not shop and is_sub_order:
+        # get_sub_order already attaches a trimmed shop context.
+        shop = (order.get("shop") or {}) or None
+
+    token = order.get("token")
+    student_name = str(order.get("student_name") or "").strip() or "the student"
+
+    # A single order's student notification is already written by
+    # ``update_order_status`` above. A multi-shop SUB-order has no such write, and
+    # its id cannot go in ``notifications.order_id`` anyway (that column is a FK to
+    # ``orders`` only), so its notification is raised here with a null order_id.
+    if is_sub_order:
+        try:
+            await _db(
+                db.create_notification,
+                title="Order confirmed",
+                message=f"Token {token} confirmed — {order.get('shop_name') or 'the shop'} accepted your order.",
+                order_id=None,  # sub-order ids are not `orders` rows
+                status="Confirmed",
+                target_role="student",
+            )
+        except Exception as e:
+            logger.warning(f"Confirm {order_id}: sub-order student notification error: {e}")
+
+    # ── 1. WhatsApp the shop: automatic, exactly what the shopkeeper needs ──
+    whatsapp_sent = False
+    try:
+        from app.services import sms_service
+
+        whatsapp_sent = await sms_service.send_whatsapp_confirmed(order, shop, db)
+    except Exception as e:
+        logger.warning(f"Confirm {order_id}: WhatsApp error: {e}")
+
+    # ── 2. SMS the student (the same text the SMS-confirm path uses) ──
+    try:
+        from app.services import sms_service
+
+        phone = str(order.get("student_phone") or "").strip()
+        if phone:
+            await sms_service.send_sms_async(
+                phone,
+                sms_service.compose_confirmation_sms(order),
+                _sms_log_fn,
+                sub_order_id=order_id,
+            )
+    except Exception as e:
+        logger.warning(f"Confirm {order_id}: student SMS error: {e}")
+
+    # ── 3. Settle the queue row(s) so the button can't be pressed twice ──
+    settled: list[str] = []
+    try:
+        candidates = []
+        if data and data.notification_id:
+            candidates.append(data.notification_id)
+        # A multi-shop order can raise one queue row per sub-order; settle every
+        # still-pending row pointing at this order.
+        for row in await _db(db.list_actionable_notifications, CONFIRM_ORDER_ACTION, "pending") or []:
+            if str(row.get("order_id") or "") == str(order_id):
+                candidates.append(row.get("id"))
+        for notification_id in dict.fromkeys(c for c in candidates if c):
+            if await _db(db.set_notification_action_state, notification_id, "done"):
+                settled.append(notification_id)
+    except Exception as e:
+        logger.warning(f"Confirm {order_id}: could not settle the queue row: {e}")
+
+    # Drop every cached read so the bell, the Approvals queue, the orders list and
+    # the dashboard all reflect the new state on their very next poll.
+    await read_cache.clear()
+
+    logger.info(f"Admin confirmed order {order_id} (token #{token})")
+    return {
+        "message": (
+            f"Order #{token} was already confirmed."
+            if already
+            else f"Order #{token} confirmed ✓"
+        ),
+        "already_confirmed": already,
+        "order": order,
+        "whatsapp_sent": whatsapp_sent,
+        "whatsapp_queued": not whatsapp_sent,
+        "notification_ids": settled,
+    }
+
+
+@router.post("/order-confirmations/{notification_id}/dismiss")
+async def dismiss_order_confirmation(
+    notification_id: str, admin: dict = Depends(verify_admin)
+):
+    """Hide one pending confirmation from the admin queue without confirming it.
+
+    For the "not now" case — the order stays exactly as it is, it simply stops
+    nagging the bell. The row is marked ``dismissed`` (never deleted) so the
+    audit trail of what the admin saw stays intact.
+    """
+    row = await _db(db.set_notification_action_state, notification_id, "dismissed")
+    if not row:
+        raise HTTPException(status_code=404, detail="That notification no longer exists")
+    await read_cache.clear()
+    return {"message": "Removed from the confirm queue", "notification": row}
 
 
 class BroadcastRequest(BaseModel):

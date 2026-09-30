@@ -302,6 +302,12 @@ def dashboard(current_vendor: dict = Depends(get_current_vendor)):
     # with every order and made the vendor app feel slow). Multi-shop
     # sub-orders are merged in so they appear too. One DB read, sliced twice.
     shop_orders = _shop_orders_merged(my_shop["id"])
+    # Same "paid only" rule as GET /orders: an unpaid prepaid order is withheld
+    # from the shop, so it must not inflate this shop's pending count or its
+    # revenue either. Otherwise a withheld order would still show as a
+    # "Pending Payment" the vendor is meant to act on — and, worse, be counted
+    # as earnings the vendor has not actually been paid for.
+    shop_orders = [o for o in shop_orders if _visible_to_shop_with_payment(o)]
     feed_orders = shop_orders[:250]
     pending = [o for o in shop_orders if o["status"] in ("Pending Payment", "Pending Acceptance")]
     active = [o for o in shop_orders if o["status"] in ("Confirmed", "Preparing", "Ready")]
@@ -434,7 +440,14 @@ def pay_admin_dues(data: AdminDuesPayment, current_vendor: dict = Depends(get_cu
 
 @router.get("/orders")
 def get_orders(current_vendor: dict = Depends(get_current_vendor)):
-    """Get all orders for this vendor's shop (single + multi-shop sub-orders)."""
+    """Get all orders for this vendor's shop (single + multi-shop sub-orders).
+
+    UNPAID PREPAID ORDERS ARE HIDDEN. A UPI order is withheld from the shop
+    until its payment is confirmed, so a shop must not see it here either — the
+    whole point of the rule is that the kitchen only takes work it has been paid
+    for. COD orders are always visible: cash is collected on delivery, so waiting
+    for payment would mean the shop never learns the order exists.
+    """
     my_shop = _find_shop(current_vendor)
     if not my_shop:
         return []
@@ -454,7 +467,47 @@ def get_orders(current_vendor: dict = Depends(get_current_vendor)):
                 "utr_number": payment.get("utr_number"),
                 "amount": payment.get("amount"),
             }
-    return orders
+    return [o for o in orders if _visible_to_shop(o)]
+
+
+def _visible_to_shop(order: dict) -> bool:
+    """Should this order appear in the shop's list at all?
+
+    True when the order is Cash on Delivery (paid later, on handover), or when a
+    payment has been recorded as successful. A prepaid order with no successful
+    payment is withheld — that is the "only paid orders reach the shop" rule.
+    """
+    method = str(
+        order.get("payment_method")
+        or (order.get("payment") or {}).get("method")
+        or ""
+    ).upper()
+    if method == "COD":
+        return True
+    payment = order.get("payment") or {}
+    return str(payment.get("status") or "").upper() == "SUCCESS"
+
+
+def _visible_to_shop_with_payment(order: dict) -> bool:
+    """``_visible_to_shop`` for a raw row that has no ``payment`` block yet.
+
+    The dashboard slices ``_shop_orders_merged`` straight after one read, before
+    any per-order payment lookup, so the payment has to be resolved here for the
+    visibility rule to have anything to judge on. Cached on the row so the caller
+    can reuse it.
+    """
+    if order.get("payment") is None:
+        pay_key = order.get("parent_order_id") if order.get("is_sub_order") else order.get("id")
+        payment = db.get_payment_by_order_id(pay_key) if pay_key else None
+        if payment:
+            order["payment"] = {
+                "id": payment.get("id"),
+                "method": payment.get("method"),
+                "status": payment.get("status"),
+                "utr_number": payment.get("utr_number"),
+                "amount": payment.get("amount"),
+            }
+    return _visible_to_shop(order)
 
 
 @router.get("/orders/lookup")

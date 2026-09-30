@@ -25,8 +25,15 @@
         <package android:name="com.whatsapp.w4b" />
     </queries>
 
+    <!--
+      allowBackup=false: this app stores the ADMIN BEARER TOKEN in
+      SharedPreferences. With backups on, that token is swept into Google Auto
+      Backup and can be restored onto another device — a full admin credential
+      leaving the phone without the admin ever seeing it. There is nothing here
+      worth restoring, so backups are off entirely.
+    -->
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:icon="@android:drawable/sym_def_app_icon"
         android:label="@string/app_name"
         android:theme="@style/Theme.Material3.DayNight">
@@ -38,12 +45,12 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="detomsite-agent" android:host="open" />
-            </intent-filter>
+            <!--
+              The old detomsite-agent://open deep link was removed: it was
+              exported + BROWSABLE (so any app or web page could launch it) but
+              NO code ever read the intent, so it was unused attack surface with
+              a browser-reachable entry point and no benefit.
+            -->
         </activity>
 
         <receiver

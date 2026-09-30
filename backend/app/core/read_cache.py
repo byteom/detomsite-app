@@ -153,3 +153,37 @@ def clear_bg() -> None:
     """
     ttl_cache.clear()
     redis_cache.spawn(clear())
+
+
+async def clear_bounded(budget: float = 0.25) -> None:
+    """Invalidate every layer, but never charge the request for it.
+
+    The write path used to ``await clear()`` on EVERY POST/PATCH/DELETE, which
+    added a Redis round trip AND a Postgres round trip to the response time of
+    every order, payment and profile write. On a busy service — or on a serverless
+    host where those shared stores are sometimes slow — that is real, user-facing
+    latency on the exact requests a user is waiting on.
+
+    This drops the in-process layer instantly (so the instance that just wrote
+    is already serving fresh data) and gives the shared layers a short budget.
+    Every shared entry already carries a TTL (5–30 s), so the worst case if the
+    budget is blown is that another instance serves a value for at most its
+    remaining TTL — never a permanently stale read. What it buys is that a slow
+    or unreachable shared cache can no longer add latency to a write.
+    """
+    ttl_cache.clear()
+    try:
+        await asyncio.wait_for(_clear_shared_layers(), timeout=max(0.01, budget))
+    except asyncio.TimeoutError:
+        logger.debug(f"Shared cache clear exceeded {budget:.2f}s budget — shared layers expire on their own TTL")
+    except Exception as e:  # a cache must never fail a write
+        logger.debug(f"Shared cache clear skipped: {e}")
+
+
+async def _clear_shared_layers() -> None:
+    await redis_cache.clear()
+    if shared_cache.enabled():
+        try:
+            await asyncio.to_thread(shared_cache.clear)
+        except Exception as e:
+            logger.debug(f"shared cache clear skipped: {e}")

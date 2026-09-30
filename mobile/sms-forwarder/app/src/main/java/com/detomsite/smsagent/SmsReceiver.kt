@@ -164,10 +164,11 @@ class SmsReceiver : BroadcastReceiver() {
     ) {
         try {
             // Accept both "https://host" and "https://host/api/v1/local" as the
-            // saved base URL — never double-append the path.
-            val root = baseUrl
-                .substringBefore("/api/v1")
-                .trimEnd('/')
+            // saved base URL — never double-append the path. normalizeBackendUrl
+            // also repairs a stored value saved before normalisation (or typed
+            // without a scheme), so an old install recovers instead of failing
+            // every incoming bank SMS.
+            val root = normalizeBackendUrl(baseUrl)
             val json = JSONObject()
                 .put("phone", configuredPhone(context, context.getSharedPreferences("agent", Context.MODE_PRIVATE)))
                 .put("utr", utr)

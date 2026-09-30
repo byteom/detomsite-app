@@ -14,6 +14,7 @@ const RoleGate = lazy(() => import('./components/RoleGate').then(m => ({ default
 const MainLayout = lazy(() => import('./components/Layout').then(m => ({ default: m.MainLayout })))
 const CartPage = lazy(() => import('./pages/CartPage').then(m => ({ default: m.CartPage })))
 const PaymentPage = lazy(() => import('./pages/PaymentPage').then(m => ({ default: m.PaymentPage })))
+const PayPage = lazy(() => import('./pages/PayPage'))
 const OrderResultPage = lazy(() => import('./pages/OrderResultPage').then(m => ({ default: m.OrderResultPage })))
 const PreviousOrdersPage = lazy(() => import('./pages/PreviousOrdersPage').then(m => ({ default: m.PreviousOrdersPage })))
 const SupportPage = lazy(() => import('./pages/SupportPage').then(m => ({ default: m.SupportPage })))
@@ -146,6 +147,7 @@ function App() {
                     <Route path="/shop/:shopId" element={<ShopDetail />} />
                     <Route path="/cart" element={<CartPage />} />
                     <Route path="/payment" element={<PaymentPage />} />
+                    <Route path="/pay" element={<PayPage />} />
                     <Route path="/order-result/:orderId" element={<OrderResultPage />} />
                     <Route path="/support" element={<SupportPage />} />
                     <Route path="/login" element={<AuthPage />} />

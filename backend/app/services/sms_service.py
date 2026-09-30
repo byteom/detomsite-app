@@ -82,6 +82,57 @@ def compose_confirmation_sms(order: dict[str, Any]) -> str:
     )
 
 
+def shop_label(order: dict[str, Any]) -> str:
+    """Best-effort shop name for a message body (handles sub-order shapes)."""
+    return (
+        or_none(order.get("shop_name"))
+        or or_none((order.get("shop") or {}).get("name"))
+        or "your shop"
+    )
+
+
+def compose_order_confirmed_wa(order: dict[str, Any]) -> str:
+    """WhatsApp message sent to the shop the moment the ADMIN confirms an order.
+
+    This is the third state in the shop's WhatsApp timeline:
+      1. order placed          → "New DETOMSITE order #N … awaiting payment"
+      2. admin confirmed it    → THIS message ("confirmed by the admin")
+      3. payment verified      → "UPI paid ₹X ✓"
+
+    Sent automatically when a WhatsApp provider is configured (``WA_PROVIDER``);
+    otherwise it is stored as a Pending wa.me row so the admin centre can still
+    one-tap send it. Never raises — a failed message must not block the confirm.
+    """
+    token = order.get("token") or order.get("id") or "?"
+    items = or_none(order.get("items"))
+    if not items:
+        products = order.get("products") or []
+        items = ", ".join(
+            f"{p.get('quantity', 1)}x {p.get('name', 'Item')}" for p in products
+        ) or "(no items listed)"
+    student = or_none(order.get("student_name")) or "(no name)"
+    amount = order.get("total") or 0
+    payment = or_none(order.get("payment_method")) or "UPI"
+    if payment.upper() == "COD":
+        payment_label = f"Cash on Delivery ₹{amount}"
+    else:
+        payment_label = f"{payment.upper()} ₹{amount}"
+    # Unique per-order reference — a multi-shop order shares one token across
+    # every sub-order, so the phone bot needs the sub-order id to be sure which
+    # chat it is verifying.
+    ref = or_none(order.get("id"))
+    ref_line = f"\n• Ref: {ref}" if ref else ""
+    return (
+        f"✅ DETOMSITE order #{token} is CONFIRMED{ref_line}\n\n"
+        f"• {shop_label(order)}\n"
+        f"• Student: {student}\n"
+        f"• Items: {items}\n"
+        f"• Payment: {payment_label}\n\n"
+        f"The admin has approved this order. Please start preparing it and keep "
+        f"the token ready for pickup. Thank you!"
+    )
+
+
 def compose_order_wa(order: dict[str, Any], paid: bool | None = None) -> str:
     """WhatsApp-ready order message for the shopkeeper.
 
@@ -152,4 +203,69 @@ async def send_sms_async(
         return True
     except Exception as e:
         logger.error(f"SMS send failed to {phone}: {e}")
+        return False
+
+
+async def send_whatsapp_confirmed(
+    order: dict[str, Any],
+    shop: dict[str, Any] | None,
+    db: Any,
+) -> bool:
+    """Tell the shop, on WhatsApp, that the admin CONFIRMED its order.
+
+    Runs the moment the admin presses Confirm in the notification bell, which is
+    what the shopkeeper needs: "stop waiting, this order is real, start cooking".
+
+    Delivery is automatic when a gateway is configured (``WA_PROVIDER`` =
+    wassenger / meta / webhook) and falls back to a Pending ``wa.me`` row in the
+    admin → WhatsApp centre otherwise, so the zero-cost manual path still works.
+
+    Every step is best-effort: a WhatsApp outage must never roll back or fail a
+    confirmation the admin already made. Returns True when a gateway accepted
+    the message, False when it is sitting in the Pending queue instead.
+    """
+    from urllib.parse import quote
+
+    from app.services import whatsapp_service
+
+    if not order or not order.get("id"):
+        return False
+    shop = shop or {}
+    phone = str(shop.get("whatsapp_number") or "").strip() or str(shop.get("phone") or "").strip()
+    if not phone:
+        logger.info(f"No WhatsApp/phone number for shop of order {order.get('id')} — confirm WhatsApp skipped")
+        return False
+
+    try:
+        message = compose_order_confirmed_wa(order)
+        digits = "".join(ch for ch in phone if ch.isdigit())
+        if len(digits) == 10:
+            digits = "91" + digits
+        url = f"https://wa.me/{digits}?text={quote(message)}"
+
+        # Persist FIRST so the message is queued even if the gateway call below
+        # fails or the process is frozen right after the response — nothing is
+        # ever silently lost.
+        created = await asyncio.to_thread(
+            db.log_whatsapp,
+            sub_order_id=order["id"],
+            phone=phone,
+            message=message,
+            url=url,
+            status="Pending",
+        )
+        row_id = (created or {}).get("id")
+
+        if row_id and whatsapp_service.provider_configured():
+            sent = await asyncio.to_thread(
+                whatsapp_service.send_whatsapp, phone, message, None, order["id"]
+            )
+            if sent:
+                await asyncio.to_thread(db.mark_whatsapp_sent, row_id)
+                logger.info(f"Order {order['id']}: confirmation WhatsApp auto-sent to {phone}")
+                return True
+        logger.info(f"Order {order['id']}: confirmation WhatsApp queued for {phone}")
+        return False
+    except Exception as e:
+        logger.warning(f"Confirmation WhatsApp error for order {order.get('id')}: {e}")
         return False
