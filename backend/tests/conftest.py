@@ -62,6 +62,85 @@ def test_annotations_resolve_under_eager_evaluation(module_name):
         f"will fail to import the module:\n  " + "\n  ".join(broken)
     )
 
+
+# ── API surface: every route must be authenticated unless it is public by
+#    design. Read from FastAPI's REAL route table rather than grepping source,
+#    so a route that changes shape (or is added) cannot quietly slip through
+#    unauthenticated again. ──
+# Paths that MUST stay reachable without a token. Each one is deliberate:
+# sign-in/registration, the public shop+product catalogue the ordering pages
+# read before login, health, the password-reset flow, and the payment gateway
+# callbacks (which authenticate by provider signature, not by user token).
+_INTENTIONALLY_PUBLIC = (
+    "/api/v1/local/auth/login",
+    "/api/v1/local/auth/register",
+    "/api/v1/local/auth/phone",
+    "/api/v1/local/status",
+    "/api/v1/local/shops",
+    "/api/v1/local/products",
+    "/api/v1/local/payment-settings",
+    "/api/v1/local/student-notice",
+    "/api/v1/local/announcements",
+    "/api/v1/local/batch",
+    "/api/v1/local/feedback",
+    "/api/v1/users/login",
+    "/api/v1/users/register",
+    "/api/v1/users/forgot-password",
+    "/api/v1/users/forgot-username",
+    "/api/v1/users/reset-password",
+    "/api/v1/admin/login",
+    "/api/v1/vendor/login",
+    "/api/v1/vendor/register",
+    "/health",
+    # Root is a liveness/welcome route: app name + version, no data. Keeping it
+    # open is what lets a load balancer and a human "is it up?" check work.
+    "/",
+)
+
+
+def _is_public(path: str) -> bool:
+    if any(path == p or path.startswith(p + "/") for p in _INTENTIONALLY_PUBLIC):
+        return True
+    # Agent routes (SMS/WhatsApp bridge) authenticate with the shared agent
+    # key checked inside the handler, not with a Depends() on the signature.
+    return any(s in path for s in ("/sms/", "/whatsapp/"))
+
+
+def test_every_route_requires_authentication():
+    """No route may be reachable with no credentials unless listed as public.
+
+    An accidentally-public money path is the single most damaging thing in this
+    codebase, and it is invisible in review because the route file looks
+    ordinary.
+
+    The route table is read INSIDE the test, deliberately. Importing
+    ``app.main`` at collection time (a ``@parametrize`` over ``app.routes``)
+    loads ``app.core.config`` BEFORE the environment setup lower down in this
+    file has run, so the first ``settings`` object built has no JWT secret and
+    no admin seed — and every later test inherits it. That silently broke
+    unrelated admin-login and agent-key tests when it was tried that way.
+    """
+    from app.main import app
+
+    public = {r for r in app.routes if hasattr(r, "methods")}
+    assert public, "no routes found — is the app object wired up correctly?"
+
+    unguarded = []
+    for route in public:
+        path = route.path
+        if _is_public(path):
+            continue
+        has_dep = bool(getattr(route, "dependant", None) and route.dependant.dependencies)
+        if not has_dep:
+            unguarded.append(f"{sorted(route.methods)[0]} {path}")
+
+    assert not unguarded, (
+        "these routes have no authentication dependency and are not on the "
+        "intentionally-public list, so anyone can call them:\n  "
+        + "\n  ".join(sorted(unguarded))
+    )
+
+
 import os
 import uuid
 
