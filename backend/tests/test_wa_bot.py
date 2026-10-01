@@ -200,6 +200,113 @@ def test_dialable_number_matches_what_the_bot_will_open(raw, expected):
 
 
 # ─── COD: placed on submit, messaged once, nothing to confirm ───
+async def test_cod_order_queues_exactly_one_shop_whatsapp(client):
+    """COD messages the shop on placement — and only once.
+
+    The queued row is what the bot actually sends, so the "one message per
+    order" guarantee has to hold on the COD path too, not just paid UPI.
+    """
+    from app.core import local_demo_db as store
+    from test_order_cancel import (
+        _approved_shop_with_product,
+        _place_order,
+        _register_and_login,
+    )
+
+    shop, product = _approved_shop_with_product(_u("codmsg_v") + "@example.com", "COD Msg Vendor")
+    tok = await _register_and_login(client, _u("codmsg_t"), "password123", "COD Msg", "student")
+    order = await _place_order(client, shop["id"], product["id"], "COD Msg", method="COD", token=tok)
+
+    rows = [r for r in store.list_whatsapp_logs(50) if str(r.get("sub_order_id")) == order["id"]]
+    assert len(rows) == 1, f"expected one shop message for the order, got {len(rows)}"
+    assert "confirm this order" not in str(rows[0].get("message") or "").lower()
+
+
+async def test_the_whole_chain_sms_to_confirmed_order_to_one_whatsapp(client, monkeypatch):
+    """THE END-TO-END JOIN, in one test.
+
+    This is the whole point of the bot, and it is exactly what has to hold:
+
+      1. a student places a UPI order and gets a Pending Payment draft;
+      2. the shop's phone receives the bank credit SMS;
+      3. the Android agent forwards it to /sms/match;
+      4. the WEBSITE reflects the order as confirmed/paid — not just the phone;
+      5. the shopkeeper gets exactly ONE WhatsApp message saying so.
+
+    Every step is asserted through the real HTTP surface, because the failure
+    mode is silent: if step 4 or 5 breaks, the money is real but neither side
+    ever sees it, and nothing errors anywhere.
+    """
+    from unittest.mock import AsyncMock
+
+    from fastapi import HTTPException
+
+    from app.api.v1 import local as local_mod
+    from app.core import local_demo_db as store
+    from test_order_cancel import _approved_shop_with_product, _register_and_login
+
+    # Silence every delivery channel EXCEPT the WhatsApp queue, which is the
+    # thing under test here.
+    monkeypatch.setattr(local_mod, "_notify_order_via_sms", AsyncMock())
+    monkeypatch.setattr(local_mod, "_notify_admin_of_new_order", AsyncMock())
+    monkeypatch.setattr(local_mod, "_push_admin", lambda *a, **k: None)
+    monkeypatch.setattr(local_mod, "_log_sms_inbound", AsyncMock())
+    monkeypatch.setattr(local_mod.push_service, "notify_shop_new_order_async", AsyncMock())
+
+    shop, product = _approved_shop_with_product(_u("e2e_v") + "@example.com", "E2E Kitchen")
+    store.update_shop(shop["id"], {"whatsapp_number": "9600000099"})
+    shop = store.get_shop(shop["id"])
+
+    token = await _register_and_login(client, _u("e2e_s"), "password123", "Chain Student", "student")
+    headers = {"Authorization": f"Bearer {token}"}
+    body = {
+        "shop_id": shop["id"], "items": [{"product_id": product["id"], "quantity": 1}],
+        "student_name": "Chain Student", "student_phone": "+919000012345",
+        "delivery_location": "VIT-AP Main Gate", "delivery_slot": "Evening",
+        "payment_method": "UPI", "client_ref": "co-" + _u("e2e"),
+    }
+    placed = await client.post("/api/v1/local/orders", json=body, headers=headers)
+    assert placed.status_code == 200, placed.text
+    order_id = placed.json()["id"]
+    total = placed.json()["total"]
+
+    # (1) The draft is open and awaiting payment, and the intent exists so the
+    #     bank credit has something to match.
+    assert store.get_order(order_id)["status"] == "Pending Payment"
+    assert store.get_payment_by_order_id(order_id)["status"] == "Pending"
+    assert not any(
+        str(r.get("sub_order_id")) == order_id
+        for r in store.list_whatsapp_logs(50)
+    ), "an UNPAID order must never reach the shop"
+
+    # (3) The agent forwards the bank credit, carrying the shop's phone.
+    matched = await local_mod._sms_match_core(
+        local_mod.LocalSmsMatch(phone=shop["phone"], utr="", amount=total)
+    )
+    assert matched["matched"] is True
+
+    # (4) The WEBSITE reflects it — the student sees a settled order.
+    seen = await client.get(f"/api/v1/local/orders/{order_id}/payment", headers=headers)
+    assert seen.status_code == 200, seen.text
+    assert seen.json()["payment_status"] == "Success", "the website still shows this order unpaid"
+    assert seen.json()["order_status"] == "Completed"
+
+    # (5) Exactly one WhatsApp message, and it says the payment landed.
+    rows = [r for r in store.list_whatsapp_logs(50) if str(r.get("sub_order_id")) == order_id]
+    assert len(rows) == 1, f"the shop was messaged {len(rows)} times for one paid order"
+    message = str(rows[0].get("message") or "")
+    assert rows[0]["phone"] == "9600000099"
+    assert "paid" in message.lower(), f"the shop was not told the payment landed: {message!r}"
+
+    # Replaying the SAME credit SMS must not produce a second message.
+    with pytest.raises(HTTPException):
+        await local_mod._sms_match_core(
+            local_mod.LocalSmsMatch(phone=shop["phone"], utr="", amount=total)
+        )
+    rows_after = [r for r in store.list_whatsapp_logs(50) if str(r.get("sub_order_id")) == order_id]
+    assert len(rows_after) == 1, "a replayed bank SMS re-messaged the shop"
+
+
 async def test_cod_is_accepted_at_every_hour(client, monkeypatch):
     """The placement hour must not decide whether a COD order is "placed".
 

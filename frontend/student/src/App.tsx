@@ -721,6 +721,20 @@ function Login() {
       const res = await api.post('/users/login', { username, password })
       localStorage.setItem('access_token', res.data.access_token)
       localStorage.setItem('user_data', JSON.stringify(res.data.user))
+      /* SEED THE SESSION CHECK so the app can skip re-validating this token.
+       *
+       * Without this, every login paid TWO cold starts back to back: the login
+       * POST, and then — because the check cache was empty — RequireAuth's
+       * /users/profile call the instant /shops mounted. The student sat on a
+       * blank "Loading..." for the sum of both (measured 4-8 s each on the
+       * serverless host), which is exactly the "it takes time to login" report.
+       *
+       * The credentials were just verified by this very call, so the token is
+       * known good; there is nothing to re-check. A genuine 401 later clears
+       * this cache and re-validates, so it costs nothing in safety. */
+      try {
+        localStorage.setItem(AUTH_CHECK_KEY, JSON.stringify({ token: res.data.access_token, t: Date.now() }))
+      } catch { /* private mode — the network check simply runs instead */ }
       navigate('/shops')
     } catch (err: any) { setErr(apiError(err, 'Login failed')) }
     finally { setLoading(false) }
