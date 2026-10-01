@@ -1954,15 +1954,24 @@ async def sms_incoming(data: LocalIncomingSms, request: Request, x_agent_key: Op
        accepting an unpaid order must not mark it paid, which is why it stays
        ``Confirmed`` and why a "Pending Payment" order is refused here.
     """
+    # Agent auth: fail closed (see ``_require_agent_key``). With no key
+    # configured the endpoint refuses to run instead of letting any anonymous
+    # caller inject "YES <token>" / a fake bank UTR and confirm an order.
+    #
+    # PENTEST FIX (auth ordering). This check used to sit BELOW the "no SMS text"
+    # validation, so an anonymous caller reached handler code before the key was
+    # ever examined and got a 400 describing the endpoint's behaviour instead of
+    # a 401. No state changed — but authentication must be the FIRST thing a
+    # handler does, so that an unauthenticated caller learns nothing at all and
+    # cannot spend the handler's work before being rejected. It also keeps the
+    # brute-force budget meaningful: every unauthenticated attempt is a key
+    # attempt, not a free probe.
+    _require_agent_key(x_agent_key, request)
+
     text = (data.text or "").strip()
     phone = (data.phone or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="No SMS text provided")
-
-    # Agent auth: fail closed (see ``_require_agent_key``). With no key
-    # configured the endpoint refuses to run instead of letting any anonymous
-    # caller inject "YES <token>" / a fake bank UTR and confirm an order.
-    _require_agent_key(x_agent_key, request)
 
     report = {"received": True, "phone": phone, "text": text, "order": None}
 
@@ -3165,8 +3174,22 @@ async def checkout_data(shop_ids: str = Query("", max_length=600)):
 
         # Shops are primary-key lookups, so N of them is cheap; only they vary
         # per cart, so only they are keyed per cart.
-        shops = [await _db(db.get_shop, sid) for sid in wanted]
-        shops = [s for s in shops if s]
+        #
+        # PENTEST FIX (data exposure). This returned ``db.get_shop()`` raw. This
+        # route has NO auth dependency — a student must see live prices before
+        # logging in — so every field came straight off the shops table:
+        # admin_dues_balance / admin_dues_last_paid_at (the platform's private
+        # ledger of what each vendor owes), revenue_today / orders_today (a
+        # competitor's live business metrics), and shopkeeper_email /
+        # whatsapp_number (the vendor's private contact details). The public
+        # /shops routes already funnel through _public_shop() for exactly this
+        # reason; this one was added later and missed it. Verified live: an
+        # anonymous GET returned all of them.
+        shops = [
+            _public_shop(shop)
+            for shop in [await _db(db.get_shop, sid) for sid in wanted]
+            if shop
+        ]
         settings = await _db(db.get_payment_settings)
         return {
             "shops": shops,
