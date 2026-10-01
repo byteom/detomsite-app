@@ -1,6 +1,67 @@
+"""The module must import under the PYTHON VERSION THAT ACTUALLY SERVES IT.
+
+A helper annotated with a name it never imported (``def f(x: Any) -> str:``)
+booted fine locally and took production down with
+``FUNCTION_INVOCATION_FAILED``. The cause is a version difference, not a typo:
+
+  * the dev box and the test suite run Python 3.14, which DEFERRED annotation
+    evaluation (PEP 649) — the name is never looked up, so the missing import
+    is invisible and every test passes;
+  * Vercel builds with Python 3.12, which evaluates annotations at def-time, so
+    the module raises NameError on IMPORT and the whole API 500s.
+
+299 green tests were therefore giving false confidence. These tests force the
+eager evaluation that 3.12 performs, across every router module, so a missing
+import is caught locally instead of in production.
 """
-Test configuration and fixtures
-"""
+import importlib
+import inspect
+import typing
+
+import pytest
+
+API_MODULES = [
+    "app.api.v1.local",
+    "app.api.v1.vendor",
+    "app.api.v1.admin",
+    "app.api.v1.admin_super",
+    "app.api.v1.local_admin",
+    "app.api.v1.orders",
+    "app.api.v1.payments",
+    "app.api.v1.products",
+    "app.api.v1.shops",
+    "app.api.v1.users",
+    "app.api.v1.campuses",
+    "app.api.v1.reviews",
+    "app.api.v1.tickets",
+    "app.api.v1.auth",
+    "app.main",
+]
+
+
+@pytest.mark.parametrize("module_name", API_MODULES)
+def test_annotations_resolve_under_eager_evaluation(module_name):
+    """Every annotation must resolve NOW, the way Python 3.12 resolves it.
+
+    ``typing.get_type_hints`` forces exactly the evaluation the deployed
+    runtime performs. A NameError here is the same NameError that made the
+    import fail in production.
+    """
+    module = importlib.import_module(module_name)
+    broken = []
+    for name, obj in vars(module).items():
+        if not (inspect.isfunction(obj) and obj.__module__ == module_name):
+            continue
+        try:
+            typing.get_type_hints(obj)
+        except Exception as exc:  # noqa: BLE001 - we are collecting every kind
+            broken.append(f"{name}: {type(exc).__name__}: {exc}")
+    assert not broken, (
+        f"{module_name} has annotations that only resolve lazily. Python 3.14 "
+        f"defers these (PEP 649) and hides the bug, but Vercel runs 3.12 and "
+        f"will fail to import the module:\n  " + "\n  ".join(broken)
+    )
+
 import os
 import uuid
 
