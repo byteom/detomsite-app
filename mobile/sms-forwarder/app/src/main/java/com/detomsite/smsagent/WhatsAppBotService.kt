@@ -50,6 +50,26 @@ import java.util.concurrent.TimeUnit
 class WhatsAppBotService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * ONE shared HTTP client for the whole service.
+     *
+     * A new [OkHttpClient] was previously built on every poll and every
+     * mark-sent. Each one owns its own connection pool AND its own dispatcher
+     * thread pool, which are only torn down when the client is garbage
+     * collected — so a bot left running overnight quietly accumulated dozens of
+     * idle threads and sockets. On a cheap phone that shows up as the bot
+     * getting slower, then hanging, then needing a force-stop.
+     *
+     * Reused clients are the intended usage: OkHttp pools connections and
+     * reuses threads, which is exactly what a 20-second poll loop wants.
+     */
+    private val http: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .build()
+    }
     private var poller: Job? = null
 
     /** id → when we last launched WhatsApp, so a stuck send retries. */
@@ -57,8 +77,28 @@ class WhatsAppBotService : Service() {
 
     /** ids already auto-sent on this device — never opened for a second time
      * even if the mark-sent confirmation POST failed (a duplicate WhatsApp to
-     * the shop is worse than a Pending row the admin can clear). */
-    private val delivered = HashSet<String>()
+     * the shop is worse than a Pending row the admin can clear).
+     *
+     * BOUNDED. This set only ever grows, so a bot left running for weeks on a
+     * shopkeeper's phone accumulated an entry for every order ever sent — a slow
+     * memory leak. Only the RECENT ids are needed: the server now durably
+     * claims each message (status 'Sending'), so a re-offer after a restart is
+     * already blocked server-side and this set is only a fast local guard for
+     * the last few messages. */
+    private val delivered = LinkedHashSet<String>()
+
+    /** Remember a delivery, dropping the oldest once the set is full. */
+    private fun rememberDelivered(id: String) {
+        synchronized(delivered) {
+            delivered.add(id)
+            while (delivered.size > DELIVERED_MEMORY) {
+                val oldest = delivered.iterator().next()
+                delivered.remove(oldest)
+            }
+        }
+    }
+
+    private fun alreadyDelivered(id: String): Boolean = synchronized(delivered) { id in delivered }
 
     /** Last time a guidance notification was shown (throttled to 5 min). */
     private var lastGuidanceAt = 0L
@@ -142,7 +182,7 @@ class WhatsAppBotService : Service() {
             .map { pending.getJSONObject(it) }
             .firstOrNull { entry ->
                 val id = entry.optString("id")
-                id.isNotBlank() && id !in delivered && !isRecentlyLaunched(id) &&
+                id.isNotBlank() && !alreadyDelivered(id) && !isRecentlyLaunched(id) &&
                     normalizePhone(entry.optString("phone")).isNotEmpty()
             } ?: return
         val id = item.optString("id")
@@ -168,10 +208,7 @@ class WhatsAppBotService : Service() {
                 .url("$root/api/v1/local/whatsapp/pending")
                 .header("X-Agent-Key", key)
                 .build()
-            val client = OkHttpClient.Builder()
-                .connectTimeout(10, TimeUnit.SECONDS)
-                .readTimeout(10, TimeUnit.SECONDS)
-                .build()
+            val client = http
             client.newCall(req).execute().use { resp ->
                 if (resp.code !in 200..299) {
                     Log.w(TAG, "pending → ${resp.code}")
@@ -229,7 +266,7 @@ class WhatsAppBotService : Service() {
     /** Confirmed by the accessibility service: Send was tapped. */
     fun confirmSent(id: String) {
         notificationManager().cancel(SENDING)
-        delivered.add(id)
+        rememberDelivered(id)
         scope.launch {
             markSent(id)
             inFlight.remove(id)
@@ -249,11 +286,7 @@ class WhatsAppBotService : Service() {
                 .header("Content-Type", "application/json")
                 .header("X-Agent-Key", key)
                 .build()
-            OkHttpClient.Builder()
-                .connectTimeout(10, TimeUnit.SECONDS)
-                .readTimeout(10, TimeUnit.SECONDS)
-                .build()
-                .newCall(req).execute().use { resp ->
+            http.newCall(req).execute().use { resp ->
                     Log.i(TAG, "mark-sent → ${resp.code}")
                 }
         } catch (e: Exception) {
@@ -309,6 +342,8 @@ class WhatsAppBotService : Service() {
     companion object {
         private const val TAG = "DetomsiteWABot"
         private const val CHANNEL = "detomsite_wa_bot"
+        /** How many recently-sent ids to remember locally. See [delivered]. */
+        private const val DELIVERED_MEMORY = 200
         private const val SENDING = 70
         private const val GUIDANCE = 71
 

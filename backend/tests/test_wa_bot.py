@@ -211,6 +211,64 @@ async def test_a_cod_order_queues_exactly_one_shop_whatsapp(client):
     assert "confirm this order" not in str(rows[0].get("message") or "").lower()
 
 
+async def test_every_shop_in_a_multi_shop_order_gets_its_message(client, monkeypatch):
+    """One student, several shops: EVERY shop is messaged, each with its own items.
+
+    This is the queue-walk guarantee. The bot opens exactly one WhatsApp chat
+    per poll cycle because its outbox is a single slot, so the feed must hand
+    over exactly one message per request. When it used to claim a whole batch
+    and return it, every shop after the first was marked in-flight but never
+    opened — so a combo order left all but one shop waiting out the staleness
+    window before their order was even deliverable.
+    """
+    from test_multi_shop_whatsapp import _shop_with_whatsapp
+    from test_order_cancel import _register_and_login
+    from unittest.mock import AsyncMock
+    from app.api.v1 import local as local_api
+
+    monkeypatch.setattr(local_api.push_service, "notify_shop_new_order_async", AsyncMock())
+    token = await _register_and_login(client, _u("walk"), "password123", "Walk Student", "student")
+    shop_a, prod_a = _shop_with_whatsapp(f"{_u('wa')}@example.com", "Walk Shop A", "9600000001", "Biryani A")
+    shop_b, prod_b = _shop_with_whatsapp(f"{_u('wb')}@example.com", "Walk Shop B", "9600000002", "Dosa B")
+    shop_c, prod_c = _shop_with_whatsapp(f"{_u('wc')}@example.com", "Walk Shop C", "9600000003", "Idli C")
+
+    res = await client.post(
+        "/api/v1/local/orders/multi",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "shops": [
+                {"shop_id": shop_a["id"], "items": [{"product_id": prod_a["id"], "quantity": 1}]},
+                {"shop_id": shop_b["id"], "items": [{"product_id": prod_b["id"], "quantity": 1}]},
+                {"shop_id": shop_c["id"], "items": [{"product_id": prod_c["id"], "quantity": 1}]},
+            ],
+            "student_name": "Walk Student", "student_phone": "+919876543210",
+            "delivery_location": "VIT-AP Main Gate", "payment_method": "COD",
+        },
+    )
+    assert res.status_code == 200, res.text
+    subs = {s["id"] for s in res.json()["sub_orders"]}
+    assert len(subs) == 3
+
+    # Walk the queue exactly as the bot does: one message, confirm it, repeat.
+    delivered = {}
+    for _ in range(6):
+        body = (await client.get("/api/v1/local/whatsapp/pending")).json()
+        if not body:
+            break
+        assert len(body) == 1, "the bot was handed several messages but opens one chat at a time"
+        item = body[0]
+        delivered[item["sub_order_id"]] = item["phone"]
+        await client.post(f"/api/v1/local/whatsapp/{item['id']}/mark-sent")
+
+    assert set(delivered) == subs, (
+        f"only {len(delivered)} of {len(subs)} shops were messaged — the rest were "
+        "claimed but never sent"
+    )
+    # Each shop was reached on its OWN number, never someone else's.
+    for sub in res.json()["sub_orders"]:
+        assert delivered[sub["id"]] == sub["shop_whatsapp"]
+
+
 async def test_pending_filters_drafts_and_sent(client):
     # Draft → still awaiting payment: the bot must NOT send it yet.
     store.log_whatsapp(
@@ -237,11 +295,21 @@ async def test_pending_filters_drafts_and_sent(client):
         url="https://wa.me/919876543210", status="Sent",
     )
 
-    resp = await client.get("/api/v1/local/whatsapp/pending")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert sorted(x["sub_order_id"] for x in body) == ["o2", "o3"]
-    assert all("awaiting payment" not in x["message"] for x in body)
+    # The feed hands over ONE message per request (the bot sends one per cycle),
+    # so drain it the way the bot does. Across the walk it must offer exactly
+    # the two READY messages — never the unpaid draft, never the sent one.
+    seen = []
+    for _ in range(4):
+        body = (await client.get("/api/v1/local/whatsapp/pending")).json()
+        if not body:
+            break
+        assert len(body) == 1, f"the bot is sent {len(body)} messages but opens one chat at a time"
+        seen.extend(x["sub_order_id"] for x in body)
+        # The bot confirms each delivery before polling again.
+        await client.post(f"/api/v1/local/whatsapp/{body[0]['id']}/mark-sent")
+
+    assert sorted(seen) == ["o2", "o3"]
+    assert all("awaiting payment" not in s.lower() for s in seen)
 
 
 async def test_mark_sent_roundtrip(client, monkeypatch):

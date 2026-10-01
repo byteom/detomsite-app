@@ -3648,13 +3648,15 @@ def list_audit_logs(limit: int = 200) -> list[dict[str, Any]]:
 
 
 def claim_whatsapp_logs(
-    log_ids: list[str], stale_minutes: int = 15
+    log_ids: list[str], stale_minutes: int = 5
 ) -> list[dict[str, Any]]:
     """Durably claim these WhatsApp rows for delivery, and return the ones won.
 
     A row is claimable when it is still ``Pending``, or when it is ``Sending``
     but was claimed longer than ``stale_minutes`` ago (the bot died mid-send, so
-    the message genuinely never went out and must be retried).
+    the message genuinely never went out and must be retried). The window is
+    short because the pending feed hands the bot exactly ONE message per poll —
+    so a stranded claim can only ever hold up a single shop, not a whole queue.
 
     Claiming flips the row to ``Sending`` and stamps ``claimed_at``. That is what
     makes "send once" durable: the feed no longer offers a row that is already

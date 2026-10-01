@@ -2380,6 +2380,12 @@ async def whatsapp_pending_agent(request: Request, x_agent_key: Optional[str] = 
     skipped so the bot waits for the payment verification to refresh them to
     "paid ✓" and then sends exactly ONE clean message (never a stale
     "awaiting payment" followed by a final one).
+
+    Exactly ONE message is returned per request, and only that one is claimed.
+    The bot sends a single message per poll cycle because the outbox it fills
+    is one slot; handing it a batch would claim messages it never opens. One
+    per request means a multi-shop order walks shop by shop and nothing is
+    marked in-flight unless it is really being sent.
     """
     # Agent auth: fail closed — this feed carries customer phone numbers and
     # order messages, so an anonymous caller must never be able to read it.
@@ -2414,23 +2420,40 @@ async def whatsapp_pending_agent(request: Request, x_agent_key: Optional[str] = 
     # A row stuck in 'Sending' becomes eligible again after the staleness
     # window, so a bot killed mid-send still results in delivery — it just can
     # never be re-sent instantly.
-    claimed = []
-    if candidates:
-        won = await _db(
-            db.claim_whatsapp_logs,
-            [c.get("id") for c in candidates if c.get("id")],
-        )
-        won_ids = {str(w.get("id")) for w in (won or [])}
-        claimed = [c for c in candidates if str(c.get("id")) in won_ids]
-
+    # HAND OVER EXACTLY ONE, AND CLAIM ONLY THAT ONE.
+    #
+    # The on-phone bot deliberately sends ONE message per poll cycle: the outbox
+    # it fills is a single slot, so opening several WhatsApp chats back to back
+    # meant only the last one ever reached the screen. It takes the first row it
+    # is given, and only if the number is usable and it is not already mid-send
+    # on that device.
+    #
+    # So the queue is claimed ONE AT A TIME. Claiming a whole batch and then
+    # returning one row is just as broken as not claiming at all: the rows the
+    # bot never opens are still marked in-flight, so they sit out the staleness
+    # window before they can even be picked up. That is what left every shop
+    # after the first in a combo order waiting — and never being told.
+    #
+    # We therefore pick the single row the bot would act on, claim exactly that
+    # id, and only return it if the claim was actually won. One row per request
+    # means a multi-shop order walks shop by shop, one cycle apart, and nothing
+    # is ever marked in-flight unless it is genuinely being sent.
+    if not candidates:
+        return []
+    target = candidates[0]
+    won = await _db(db.claim_whatsapp_logs, [target.get("id")], 5)
+    if not won:
+        # Lost the race to another poller (or its claim is still fresh) — the
+        # bot simply gets nothing this cycle and tries again shortly.
+        return []
+    row = won[0]
     return [
         {
-            "id": log.get("id"),
-            "sub_order_id": log.get("sub_order_id") or log.get("order_id") or "",
-            "phone": str(log.get("phone") or "").strip(),
-            "message": str(log.get("message") or "").strip(),
+            "id": row.get("id"),
+            "sub_order_id": row.get("sub_order_id") or row.get("order_id") or "",
+            "phone": str(row.get("phone") or "").strip(),
+            "message": str(row.get("message") or "").strip(),
         }
-        for log in claimed
     ]
 
 

@@ -2453,7 +2453,7 @@ def update_whatsapp_message(whatsapp_id: str, message: str, url: str = "") -> di
 
 
 def claim_whatsapp_logs(
-    log_ids: list[str], stale_minutes: int = 15
+    log_ids: list[str], stale_minutes: int = 5
 ) -> list[dict[str, Any]]:
     """Durably claim these WhatsApp rows for delivery, and return the ones won.
 
