@@ -3647,44 +3647,52 @@ def list_audit_logs(limit: int = 200) -> list[dict[str, Any]]:
         _release(connection)
 
 
-def claim_whatsapp_logs(
+def claim_next_whatsapp_log(
     log_ids: list[str], stale_minutes: int = 5
-) -> list[dict[str, Any]]:
-    """Durably claim these WhatsApp rows for delivery, and return the ones won.
+) -> dict[str, Any] | None:
+    """Atomically claim the single next DELIVERABLE row, or None.
 
-    A row is claimable when it is still ``Pending``, or when it is ``Sending``
-    but was claimed longer than ``stale_minutes`` ago (the bot died mid-send, so
-    the message genuinely never went out and must be retried). The window is
-    short because the pending feed hands the bot exactly ONE message per poll —
-    so a stranded claim can only ever hold up a single shop, not a whole queue.
+    This picks the newest row that is genuinely claimable — ``Pending``, or
+    ``Sending`` but claimed long enough ago (the bot died mid-send, so it truly
+    never went out and must be retried).
 
-    Claiming flips the row to ``Sending`` and stamps ``claimed_at``. That is what
-    makes "send once" durable: the feed no longer offers a row that is already
-    mid-delivery, so a bot that cannot confirm no longer re-sends on every poll.
-    Rows claimed by a concurrent poller are excluded by the status guard, so two
-    agents can never both win the same message.
+    Picking "newest candidate then try to claim it" is a head-of-line blocking
+    bug: the newest candidate is often one that is already ``Sending`` and not
+    yet stale, so the claim fails and the feed returns NOTHING while perfectly
+    deliverable messages sit behind it. One stuck row then stalls every other
+    shop's order message, over and over, until it goes stale — which is exactly
+    "the order shows in the shopkeeper app but no WhatsApp ever arrives".
+
+    Selecting the claimable row INSIDE the statement removes the race between
+    choosing and claiming, so exactly one row is ever marked in-flight.
     """
     ids = [str(i) for i in (log_ids or []) if str(i).strip()]
     if not ids:
-        return []
+        return None
     with _DBContext(_connect()) as connection:
         with connection.cursor() as cur:
             cur.execute(
                 """
                 UPDATE whatsapp_logs
                    SET status = 'Sending', claimed_at = NOW()
-                 WHERE id = ANY(%s)
-                   AND (
-                        status = 'Pending'
-                     OR (status = 'Sending'
-                         AND (claimed_at IS NULL
-                              OR claimed_at < NOW() - (%s || ' minutes')::interval))
-                   )
+                 WHERE id = (
+                       SELECT id FROM whatsapp_logs
+                        WHERE id = ANY(%s)
+                          AND (
+                               status = 'Pending'
+                            OR (status = 'Sending'
+                                AND (claimed_at IS NULL
+                                     OR claimed_at < NOW() - (%s || ' minutes')::interval))
+                          )
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                 )
                 RETURNING *
                 """,
                 (ids, int(stale_minutes)),
             )
-            return _rows_to_dicts(cur.fetchall())
+            row = cur.fetchone()
+            return dict(row) if row else None
 
 
 def list_whatsapp_logs(limit: int = 100) -> list[dict[str, Any]]:

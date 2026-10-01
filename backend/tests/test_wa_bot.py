@@ -58,6 +58,43 @@ async def test_a_message_is_offered_to_the_bot_exactly_once(client):
     assert second.json() == [], "the same order was offered to the bot a second time"
 
 
+async def test_one_stuck_row_cannot_block_every_other_shop(client):
+    """A row already in flight must not stall the queue behind it.
+
+    THE BUG THIS PINS. The feed used to pick the newest candidate and only THEN
+    try to claim it. That newest candidate is very often one that is already
+    'Sending' and not yet stale — its claim fails, the feed returns nothing,
+    and every perfectly deliverable message behind it is never handed over. One
+    stuck row stalled all shop notifications, repeatedly.
+
+    That is exactly the reported symptom: the order is visible in the
+    shopkeeper app, but no WhatsApp message ever reaches the shop.
+    """
+    # Oldest first, so the "newest" pick would land on the row we then strand.
+    first = _ready_row("o-blocker")
+    later = _ready_row("o-behind-1")
+    newest = _ready_row("o-behind-2")
+
+    # Strand the NEWEST row: claimed a moment ago, i.e. mid-send.
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE whatsapp_logs SET status='Sending', claimed_at=datetime('now')"
+            " WHERE id = ?",
+            (newest["id"],),
+        )
+
+    body = (await client.get("/api/v1/local/whatsapp/pending")).json()
+    assert len(body) == 1, "a stuck row blocked the whole queue — no shop was messaged"
+    assert body[0]["id"] != newest["id"], "the in-flight row was handed out again"
+    assert body[0]["id"] in (first["id"], later["id"])
+
+    # And the queue keeps moving: the next poll gets the other deliverable row.
+    second = (await client.get("/api/v1/local/whatsapp/pending")).json()
+    assert len(second) == 1, "the queue stalled after the first message"
+    assert second[0]["id"] != body[0]["id"]
+    assert second[0]["id"] != newest["id"]
+
+
 async def test_confirming_delivery_keeps_it_out_of_the_feed(client, monkeypatch):
     """The normal path — send then confirm — also never re-offers the message."""
     from app.api.v1 import local as local_mod
@@ -222,6 +259,70 @@ async def test_cod_order_queues_exactly_one_shop_whatsapp(client):
     assert "confirm this order" not in str(rows[0].get("message") or "").lower()
 
 
+@pytest.mark.asyncio
+async def test_checkout_data_returns_everything_in_one_call(client):
+    """The pay/checkout pages must need ONE request, not 1 + 2N.
+
+    They used to fire /payment-settings plus /products and /shops/{id} for
+    every shop in the cart. On a serverless host each call pays its own cold
+    start, so a two-shop basket meant five round trips and the page sat on
+    "Loading the live price…" for the sum of them.
+    """
+    from test_order_cancel import _approved_shop_with_product
+
+    shop_a, prod_a = _approved_shop_with_product(f"{_u('ckA')}@example.com", "Checkout A")
+    shop_b, prod_b = _approved_shop_with_product(f"{_u('ckB')}@example.com", "Checkout B")
+
+    res = await client.get(
+        f"/api/v1/local/checkout-data?shop_ids={shop_a['id']},{shop_b['id']}"
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    ids = {s["id"] for s in body["shops"]}
+    assert ids == {shop_a["id"], shop_b["id"]}
+    assert body["payment_settings"], "payment settings missing — the QR page needs them"
+
+    # Products are grouped per shop so neither shop is priced from the other's.
+    assert prod_a["id"] in {p["id"] for p in body["products"][shop_a["id"]]}
+    assert prod_b["id"] in {p["id"] for p in body["products"][shop_b["id"]]}
+    assert prod_b["id"] not in {p["id"] for p in body["products"][shop_a["id"]]}
+
+    # Unavailable items must never be offered, or the student prices an order
+    # the server will then refuse to create.
+    for rows in body["products"].values():
+        assert all(p.get("available") for p in rows)
+
+
+@pytest.mark.asyncio
+async def test_checkout_data_tolerates_an_empty_or_unknown_cart(client):
+    """A bogus or empty shop list must not 500 the page."""
+    for qs in ("", "?shop_ids=", "?shop_ids=does-not-exist"):
+        res = await client.get(f"/api/v1/local/checkout-data{qs}")
+        assert res.status_code == 200, (qs, res.text)
+        assert res.json()["shops"] == []
+        assert res.json()["payment_settings"]
+
+
+@pytest.mark.asyncio
+async def test_checkout_data_does_not_leak_shops_the_student_did_not_ask_for(client):
+    """The response contains ONLY the requested shops.
+
+    Otherwise the cache entry for one cart would hand every visitor the full
+    shop list keyed to somebody else's basket.
+    """
+    from test_order_cancel import _approved_shop_with_product
+
+    wanted, _ = _approved_shop_with_product(f"{_u('ckW')}@example.com", "Wanted Shop")
+    other, _ = _approved_shop_with_product(f"{_u('ckO')}@example.com", "Other Shop")
+
+    res = await client.get(f"/api/v1/local/checkout-data?shop_ids={wanted['id']}")
+    assert res.status_code == 200
+    assert [s["id"] for s in res.json()["shops"]] == [wanted["id"]]
+    assert other["id"] not in res.json()["products"]
+
+
+@pytest.mark.asyncio
 async def test_the_whole_chain_sms_to_confirmed_order_to_one_whatsapp(client, monkeypatch):
     """THE END-TO-END JOIN, in one test.
 

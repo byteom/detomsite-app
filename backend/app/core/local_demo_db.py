@@ -2452,20 +2452,23 @@ def update_whatsapp_message(whatsapp_id: str, message: str, url: str = "") -> di
         return dict(row) if row else None
 
 
-def claim_whatsapp_logs(
+def claim_next_whatsapp_log(
     log_ids: list[str], stale_minutes: int = 5
-) -> list[dict[str, Any]]:
-    """Durably claim these WhatsApp rows for delivery, and return the ones won.
+) -> dict[str, Any] | None:
+    """Atomically claim the single next DELIVERABLE row, or None.
 
-    Mirrors the Supabase implementation. A row is claimable when it is still
-    ``Pending``, or ``Sending`` but claimed longer than ``stale_minutes`` ago
-    (the bot died mid-send, so the message never went out and must be retried).
-    Claiming flips it to ``Sending`` and stamps ``claimed_at``, which is what
-    makes "send once" survive a bot restart.
+    Mirrors the Supabase implementation. The claimable row is chosen INSIDE the
+    statement — the newest one that is ``Pending``, or ``Sending`` but claimed
+    long enough ago to be retried.
+
+    Choosing "newest candidate, then try to claim it" blocks the whole queue:
+    that newest candidate is frequently already ``Sending`` and not yet stale,
+    the claim fails, and the feed returns nothing while deliverable messages sit
+    behind it. See the Supabase docstring for the full failure mode.
     """
     ids = [str(i) for i in (log_ids or []) if str(i).strip()]
     if not ids:
-        return []
+        return None
     placeholders = ",".join("?" for _ in ids)
     cutoff = f"-{int(stale_minutes)} minutes"
     with _connect() as connection:
@@ -2473,18 +2476,23 @@ def claim_whatsapp_logs(
             f"""
             UPDATE whatsapp_logs
                SET status = 'Sending', claimed_at = CURRENT_TIMESTAMP
-             WHERE id IN ({placeholders})
-               AND (
-                    status = 'Pending'
-                 OR (status = 'Sending'
-                     AND (claimed_at IS NULL
-                          OR claimed_at < datetime('now', ?)))
-               )
+             WHERE id = (
+                   SELECT id FROM whatsapp_logs
+                    WHERE id IN ({placeholders})
+                      AND (
+                           status = 'Pending'
+                        OR (status = 'Sending'
+                            AND (claimed_at IS NULL
+                                 OR claimed_at < datetime('now', ?)))
+                      )
+                    ORDER BY created_at DESC
+                    LIMIT 1
+             )
             RETURNING *
             """,
             (*ids, cutoff),
         ).fetchall()
-        return _rows_to_dicts(rows)
+        return _rows_to_dicts(rows)[0] if rows else None
 
 
 def list_whatsapp_logs(limit: int = 100) -> list[dict[str, Any]]:

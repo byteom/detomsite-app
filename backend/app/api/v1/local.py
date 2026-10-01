@@ -1,7 +1,7 @@
 """
 API routes backed by Supabase Postgres (the only database).
 """
-from fastapi import APIRouter, HTTPException, Depends, Header, Request
+from fastapi import APIRouter, HTTPException, Depends, Header, Query, Request
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from datetime import datetime, timezone
 import asyncio
@@ -2498,33 +2498,25 @@ async def whatsapp_pending_agent(request: Request, x_agent_key: Optional[str] = 
     # A row stuck in 'Sending' becomes eligible again after the staleness
     # window, so a bot killed mid-send still results in delivery — it just can
     # never be re-sent instantly.
-    # HAND OVER EXACTLY ONE, AND CLAIM ONLY THAT ONE.
+    # HAND OVER EXACTLY ONE DELIVERABLE MESSAGE, AND CLAIM ONLY THAT ONE.
     #
     # The on-phone bot deliberately sends ONE message per poll cycle: the outbox
     # it fills is a single slot, so opening several WhatsApp chats back to back
-    # meant only the last one ever reached the screen. It takes the first row it
-    # is given, and only if the number is usable and it is not already mid-send
-    # on that device.
+    # meant only the last one ever reached the screen.
     #
-    # So the queue is claimed ONE AT A TIME. Claiming a whole batch and then
-    # returning one row is just as broken as not claiming at all: the rows the
-    # bot never opens are still marked in-flight, so they sit out the staleness
-    # window before they can even be picked up. That is what left every shop
-    # after the first in a combo order waiting — and never being told.
-    #
-    # We therefore pick the single row the bot would act on, claim exactly that
-    # id, and only return it if the claim was actually won. One row per request
-    # means a multi-shop order walks shop by shop, one cycle apart, and nothing
-    # is ever marked in-flight unless it is genuinely being sent.
+    # So the queue is claimed ONE AT A TIME — claiming a batch marks rows the bot
+    # never opens, and they then sit out the staleness window. `claim_next`
+    # picks the newest row that is genuinely CLAIMABLE inside the SQL, so a row
+    # already in flight can never block the deliverable messages behind it.
     if not candidates:
         return []
-    target = candidates[0]
-    won = await _db(db.claim_whatsapp_logs, [target.get("id")], 5)
-    if not won:
-        # Lost the race to another poller (or its claim is still fresh) — the
-        # bot simply gets nothing this cycle and tries again shortly.
+    row = await _db(
+        db.claim_next_whatsapp_log, [c.get("id") for c in candidates if c.get("id")], 5
+    )
+    if not row:
+        # Nothing claimable this cycle (a concurrent poller won the race).
+        # The bot simply tries again shortly.
         return []
-    row = won[0]
     return [
         {
             "id": row.get("id"),
@@ -3133,6 +3125,46 @@ def _load_products_with_stock() -> list[dict]:
         p["batch_type"] = batch_type
         p["stock_left"] = stocks.get(p["id"], 0)
     return products
+
+
+@router.get("/checkout-data")
+async def checkout_data(shop_ids: str = Query("", max_length=600)):
+    """Everything the checkout and payment pages need, in ONE cached request.
+
+    The pay page used to fire ``/payment-settings`` plus ``/products`` and
+    ``/shops/{id}`` for EVERY shop in the cart. That is 1 + 2N separate HTTP
+    calls, and on a serverless host each one pays its own cold start, so a
+    two-shop basket meant five round trips and the page sat on "Loading the live
+    price…" for the sum of them.
+
+    They are also all short-lived, low-cardinality reads of the same few rows,
+    so they belong behind one cache entry. One request now, one cold start, and
+    warm reads for every visitor afterwards.
+
+    ``shop_ids`` is a comma-separated list; an empty value returns just the
+    settings, which is what the checkout page needs before a shop is chosen.
+    """
+    wanted = [s.strip() for s in (shop_ids or "").split(",") if s.strip()][:20]
+
+    async def _load():
+        shops = [await _db(db.get_shop, sid) for sid in wanted]
+        shops = [s for s in shops if s]
+        products: dict[str, list] = {}
+        if shops:
+            # One store read for the whole cart, filtered per shop in Python —
+            # a call per shop would put us straight back where we started.
+            every = await _db(db.list_products) or []
+            by_shop: dict[str, list] = {}
+            for p in every:
+                if p.get("available"):
+                    by_shop.setdefault(str(p.get("shop_id")), []).append(p)
+            for s in shops:
+                products[str(s["id"])] = by_shop.get(str(s["id"]), [])
+        settings = await _db(db.get_payment_settings)
+        return {"shops": shops, "products": products, "payment_settings": settings}
+
+    key = "checkout:" + ",".join(sorted(wanted))
+    return await _cached_read(3, key, _load)
 
 
 @router.get("/products/stock")

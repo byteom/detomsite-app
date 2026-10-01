@@ -55,12 +55,29 @@ def test_annotations_resolve_under_eager_evaluation(module_name):
         try:
             typing.get_type_hints(obj)
         except Exception as exc:  # noqa: BLE001 - we are collecting every kind
-            broken.append(f"{name}: {type(exc).__name__}: {exc}")
+            broken.append(f"{name} annotation: {type(exc).__name__}: {exc}")
     assert not broken, (
         f"{module_name} has annotations that only resolve lazily. Python 3.14 "
         f"defers these (PEP 649) and hides the bug, but Vercel runs 3.12 and "
         f"will fail to import the module:\n  " + "\n  ".join(broken)
     )
+
+
+@pytest.mark.parametrize("module_name", API_MODULES)
+def test_module_imports_under_the_deployed_runtime(module_name):
+    """Every API module must import cleanly on its own.
+
+    This is the direct guard for the outage class of bug. A name used in a
+    parameter DEFAULT — `shop_ids: str = Query("")` with `Query` never
+    imported — is evaluated when the function is DEFINED, so the module raises
+    NameError on import and the entire API returns 500. It happened twice here:
+    first for an annotation (`Any`), then for a default (`Query`).
+
+    The annotation sweep above catches the lazy-annotation variant; this catches
+    the rest, and states the failure in terms of what actually breaks.
+    """
+    module = importlib.import_module(module_name)
+    assert module is not None
 
 
 # ── API surface: every route must be authenticated unless it is public by

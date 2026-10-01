@@ -1478,10 +1478,26 @@ function PaymentPage() {
      can refuse to continue when the shop accepts no payment method at all. */
   void buildUpiUri
 
-  useEffect(() => { api.get<PaymentSettings>('/local/payment-settings').then(r => setPs(r.data)).catch(() => {}).finally(() => setSettingsLoaded(true)) }, [])
+  /* ONE request instead of two. These were sequential — payment-settings, then
+   the shop — so the page waited for both cold starts before it could even
+   render the delivery form. /local/checkout-data returns both behind a single
+   cache entry, and both "loaded" flags flip together so the form never renders
+   against half-fetched state. */
   useEffect(() => {
-    if (!items.length) return
-    api.get<Shop>(`/local/shops/${items[0].shop_id}`).then(r => setShop(r.data)).catch(() => {}).finally(() => setShopLoaded(true))
+    const shopId = items[0]?.shop_id
+    const finish = () => { setSettingsLoaded(true); setShopLoaded(true) }
+    if (!items.length) { finish(); return }
+    api.get<{
+      shops: Shop[]
+      payment_settings: PaymentSettings
+    }>('/local/checkout-data', { params: shopId ? { shop_ids: shopId } : {} })
+      .then(({ data }) => {
+        if (data.payment_settings) setPs(data.payment_settings)
+        const found = data.shops?.find(s => s.id === shopId)
+        if (found) setShop(found)
+      })
+      .catch(() => {})
+      .finally(finish)
   }, [items[0]?.shop_id])
 
   const submit = (e: FormEvent) => {
@@ -1656,22 +1672,32 @@ function PayPage() {
      the student goes straight to Place Order. */
   const chosenMethod = saved.method || null
 
-  useEffect(() => { api.get<PaymentSettings>('/local/payment-settings').then(r => setPs(r.data)).catch(() => {}) }, [])
-
   /* Price the cart from the live product list, and pull the first shop for the
      UPI target + open/closed state. Every shop in the basket is priced, not just
-     the first, so a price edit at any one shop is caught before the order. */
+     the first, so a price edit at any one shop is caught before the order.
+
+     ONE request, not 1 + 2N. This used to fetch /payment-settings, then
+     /products AND /shops/{id} for every shop in the cart — each a separate HTTP
+     call, and on a serverless host each pays its own cold start. A two-shop
+     basket meant five round trips and the page sat on "Loading the live price…"
+     for the sum of them. /local/checkout-data returns all of it behind one
+     cache entry, so the page pays a single cold start and warm reads after. */
   const cartKey = items.map(i => i.product_id).join(',')
   useEffect(() => {
     if (!items.length) { setLoading(false); return }
     const shopIds = Array.from(new Set(items.map(i => i.shop_id)))
-    Promise.all(shopIds.map(id =>
-      Promise.all([
-        api.get<Product[]>('/local/products', { params: { shop_id: id } }),
-        api.get<Shop>(`/local/shops/${id}`),
-      ]).then(([pr, sr]) => ({ id, products: pr.data, shop: sr.data })),
-    ))
-      .then(results => {
+    api.get<{
+      shops: Shop[]
+      products: Record<string, Product[]>
+      payment_settings: PaymentSettings
+    }>('/local/checkout-data', { params: { shop_ids: shopIds.join(',') } })
+      .then(({ data }) => {
+        setPs(data.payment_settings)
+        const results = shopIds.map(id => ({
+          id,
+          products: data.products?.[id] || [],
+          shop: data.shops.find(s => s.id === id) as Shop,
+        }))
         // Values are the price of the WHOLE LINE (unit price x quantity), not
         // the unit price. Storing the unit price here and summing it directly
         // would quote a 3-vada order as the price of one vada.
