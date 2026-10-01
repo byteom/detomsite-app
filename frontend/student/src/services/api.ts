@@ -7,13 +7,13 @@ const api = axios.create({
   // saw a permanent spinner and had no way out. Every call now gives up so the
   // UI can show a real "could not reach the server" message.
   //
-  // 45s, not 20s: the API is serverless and pays a cold start per request
-  // (measured 7-14s for an order POST in production, occasionally more). At 20s
-  // the client abandoned requests the server had ALREADY completed, so students
-  // were shown "the server is taking too long to respond" for a successful
-  // order and then placed a second one. Reads are still retried below, so a
-  // genuinely stuck read recovers rather than hanging.
-  timeout: 45000,
+  // This default is for READS, and it is deliberately short. Reads are retried
+  // below (up to twice), so a stuck read costs 3 x this before it surfaces — a
+  // longer default multiplied by the retries is what left whole pages sitting
+  // on "Loading..." with no way forward. The one genuinely slow WRITE (placing
+  // an order, measured 8-14 s on a cold serverless instance) passes its own,
+  // larger timeout per request rather than inflating this one for everything.
+  timeout: 20000,
 })
 
 /* In-flight GET de-duplication.
@@ -47,7 +47,7 @@ api.interceptors.response.use(
     const method = (config?.method || 'get').toLowerCase()
     const attempts = config?._retries ?? 0
     // Only safe reads, and never more than two extra tries.
-    if (config && method === 'get' && attempts < 2 && RETRYABLE(err.response?.status)) {
+    if (config && method === 'get' && !config.noRetry && attempts < 2 && RETRYABLE(err.response?.status)) {
       config._retries = attempts + 1
       const wait = 1500 * attempts
       await new Promise((r) => setTimeout(r, wait))
@@ -113,12 +113,27 @@ api.interceptors.response.use(
 
 /* Wrap axios with in-flight de-duplication for safe (read) requests. Writes
  * are never shared — two clicks on "Place Order" must be two orders, not one
- * silently de-duplicated call. */
-export async function dedupeGet<T>(url: string, params?: Record<string, unknown>): Promise<any> {
-  const key = `get ${url} ${JSON.stringify(params || {})}`
+ * silently de-duplicated call.
+ *
+ * `opts.noRetry` exists for the auth gate. Retrying is right for a data fetch
+ * (a warm instance answers in ~0.4 s), but the session check sits ABOVE every
+ * page, so every retry is multiplied across the whole portal and each one costs
+ * a full timeout. It therefore gets a single short attempt and fails fast to
+ * the "can't reach the server — Retry" panel.
+ *
+ * `opts.timeout` overrides the default for this call only. */
+type DedupeOpts = { timeout?: number; noRetry?: boolean }
+export async function dedupeGet<T>(
+  url: string,
+  params?: Record<string, unknown>,
+  opts?: DedupeOpts,
+): Promise<any> {
+  const key = `get ${url} ${JSON.stringify(params || {})} ${opts?.timeout ?? ''}`
   const existing = inflight.get(key)
   if (existing) return existing
-  const p = api.get<T>(url, { params }).finally(() => inflight.delete(key))
+  const p = api
+    .get<T>(url, { params, ...(opts?.timeout ? { timeout: opts.timeout } : {}), ...(opts?.noRetry ? { noRetry: true } : {}) } as any)
+    .finally(() => inflight.delete(key))
   inflight.set(key, p)
   return p
 }

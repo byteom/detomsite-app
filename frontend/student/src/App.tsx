@@ -58,6 +58,15 @@ function readUser(): { id?: number; name?: string; username?: string; email?: st
    network error or a 5xx shows a "can't reach the server — Retry" panel and
    keeps the token, so a refresh recovers instantly. */
 const AUTH_CHECK_KEY = 'detomsite-auth-check'
+/* The session check gates EVERY page, so it gets a short, single-shot budget.
+ * A reachable server answers /users/profile in well under a second; anything
+ * approaching this ceiling is a genuinely unreachable server, and showing
+ * "Retry" is far kinder than a spinner the student cannot escape. */
+const AUTH_CHECK_TIMEOUT_MS = 8000
+/* Hard ceiling on the "Loading..." screen, independent of any request. If the
+ * session check has not concluded by now — for ANY reason — stop waiting and
+ * offer Retry. This is what makes a permanently stuck page impossible. */
+const AUTH_CHECK_WATCHDOG_MS = 12000
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const [checked, setChecked] = useState(false)
   const [ok, setOk] = useState(false)
@@ -72,23 +81,55 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
       return
     }
     let cancelled = false
+
+    /* WATCHDOG — the last line of defence against a page that never leaves
+     * "Loading...".
+     *
+     * Whatever the cause (a request that never settles, a tab restored from the
+     * back/forward cache mid-flight, a browser quirk), the student used to be
+     * left staring at a spinner with no way forward except reloading — and a
+     * reload just ran the same code again. This gives up waiting after a fixed
+     * budget and shows the "Retry" panel instead, so the page ALWAYS ends up
+     * with something the student can act on. */
+    const watchdog = setTimeout(() => {
+      if (cancelled) return
+      setOffline(true)
+      setChecked(true)
+      setOk(false)
+    }, AUTH_CHECK_WATCHDOG_MS)
+
     // Validated this same token recently? Go straight in — no network call.
     try {
       const cached = JSON.parse(localStorage.getItem(AUTH_CHECK_KEY) || 'null')
       if (cached && cached.token === token && Date.now() - cached.t < 10 * 60 * 1000) {
+        clearTimeout(watchdog)
         setChecked(true); setOk(true)
         return
       }
     } catch { /* fall through to the real check */ }
     setOffline(false)
-    // Validate the token against the backend — a stale/leftover token fails here
-    dedupeGet('/users/profile')
+    // Validate the token against the backend — a stale/leftover token fails here.
+    //
+    // This runs ABOVE every page, so it must fail FAST. It used to share the
+    // global read timeout AND the automatic GET retry, which meant a single
+    // unreachable server left the entire portal on "Loading..." for the sum of
+    // both (over two minutes at the previous 45 s default) with nothing to tap.
+    // A student on a weak connection simply reloaded, over and over, and the
+    // page never recovered on its own.
+    //
+    // So the session check gets ONE short attempt and no retry: the real 401 /
+    // 403 answer is instant when the server is reachable, so a slow response
+    // genuinely means unreachable, and the "Retry" panel is the right answer
+    // within a few seconds rather than after minutes of nothing.
+    dedupeGet('/users/profile', undefined, { timeout: AUTH_CHECK_TIMEOUT_MS, noRetry: true })
       .then(() => {
+        clearTimeout(watchdog)
         if (cancelled) return
         try { localStorage.setItem(AUTH_CHECK_KEY, JSON.stringify({ token, t: Date.now() })) } catch { /* ignore */ }
         setChecked(true); setOk(true)
       })
       .catch((err: any) => {
+        clearTimeout(watchdog)
         if (cancelled) return
         const status = err?.response?.status
         if (status === 401 || status === 403) {
@@ -102,7 +143,7 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
           setOffline(true); setChecked(true); setOk(false)
         }
       })
-    return () => { cancelled = true }
+    return () => { cancelled = true; clearTimeout(watchdog) }
   }, [attempt])
 
   if (!checked) {
