@@ -1492,8 +1492,10 @@ function PaymentPage() {
       payment_settings: PaymentSettings
     }>('/local/checkout-data', { params: shopId ? { shop_ids: shopId } : {} })
       .then(({ data }) => {
-        if (data.payment_settings) setPs(data.payment_settings)
-        const found = data.shops?.find(s => s.id === shopId)
+        // Defensive: a malformed response must not blank the checkout page.
+        if (data?.payment_settings) setPs(data.payment_settings)
+        const list = Array.isArray(data?.shops) ? data.shops : []
+        const found = list.find(s => s.id === shopId)
         if (found) setShop(found)
       })
       .catch(() => {})
@@ -1692,11 +1694,19 @@ function PayPage() {
       payment_settings: PaymentSettings
     }>('/local/checkout-data', { params: { shop_ids: shopIds.join(',') } })
       .then(({ data }) => {
-        setPs(data.payment_settings)
+        /* Defensive on every field. This page is the last step before someone
+           pays, and a bare `data.shops.find(...)` throws straight into the
+           error boundary the moment the response is not exactly the shape we
+           expect — taking the whole portal to "Something went wrong" with the
+           cart still full. Degrade to "prices unavailable" instead, which the
+           page already reports and recovers from. */
+        setPs(data?.payment_settings || null)
+        const list = Array.isArray(data?.shops) ? data.shops : []
+        const byId = data?.products && typeof data.products === 'object' ? data.products : {}
         const results = shopIds.map(id => ({
           id,
-          products: data.products?.[id] || [],
-          shop: data.shops.find(s => s.id === id) as Shop,
+          products: Array.isArray(byId[id]) ? byId[id] : [],
+          shop: list.find(s => s.id === id) as Shop,
         }))
         // Values are the price of the WHOLE LINE (unit price x quantity), not
         // the unit price. Storing the unit price here and summing it directly

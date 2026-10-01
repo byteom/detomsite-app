@@ -3147,24 +3147,37 @@ async def checkout_data(shop_ids: str = Query("", max_length=600)):
     wanted = [s.strip() for s in (shop_ids or "").split(",") if s.strip()][:20]
 
     async def _load():
+        # The expensive part — the whole product catalogue — is read through its
+        # OWN longer-lived cache entry and then filtered per shop in Python.
+        #
+        # It used to run `list_products()` inline under a 3-second TTL, so every
+        # distinct cart re-scanned the entire products table several times a
+        # minute. That is exactly the kind of load that makes EVERY portal feel
+        # slow, and it grew worse the more students were checking out.
+        products_by_shop: dict[str, list] = {}
+        if wanted:
+            catalogue = await _cached_read(60, "checkout:catalogue", db.list_products) or []
+            grouped: dict[str, list] = {}
+            for p in catalogue:
+                if p.get("available"):
+                    grouped.setdefault(str(p.get("shop_id")), []).append(p)
+            products_by_shop = grouped
+
+        # Shops are primary-key lookups, so N of them is cheap; only they vary
+        # per cart, so only they are keyed per cart.
         shops = [await _db(db.get_shop, sid) for sid in wanted]
         shops = [s for s in shops if s]
-        products: dict[str, list] = {}
-        if shops:
-            # One store read for the whole cart, filtered per shop in Python —
-            # a call per shop would put us straight back where we started.
-            every = await _db(db.list_products) or []
-            by_shop: dict[str, list] = {}
-            for p in every:
-                if p.get("available"):
-                    by_shop.setdefault(str(p.get("shop_id")), []).append(p)
-            for s in shops:
-                products[str(s["id"])] = by_shop.get(str(s["id"]), [])
         settings = await _db(db.get_payment_settings)
-        return {"shops": shops, "products": products, "payment_settings": settings}
+        return {
+            "shops": shops,
+            "products": {s["id"]: products_by_shop.get(str(s["id"]), []) for s in shops},
+            "payment_settings": settings,
+        }
 
     key = "checkout:" + ",".join(sorted(wanted))
-    return await _cached_read(3, key, _load)
+    # 30 s, not 3. Shop/product data changes far more slowly than that, and a
+    # short TTL turns a popular page into a database load generator.
+    return await _cached_read(30, key, _load)
 
 
 @router.get("/products/stock")
