@@ -128,6 +128,77 @@ async def test_an_unpaid_draft_is_never_claimed(client):
     assert [x["id"] for x in second.json()] == [draft["id"]]
 
 
+# ─── Queue-abuse guards ───
+async def test_the_queue_cannot_be_drained_by_polling(client, monkeypatch):
+    """Claiming is a WRITE, so an unthrottled poller must not be able to starve
+    every shop's order notifications.
+
+    The agent key is ONE shared secret pasted into every shop's phone. If this
+    feed could be polled in a loop, one leaked copy would claim every queued
+    message and never send it — each claim then blocking that message for the
+    staleness window. The real bot would find an empty queue and the whole
+    notification system would go silent campus-wide.
+    """
+    from app.api.v1 import local as local_mod
+
+    monkeypatch.setattr(local_mod.settings, "SMS_FORWARD_KEY", "topsecret")
+    monkeypatch.setattr(local_mod, "rate_allow", lambda *a, **k: False)
+    hdr = {"X-Agent-Key": "topsecret"}
+
+    res = await client.get("/api/v1/local/whatsapp/pending", headers=hdr)
+    assert res.status_code == 429, (
+        "the queue feed is unthrottled — a leaked agent key can drain every "
+        "shop's order notifications"
+    )
+
+
+async def test_a_row_with_no_usable_number_is_never_claimed(client):
+    """A poison row must not be able to occupy the queue.
+
+    The bot filters out any number it cannot normalise, so claiming such a row
+    server-side would mark a real order message in-flight, deliver nothing, and
+    leave it rotating through the staleness window forever.
+    """
+    good = _ready_row("o-good")
+    poison = store.log_whatsapp(
+        sub_order_id="o-poison", phone="",  # no number at all
+        message="Hello! New DETOMSITE order #poison\n• Payment: Cash on Delivery ₹50",
+        url="", status="Pending",
+    )
+
+    first = (await client.get("/api/v1/local/whatsapp/pending")).json()
+    assert [x["id"] for x in first] == [good["id"]], "an undeliverable row was handed to the bot"
+
+    # The poison row is left untouched and claimable-in-principle, never in-flight.
+    assert store.list_whatsapp_logs(50) is not None
+    with store._connect() as connection:
+        row = connection.execute(
+            "SELECT status FROM whatsapp_logs WHERE id = ?", (poison["id"],)
+        ).fetchone()
+    assert row["status"] == "Pending", "a row with no usable number was marked in-flight"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("9876543210", "919876543210"),      # bare 10-digit
+        ("09876543210", "919876543210"),     # domestic trunk prefix
+        ("+91 98765 43210", "919876543210"), # spaced, with country code
+        ("919876543210", "919876543210"),    # already full
+        ("", ""), ("12345", ""), ("abcdefghij", ""),
+    ],
+)
+def test_dialable_number_matches_what_the_bot_will_open(raw, expected):
+    """Server and phone must agree on what is deliverable.
+
+    If they disagree the server claims a message the bot then refuses to open,
+    and that order is never announced.
+    """
+    from app.api.v1.local import _dialable_whatsapp_number
+
+    assert _dialable_whatsapp_number(raw) == expected
+
+
 # ─── COD: placed on submit, messaged once, nothing to confirm ───
 async def test_cod_is_accepted_at_every_hour(client, monkeypatch):
     """The placement hour must not decide whether a COD order is "placed".

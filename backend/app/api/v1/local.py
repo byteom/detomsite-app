@@ -1229,6 +1229,30 @@ async def add_order(data: LocalOrderCreate, current_user: dict = Depends(get_cur
         if existing and str(existing.get("status") or "") in _AWAITING_PAYMENT_STATUSES:
             return existing
 
+    # PENTEST FIX — bound how fast one ACCOUNT can place orders.
+    #
+    # This endpoint had no per-account limit, so any authenticated student
+    # could loop it and create an unbounded number of real orders. Each one
+    # decrements product stock AND queues a WhatsApp message to a real
+    # shopkeeper, so the blast radius is not just database rows: it is a way to
+    # burn a shop's stock and flood every shop on campus with junk
+    # notifications, while looking like ordinary usage from one account.
+    #
+    # Keyed per student rather than per IP: a campus is behind one NAT, so an
+    # IP limit would lock out every honest student the moment one person
+    # misbehaved.
+    #
+    # Deliberately placed AFTER the idempotency check, so a legitimate retry of
+    # a slow checkout is free and a student can never be locked out by the
+    # very retry logic that protects them from duplicate orders.
+    if not rate_allow(
+        "place_order", str(current_user.get("id")), max_attempts=20, window_sec=300
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="You are placing orders too quickly — please wait a minute and try again.",
+        )
+
     # The student's mobile is always stored as E.164 (+91 + 10 digits) so the
     # shopkeeper/order views never see a bare 10-digit number.
     payload["student_phone"] = _normalize_phone(payload.get("student_phone", ""))
@@ -2370,6 +2394,26 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
         raise HTTPException(status_code=500, detail="Internal error")
 
 
+def _dialable_whatsapp_number(raw: Any) -> str:
+    """Can this shop number actually be dialled as an Indian mobile?
+
+    Mirrors the normalisation the on-phone bot performs before it opens
+    WhatsApp, so the two agree on what is deliverable. Without this the server
+    would happily claim a row the bot then refuses to open — marking a real
+    order message in-flight forever.
+
+    Returns the dialled form (country code + number) or "" when unusable.
+    """
+    digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    if len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]          # domestic trunk prefix
+    if len(digits) == 10:
+        return "91" + digits
+    if len(digits) == 12 and digits.startswith("91"):
+        return digits
+    return ""
+
+
 @router.get("/whatsapp/pending")
 async def whatsapp_pending_agent(request: Request, x_agent_key: Optional[str] = Header(None)):
     """Pending WhatsApp notifications for the on-phone auto-send bot (same
@@ -2391,6 +2435,29 @@ async def whatsapp_pending_agent(request: Request, x_agent_key: Optional[str] = 
     # order messages, so an anonymous caller must never be able to read it.
     _require_agent_key(x_agent_key, request)
 
+    # PENTEST FIX — THIS ENDPOINT NOW WRITES, SO IT MUST BE THROTTLED.
+    #
+    # Claiming a message is a STATE CHANGE (it marks the row 'Sending'), which
+    # makes this the only agent route that mutates the queue. That matters: the
+    # agent key is a single shared secret pasted into EVERY shop's phone, so one
+    # leaked copy — or one buggy/replayed client — could otherwise poll this in a
+    # loop, claim every queued order message, and never send any of them. Each
+    # claim then blocks its message for the staleness window, so the real bot
+    # would find the queue empty and every shop on campus would silently stop
+    # hearing about new orders. A cheap, permanent denial of the whole
+    # notification system.
+    #
+    # The genuine bot polls once every 20 s (3/min), so 30/min per client leaves
+    # an order of magnitude of headroom for retries while making queue-draining
+    # pointless.
+    if not rate_allow(
+        "wa_pending", rate_ip(request), max_attempts=30, window_sec=60
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many queue polls — slow down.",
+        )
+
     logs = await _db(db.list_whatsapp_logs, 100)
     # Two filters, both about not messaging the shop more than necessary:
     #   * "Sent" is already delivered.
@@ -2404,6 +2471,17 @@ async def whatsapp_pending_agent(request: Request, x_agent_key: Optional[str] = 
             continue
         message = str(log.get("message") or "").strip()
         if "awaiting payment" in message.lower():
+            continue
+        # Skip rows the bot physically cannot deliver, BEFORE they can become the
+        # claimed target. The bot filters these out itself (it needs a normalisable
+        # number), so claiming one here would mark it in-flight, send nothing, and
+        # leave it rotating through the staleness window forever — a poison row
+        # that can never be cleared and keeps re-entering the queue.
+        if not _dialable_whatsapp_number(log.get("phone")):
+            logger.warning(
+                "Skipping WhatsApp row %s: no usable number (%r)",
+                log.get("id"), log.get("phone"),
+            )
             continue
         candidates.append(log)
 

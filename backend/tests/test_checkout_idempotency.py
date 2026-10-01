@@ -373,3 +373,88 @@ async def test_utr_confirmation_does_not_pay_the_order_by_itself(client):
         "a student-supplied reference marked the order paid without bank evidence"
     )
 
+
+# ─── Abuse: one account must not be able to flood the platform ───
+@pytest.mark.anyio
+async def test_a_student_cannot_flood_the_platform_with_orders(client, monkeypatch):
+    """POST /orders must be bounded per ACCOUNT.
+
+    The endpoint had no per-account limit, so any authenticated student could
+    loop it and create an unbounded number of real orders. Each one decrements
+    product stock AND queues a WhatsApp message to a real shopkeeper — so the
+    abuse is not merely database rows, it is a way to burn a shop's stock and
+    flood the campus's shops with junk notifications from a single account.
+    """
+    from app.api.v1 import local as local_mod
+
+    token = await _student(client, "flood")
+    shop, product = _approved_shop_with_product(f"{_u('fl_v')}@example.com", "Flood Vendor")
+
+    # The limiter reports this account is out of budget.
+    monkeypatch.setattr(local_mod, "rate_allow", lambda *a, **k: False)
+    res = await client.post(
+        "/api/v1/local/orders", json=_body(shop, product, "co-" + _u("f")),
+        headers=_headers(token),
+    )
+    assert res.status_code == 429, "an unthrottled student can place unlimited orders"
+
+
+@pytest.mark.anyio
+async def test_the_order_limit_does_not_lock_out_other_students(client, monkeypatch):
+    """The limit is per student — never global, and never per-IP.
+
+    A campus sits behind a single NAT address, so an IP-based limit would lock
+    out every honest student the moment one person misbehaved.
+    """
+    from app.api.v1 import local as local_mod
+
+    token = await _student(client, "iso1")
+    shop, product = _approved_shop_with_product(f"{_u('iso1_v')}@example.com", "Iso Vendor 1")
+
+    monkeypatch.setattr(local_mod, "rate_allow", lambda *a, **k: False)
+    blocked = await client.post(
+        "/api/v1/local/orders", json=_body(shop, product, "co-" + _u("a")),
+        headers=_headers(token),
+    )
+    assert blocked.status_code == 429
+
+    monkeypatch.undo()
+    other = await _student(client, "iso2")
+    shop2, product2 = _approved_shop_with_product(f"{_u('iso2_v')}@example.com", "Iso Vendor 2")
+    ok = await client.post(
+        "/api/v1/local/orders", json=_body(shop2, product2, "co-" + _u("b")),
+        headers=_headers(other),
+    )
+    assert ok.status_code == 200, ok.text
+
+
+@pytest.mark.anyio
+async def test_an_idempotent_retry_does_not_burn_the_order_budget(client, monkeypatch):
+    """The order limit must sit AFTER the idempotency check.
+
+    The portal retries a slow checkout on purpose, because the serverless host
+    is slow on a cold start. If a retry consumed the student's order budget, a
+    flaky connection could lock them out mid-checkout — the exact failure the
+    retry exists to prevent. Replaying the same client_ref is therefore free.
+    """
+    from app.api.v1 import local as local_mod
+
+    token = await _student(client, "budget")
+    headers = _headers(token)
+    shop, product = _approved_shop_with_product(f"{_u('bg_v')}@example.com", "Budget Vendor")
+    ref = "co-" + _u("bg")
+
+    first = await client.post("/api/v1/local/orders", json=_body(shop, product, ref), headers=headers)
+    assert first.status_code == 200, first.text
+    first_id = first.json()["id"]
+
+    # The limiter now refuses everything — but a replay of the SAME basket is
+    # served by the idempotency check, which runs before the limiter is asked.
+    monkeypatch.setattr(local_mod, "rate_allow", lambda *a, **k: False)
+    replay = await client.post("/api/v1/local/orders", json=_body(shop, product, ref), headers=headers)
+    assert replay.status_code == 200, (
+        "a legitimate retry was blocked by the order rate limit — a slow "
+        "checkout could now lock a student out of paying"
+    )
+    assert replay.json()["id"] == first_id
+
