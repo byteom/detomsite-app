@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -69,6 +70,19 @@ def _connection_string() -> str:
 # needs a TCP + TLS handshake across regions). We keep a small pool of warm
 # connections and reuse them, which makes the site feel much snappier.
 _pool: Any = None
+
+# How long a request may wait for a busy pool slot before giving up.
+#
+# A slot is momentarily busy, not missing, so waiting is correct — but the wait
+# has to be bounded or a saturated pool would turn into hanging requests. This
+# is comfortably under a normal request budget: checkout is a handful of fast
+# queries, so a slot frees within milliseconds under realistic load.
+_POOL_WAIT_SECONDS = 8.0
+
+# Pool size. Supabase's free tier allows far more than 15 connections, and 15
+# proved too small: 20 simultaneous checkout requests produced 7 hard 500s.
+# 25 leaves headroom for a burst while staying modest for the database.
+_POOL_MAX = 25
 
 
 def _dsn_options(dsn: str) -> str:
@@ -129,7 +143,7 @@ def _get_pool() -> Any:
     global _pool
     if _pool is None:
         _pool = _pg_pool.ThreadedConnectionPool(
-            1, 15, _connection_string(),
+            1, _POOL_MAX, _connection_string(),
             cursor_factory=psycopg2.extras.RealDictCursor,
             **_pool_connect_kwargs(),
         )
@@ -137,14 +151,49 @@ def _get_pool() -> Any:
 
 
 def _connect() -> Any:
-    """Get a pooled Postgres connection with dict-row support."""
-    conn = _get_pool().getconn()
-    if getattr(conn, "closed", 0) != 0:
-        # Stale pooled connection — return its slot (rebuilds the pool) and
-        # ask for a fresh one, so the slot is never leaked.
-        _release(conn, discard=True)
-        conn = _get_pool().getconn()
-    return conn
+    """Get a pooled Postgres connection with dict-row support.
+
+    PENTEST/RELIABILITY FIX (production 500s under load). ``getconn()`` raises
+    ``PoolError("connection pool exhausted")`` the moment all 15 slots are
+    checked out — it does NOT wait. Nothing here caught that, so it propagated
+    as an HTTP 500.
+
+    Reproduced live: 20 simultaneous requests to /checkout-data returned
+    **13 × 200 and 7 × 500**. That is the "Could not load the live prices for
+    your cart" message, and it was intermittent, which is why it looked like a
+    flaky connection rather than a hard limit. It hits the busiest page exactly
+    when several students check out at once.
+
+    A pool slot is a resource that is *momentarily* busy, not missing, so the
+    right behaviour is to wait a moment for one to come back. The wait is short
+    and bounded: a checkout is a handful of quick queries, so a slot frees up
+    almost immediately. Anything that is genuinely stuck is already capped by
+    the server-side ``statement_timeout``, so this cannot queue forever.
+    """
+    pool = _get_pool()
+    deadline = time.monotonic() + _POOL_WAIT_SECONDS
+    delay = 0.02
+    while True:
+        try:
+            conn = pool.getconn()
+        except _pg_pool.PoolError:
+            if time.monotonic() >= deadline:
+                # Out of patience. This is a real capacity problem, so say so
+                # rather than pretending — but it is still a server-side fault,
+                # and the middleware turns this into a 503, not a 500.
+                logger.error("Postgres pool exhausted after %.1fs", _POOL_WAIT_SECONDS)
+                raise
+            # Contention, not failure: back off gently and try again.
+            time.sleep(delay)
+            delay = min(delay * 1.6, 0.25)
+            continue
+
+        if getattr(conn, "closed", 0) != 0:
+            # Stale pooled connection — return its slot (rebuilds the pool) and
+            # ask for a fresh one, so the slot is never leaked.
+            _release(conn, discard=True)
+            continue
+        return conn
 
 
 def _release(conn: Any, discard: bool = False) -> None:

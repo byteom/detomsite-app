@@ -27,6 +27,26 @@ def _is_client_body_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_retryable_capacity_error(exc: BaseException) -> bool:
+    """True for a transient "come back in a moment" server fault.
+
+    Currently: the Postgres connection pool being exhausted. Reproduced live
+    with 20 concurrent checkout requests, 7 of which returned 500 — which
+    surfaced to students as "Could not load the live prices for your cart".
+    The request was never wrong; the server was briefly out of slots, so the
+    honest status is 503 + Retry-After, not 500.
+
+    Matched by class name and message rather than importing psycopg2 here, so
+    this module stays free of a database dependency and cannot itself fail to
+    import while handling an error.
+    """
+    for klass in type(exc).__mro__:
+        if klass.__name__ in ("PoolError", "TooManyConnections"):
+            return True
+    text = str(exc).lower()
+    return "connection pool exhausted" in text or "too many connections" in text
+
+
 class ErrorHandlingMiddleware(BaseHTTPMiddleware):
     """Middleware for error handling"""
 
@@ -63,6 +83,22 @@ class ErrorHandlingMiddleware(BaseHTTPMiddleware):
                 f"Unhandled error - Request ID: {request_id}, "
                 f"Path: {request.url.path}, Error: {str(e)}"
             )
+
+            # A saturated database pool is a CAPACITY problem, not a broken
+            # request: nothing about the caller's request was wrong, and the
+            # exact same call will succeed moments later. 503 says "try again"
+            # to every client and any retry logic, while 500 reads as "this
+            # request is invalid" and is what made a transient pool shortage
+            # look like a permanent fault on the checkout page.
+            if _is_retryable_capacity_error(e):
+                return JSONResponse(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    content={
+                        "detail": "The service is busy. Please try again in a moment.",
+                        "request_id": request_id,
+                    },
+                    headers={"Retry-After": "2"},
+                )
 
             # Don't expose internal errors in production
             error_message = str(e) if settings.DEBUG else "Internal Server Error"
