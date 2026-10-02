@@ -2,6 +2,7 @@
 Error handling middleware
 """
 import json
+import os
 
 from fastapi import Request, status
 from fastapi.responses import JSONResponse
@@ -11,6 +12,14 @@ import logging
 import uuid
 
 logger = logging.getLogger(__name__)
+
+# TEMPORARY diagnostic switch, default OFF. Enabled for one deploy to identify
+# the class of a production-only 500, then removed. It reveals the exception
+# TYPE NAME only — never the message, which can contain SQL or credentials.
+# TEMPORARY diagnostic switch, default OFF. Enabled for one deploy to identify
+# the class of a production-only 500, then removed. It reveals the exception
+# TYPE NAME only — never the message, which can contain SQL or credentials.
+_EXPOSE_ERROR_CLASS = os.environ.get("EXPOSE_ERROR_CLASS", "") == "1"
 
 
 def _is_client_body_error(exc: BaseException) -> bool:
@@ -30,21 +39,41 @@ def _is_client_body_error(exc: BaseException) -> bool:
 def _is_retryable_capacity_error(exc: BaseException) -> bool:
     """True for a transient "come back in a moment" server fault.
 
-    Currently: the Postgres connection pool being exhausted. Reproduced live
-    with 20 concurrent checkout requests, 7 of which returned 500 — which
-    surfaced to students as "Could not load the live prices for your cart".
-    The request was never wrong; the server was briefly out of slots, so the
-    honest status is 503 + Retry-After, not 500.
+    Identified live, by exposing the exception class name for one deploy: a
+    20-way burst of /checkout-data produced 20 × ``OperationalError`` and no
+    ``PoolError`` at all.
+
+    In psycopg2, ``QueryCanceled`` — a statement killed by the server-side
+    ``statement_timeout`` — is a SUBCLASS of ``OperationalError``. So this was
+    never the pool refusing a slot; it was a request that waited for a slot,
+    then waited behind Supabase's own connection pooler, and finally had its
+    query cancelled at the 20 s mark. The request was well-formed and the same
+    call succeeds once the instance is warm, so the honest status is 503 +
+    Retry-After, and the client should try again rather than be told the
+    checkout is broken.
 
     Matched by class name and message rather than importing psycopg2 here, so
     this module stays free of a database dependency and cannot itself fail to
     import while handling an error.
     """
     for klass in type(exc).__mro__:
-        if klass.__name__ in ("PoolError", "TooManyConnections"):
+        if klass.__name__ in (
+            "PoolError",
+            "TooManyConnections",
+            "QueryCanceled",
+            # Connection-level problems are equally transient: a pooler that
+            # recycled an idle backend, a dropped socket, a database restart.
+            "OperationalError",
+        ):
             return True
     text = str(exc).lower()
-    return "connection pool exhausted" in text or "too many connections" in text
+    return (
+        "connection pool exhausted" in text
+        or "too many connections" in text
+        or "too many clients" in text
+        or "canceling statement due to statement timeout" in text
+        or "server closed the connection unexpectedly" in text
+    )
 
 
 class ErrorHandlingMiddleware(BaseHTTPMiddleware):
@@ -100,8 +129,15 @@ class ErrorHandlingMiddleware(BaseHTTPMiddleware):
                     headers={"Retry-After": "2"},
                 )
 
+            # TEMPORARY DIAGNOSTIC (will be removed once identified): expose only
+            # the exception CLASS NAME — never its message, which can carry SQL
+            # fragments and connection strings.
+            if _EXPOSE_ERROR_CLASS:
+                error_message = f"{type(e).__name__}"
+
             # Don't expose internal errors in production
-            error_message = str(e) if settings.DEBUG else "Internal Server Error"
+            if not settings.DEBUG and not _EXPOSE_ERROR_CLASS:
+                error_message = "Internal Server Error"
 
             return JSONResponse(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

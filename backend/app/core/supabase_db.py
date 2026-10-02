@@ -74,11 +74,18 @@ _pool: Any = None
 
 # How long a request may wait for a busy pool slot before giving up.
 #
-# A slot is momentarily busy, not missing, so waiting is correct — but the wait
-# has to be bounded or a saturated pool would turn into hanging requests. This
-# is comfortably under a normal request budget: checkout is a handful of fast
-# queries, so a slot frees within milliseconds under realistic load.
-_POOL_WAIT_SECONDS = 8.0
+# Deliberately SHORTER than the server-side ``statement_timeout`` (20 s). A
+# request that waited 8 s for a slot and then queued behind Supabase's own
+# pooler still had its query cancelled at 20 s — that is what produced the
+# production 500s (psycopg2 raises QueryCanceled, a subclass of
+# OperationalError). Failing fast at 3 s instead means the client gets a
+# retryable 503 while the request is still cheap, rather than burning 20 s of a
+# serverless invocation to be told nothing.
+#
+# A slot frees in milliseconds under normal load, so 3 s is generous; it only
+# matters when the pool is genuinely saturated, which is exactly when waiting
+# longer is pointless.
+_POOL_WAIT_SECONDS = 3.0
 
 # Pool size.
 #
