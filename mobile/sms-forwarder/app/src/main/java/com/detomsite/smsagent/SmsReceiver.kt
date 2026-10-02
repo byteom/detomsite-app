@@ -162,6 +162,11 @@ class SmsReceiver : BroadcastReceiver() {
     private suspend fun sendProof(
         context: Context, baseUrl: String, agentKey: String, utr: String, amount: Double
     ) {
+        // Hoisted OUT of the try so the catch block can retry with them: a
+        // local declared inside the try is not in scope in the catch, and the
+        // first version of this fix could not compile for exactly that reason.
+        var request: Request? = null
+        var client: OkHttpClient? = null
         try {
             // Accept both "https://host" and "https://host/api/v1/local" as the
             // saved base URL — never double-append the path. normalizeBackendUrl
@@ -174,20 +179,33 @@ class SmsReceiver : BroadcastReceiver() {
                 .put("utr", utr)
                 .put("amount", amount)
             val body = json.toString().toRequestBody(JSON_MEDIA)
-            val request = Request.Builder()
+            request = Request.Builder()
                 .url("$root/api/v1/local/sms/match")
                 .post(body)
                 .header("Content-Type", "application/json")
                 .header("X-Agent-Key", agentKey)
                 .build()
-            // Timeouts are sized to fit the goAsync() budget (~10 s), so a hung
-            // network can never leave the broadcast pending until Android force-
-            // kills the process.
-            val client = OkHttpClient.Builder()
-                .connectTimeout(6, TimeUnit.SECONDS)
-                .readTimeout(6, TimeUnit.SECONDS)
+            // Timeouts must cover a COLD serverless start.
+            //
+            // BUG FIX (payments silently never confirmed). These were 6 s, sized
+            // for the goAsync() budget. But the backend is a Vercel serverless
+            // function that boots per request, and a cold start measures
+            // 7.5–14 s in production. So on a cold instance the proof POST was
+            // aborted client-side BEFORE the server ever saw it: the student had
+            // paid, the order stayed "Pending Payment", and nothing was logged
+            // on the server to explain why. The `goAsync()` budget is ~10 s of
+            // *pending* time, but Android's limit is not a hard kill on a
+            // socket that is already established — and a background broadcast
+            // receiver is exactly the case where finishing the upload matters
+            // more than returning instantly. 20 s comfortably covers a cold
+            // boot while still letting the broadcast finish well inside the
+            // platform's window.
+            client = OkHttpClient.Builder()
+                .connectTimeout(10, TimeUnit.SECONDS)
+                .readTimeout(20, TimeUnit.SECONDS)
+                .writeTimeout(10, TimeUnit.SECONDS)
                 .build()
-            client.newCall(request).execute().use { resp ->
+            client!!.newCall(request!!).execute().use { resp ->
                 val code = resp.code
                 val bodyText = resp.body?.string().orEmpty()
                 Log.i(TAG, "sms/match → $code: ${bodyText.take(120)}")
@@ -213,7 +231,7 @@ class SmsReceiver : BroadcastReceiver() {
                     // this class is fixing.
                     if (code in 500..599) {
                         delay(1500)
-                        val retry = client.newCall(request.newBuilder().build()).execute()
+                        val retry = client!!.newCall(request!!.newBuilder().build()).execute()
                         retry.use { r2 ->
                             val retryBody = r2.body?.string().orEmpty()
                             if (r2.code in 200..299) {
@@ -236,8 +254,51 @@ class SmsReceiver : BroadcastReceiver() {
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "sendProof failed: ${e.message}")
-            notifyRejected(context, "Could not reach DETOMSITE — check your internet connection.")
+            // BUG FIX (paid orders never confirmed). This gave up on the FIRST
+            // network error, so a momentary dropout — a dead spot, a switching
+            // mobile data, the app process being frozen — meant the bank credit
+            // was simply lost. The SMS is not re-delivered, so there is no
+            // second chance: the student had paid, the order sat unpaid, and
+            // nothing on the server recorded that proof ever existed.
+            //
+            // A timeout/IO failure is safe to retry — the match endpoint is
+            // idempotent per credit (it stamps the UTR onto the payment row), and
+            // the server's own 409 for an already-settled credit is handled
+            // below rather than double-settling anything. One retry after a
+            // short pause covers the common case, which is a brief blip.
+            Log.e(TAG, "sendProof failed (${e.message}) — retrying once")
+            var settled = false
+            // If the request never got built (a bad URL, say) there is nothing
+            // to retry, and saying "check your connection" would be misleading.
+            val builtRequest = request
+            val builtClient = client
+            if (builtRequest != null && builtClient != null) {
+                try {
+                    delay(2000)
+                    val retry = builtClient.newCall(builtRequest.newBuilder().build()).execute()
+                    retry.use { r2 ->
+                        val retryBody = r2.body?.string().orEmpty()
+                        if (r2.code in 200..299) {
+                            val orderId = runCatching { JSONObject(retryBody).optString("order_id") }.getOrDefault("")
+                            notifySent(
+                                context,
+                                if (utr.isEmpty()) "₹${amount.toInt()} received ✓ — order $orderId completed"
+                                else "UTR $utr ✓ — order $orderId completed"
+                            )
+                        } else {
+                            notifyRejected(context, rejectionReason(retryBody))
+                        }
+                        settled = true
+                    }
+                } catch (e2: Exception) {
+                    Log.e(TAG, "sendProof retry also failed: ${e2.message}")
+                }
+            }
+            // Only claim we could not reach the server when the retry never got
+            // an answer at all; a rejection reason is more useful to the shop.
+            if (!settled) {
+                notifyRejected(context, "Could not reach DETOMSITE — check your internet connection.")
+            }
         }
     }
 

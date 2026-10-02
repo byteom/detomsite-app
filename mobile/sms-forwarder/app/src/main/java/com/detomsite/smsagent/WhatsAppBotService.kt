@@ -66,8 +66,19 @@ class WhatsAppBotService : Service() {
      */
     private val http: OkHttpClient by lazy {
         OkHttpClient.Builder()
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(10, TimeUnit.SECONDS)
+            // BUG FIX (bot never sees a message). These were 10 s, but the
+            // backend is a Vercel serverless function that boots PER REQUEST and
+            // measures 7.5–14 s cold in production. So on a cold instance the
+            // queue poll was aborted client-side before the server replied, the
+            // bot logged "pending → ?" and moved on — and since every later poll
+            // in that window also hit a cold or busy instance, the shop could go
+            // hours without its order. This is the single most likely reason
+            // "the bot does nothing".
+            //
+            // A poll that takes 20 s is still only one message per cycle, so
+            // throughput is unchanged; it just stops discarding the answer.
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(25, TimeUnit.SECONDS)
             .build()
     }
     private var poller: Job? = null
@@ -175,12 +186,22 @@ class WhatsAppBotService : Service() {
 
     private suspend fun pollLoop() {
         while (scope.isActive) {
+            val started = System.currentTimeMillis()
             try {
                 if (isEnabled()) awaitOutbox()
             } catch (e: Exception) {
                 Log.w(TAG, "poll error: ${e.message}")
             }
-            delay(20_000L)
+            // Sleep the REMAINDER of the interval, not the whole interval.
+            //
+            // BUG FIX (messages arrive very late). A cold poll can take ~14 s on
+            // its own, and the loop then slept a further 20 s, so a cycle was
+            // ~34 s. A three-shop order needs three cycles, and each shop's
+            // message therefore arrived half a minute or more after the one
+            // before it — the queue crawled. Measuring from the start of the
+            // work keeps the cadence at a steady 20 s however slow the call was.
+            val elapsed = System.currentTimeMillis() - started
+            delay((POLL_INTERVAL_MS - elapsed).coerceAtLeast(1_000L))
         }
     }
     private fun isEnabled(): Boolean {
@@ -216,11 +237,21 @@ class WhatsAppBotService : Service() {
         // confirmed — so it stayed 'Sending' server-side and eventually came
         // back around. Waiting for the current send to settle is what makes
         // "one message at a time" actually true on the phone.
+        //
+        // REGRESSION FIX (messages arriving very late). This guard was first
+        // written with the 8-minute RETRY_WINDOW_MS, which meant one stuck send
+        // blocked the ENTIRE queue for 8 minutes — every other shop's order
+        // waited behind it. A send that is going to work completes in seconds
+        // (the accessibility tap follows the message within ~1.3 s), so the
+        // guard only needs to outlast a normal send, not the retry window. On
+        // expiry the stuck send is abandoned WITHOUT being marked delivered, so
+        // the server still re-offers it and the other shops are not held up.
         if (AutoSendState.id != null) {
             val launched = System.currentTimeMillis() - AutoSendState.launchedAt
-            // A send that never completes must not wedge the outbox forever.
-            if (launched < RETRY_WINDOW_MS) return
-            Log.w(TAG, "outbox still occupied after ${launched}ms — clearing and retrying")
+            if (launched < OUTBOX_BUSY_MS) return
+            Log.w(TAG, "outbox occupied ${launched}ms without completing — abandoning")
+            // Deliberately NOT inFlight.remove()/rememberDelivered(): the send
+            // did not happen, so this id must stay eligible on the server.
             inFlight.remove(AutoSendState.id)
             AutoSendState.clear()
         }
@@ -443,6 +474,29 @@ class WhatsAppBotService : Service() {
          * The margin absorbs clock skew and poll-alignment.
          */
         private const val RETRY_WINDOW_MS = 8 * 60_000L
+
+        /**
+         * How long the single outbox slot may be occupied before the send is
+         * abandoned and the queue moves on.
+         *
+         * A send that is going to succeed completes in about a second: the
+         * accessibility tap follows the pre-filled message within ~1.3 s. So
+         * anything still pending after 45 s is not going to complete, and
+         * holding the queue for the full retry window made every OTHER shop's
+         * order wait behind one stuck message — the "messages arrive very late"
+         * symptom. The abandoned id is NOT marked delivered, so the server
+         * re-offers it and nothing is lost.
+         */
+        private const val OUTBOX_BUSY_MS = 45_000L
+
+        /**
+         * Gap between queue polls.
+         *
+         * 20 s is comfortably inside the server's own throttle for this feed
+         * (30/min per client), so the bot can never lock itself out, while
+         * keeping a single-shop order to the shop's phone within half a minute.
+         */
+        private const val POLL_INTERVAL_MS = 20_000L
 
         private const val SENDING = 70
         private const val GUIDANCE = 71
