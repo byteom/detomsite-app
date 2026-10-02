@@ -87,6 +87,27 @@ class WhatsAppBotService : Service() {
      * the last few messages. */
     private val delivered = LinkedHashSet<String>()
 
+    /**
+     * Load the persisted delivery ledger at service start.
+     *
+     * BUG FIX (duplicate WhatsApp after a restart). `delivered` was in-memory
+     * only, so every restart forgot which messages had already gone out. The
+     * server's claim only holds a row for 5 minutes; a bot restarted after that
+     * (Android kills a foreground service under memory pressure all the time)
+     * would be handed the SAME row again and message the shop a second time.
+     * The server cannot fix this alone — it cannot tell "never sent" from
+     * "sent, but the mark-sent POST never landed".
+     */
+    private fun loadDelivered() {
+        val raw = getSharedPreferences("agent", Context.MODE_PRIVATE)
+            .getString("wa_delivered", "").orEmpty()
+        synchronized(delivered) {
+            delivered.clear()
+            raw.split(',').filter { it.isNotBlank() }.forEach { delivered.add(it) }
+        }
+        if (delivered.isNotEmpty()) Log.i(TAG, "restored ${delivered.size} delivered ids")
+    }
+
     /** Remember a delivery, dropping the oldest once the set is full. */
     private fun rememberDelivered(id: String) {
         synchronized(delivered) {
@@ -95,7 +116,22 @@ class WhatsAppBotService : Service() {
                 val oldest = delivered.iterator().next()
                 delivered.remove(oldest)
             }
+            persistDelivered()
         }
+    }
+
+    /**
+     * Persist immediately rather than on a timer.
+     *
+     * The previous behaviour kept the ledger in memory and only the in-flight
+     * map in the process, so a crash between the WhatsApp send and the next poll
+     * lost the fact entirely. This is written on every send (a handful per day),
+     * so the write cost is irrelevant next to losing the guarantee.
+     */
+    private fun persistDelivered() {
+        val snapshot = synchronized(delivered) { delivered.joinToString(",") }
+        getSharedPreferences("agent", Context.MODE_PRIVATE)
+            .edit().putString("wa_delivered", snapshot).apply()
     }
 
     private fun alreadyDelivered(id: String): Boolean = synchronized(delivered) { id in delivered }
@@ -109,6 +145,7 @@ class WhatsAppBotService : Service() {
         if (instance == null) instance = this
         startForegroundCompat()
         if (poller?.isActive != true) {
+            loadDelivered()
             poller = scope.launch { pollLoop() }
         }
         return START_STICKY
@@ -146,7 +183,6 @@ class WhatsAppBotService : Service() {
             delay(20_000L)
         }
     }
-
     private fun isEnabled(): Boolean {
         val p = getSharedPreferences("agent", Context.MODE_PRIVATE)
         return p.getBoolean("wa_bot_enabled", false) &&
@@ -169,6 +205,24 @@ class WhatsAppBotService : Service() {
         if (!whatsAppInstalled()) {
             notifyGuidance("WhatsApp is not installed — install it to auto-send.")
             return
+        }
+
+        // BUG FIX (stuck outbox = "no WhatsApp ever arrives"). This poll used to
+        // run even while a send was still pending, so it could claim a SECOND
+        // message and overwrite the single outbox slot that
+        // WhatsAppAccessibilityService is waiting on. The first message's tap
+        // then either fired against the wrong chat or never fired at all, and
+        // because the new id had replaced it, the first message was never
+        // confirmed — so it stayed 'Sending' server-side and eventually came
+        // back around. Waiting for the current send to settle is what makes
+        // "one message at a time" actually true on the phone.
+        if (AutoSendState.id != null) {
+            val launched = System.currentTimeMillis() - AutoSendState.launchedAt
+            // A send that never completes must not wedge the outbox forever.
+            if (launched < RETRY_WINDOW_MS) return
+            Log.w(TAG, "outbox still occupied after ${launched}ms — clearing and retrying")
+            inFlight.remove(AutoSendState.id)
+            AutoSendState.clear()
         }
 
         val pending = fetchPending(root, key) ?: return
@@ -196,10 +250,29 @@ class WhatsAppBotService : Service() {
         openWhatsApp(id, item.optString("phone"), item.optString("message"))
     }
 
-    /** Launched within the retry window and still waiting for accessibility? */
+    /**
+     * Launched within the retry window and still waiting for accessibility?
+     *
+     * BUG FIX (window mismatch + unbounded growth). This used to be 3 minutes,
+     * while the server's claim expires after 5. So between minute 3 and minute 5
+     * the bot considered a message "not recently launched" and would re-open
+     * WhatsApp for it — while the server was STILL holding the claim, so the
+     * same shop got the same order a second time. The two windows have to agree,
+     * and the local one must be the LONGER of the two, otherwise the bot
+     * re-sends inside the period the server believes is already handled.
+     *
+     * It also never removed entries for ids that were neither delivered nor
+     * retried, so `inFlight` grew for the life of the process. Entries are now
+     * dropped once they are older than the window.
+     */
     private fun isRecentlyLaunched(id: String): Boolean {
         val launched = inFlight[id] ?: return false
-        return System.currentTimeMillis() - launched < 3 * 60_000L
+        val age = System.currentTimeMillis() - launched
+        if (age >= RETRY_WINDOW_MS) {
+            inFlight.remove(id)
+            return false
+        }
+        return true
     }
 
     private suspend fun fetchPending(root: String, key: String): JSONArray? = withContext(Dispatchers.IO) {
@@ -263,17 +336,32 @@ class WhatsAppBotService : Service() {
         }
     }
 
-    /** Confirmed by the accessibility service: Send was tapped. */
+    /**
+     * Confirmed by the accessibility service: Send was tapped.
+     *
+     * The id is remembered locally BEFORE the network call on purpose: a
+     * duplicate WhatsApp to a shop is far worse than a row the admin can
+     * re-send by hand, and the server cannot distinguish "never sent" from
+     * "sent but the confirmation was lost". So the local ledger is the
+     * authority on what this phone has already sent.
+     */
     fun confirmSent(id: String) {
         notificationManager().cancel(SENDING)
         rememberDelivered(id)
-        scope.launch {
-            markSent(id)
-            inFlight.remove(id)
-            if (AutoSendState.id == id) AutoSendState.clear()
-        }
+        inFlight.remove(id)
+        if (AutoSendState.id == id) AutoSendState.clear()
+        scope.launch { markSent(id) }
     }
 
+    /**
+     * Tell the server the message went out. Returns true on success.
+     *
+     * A failure is logged but NOT retried and does NOT un-deliver the message:
+     * the shop genuinely has it, so re-offering the row would produce the
+     * duplicate this whole ledger exists to prevent. The row simply stays
+     * 'Sending' server-side and ages out, and the admin centre shows it as
+     * unsent, which is the honest state.
+     */
     private suspend fun markSent(id: String) {
         val root = baseUrl()
         val key = getSharedPreferences("agent", Context.MODE_PRIVATE)
@@ -344,6 +432,18 @@ class WhatsAppBotService : Service() {
         private const val CHANNEL = "detomsite_wa_bot"
         /** How many recently-sent ids to remember locally. See [delivered]. */
         private const val DELIVERED_MEMORY = 200
+
+        /**
+         * How long one message stays "being worked on" locally.
+         *
+         * MUST be >= the server's claim staleness (5 min, see
+         * `claim_next_whatsapp_log`). If it were shorter the bot would treat a
+         * message as retryable while the server still considered it in-flight,
+         * and would re-open WhatsApp for it — the duplicate the shopkeeper sees.
+         * The margin absorbs clock skew and poll-alignment.
+         */
+        private const val RETRY_WINDOW_MS = 8 * 60_000L
+
         private const val SENDING = 70
         private const val GUIDANCE = 71
 

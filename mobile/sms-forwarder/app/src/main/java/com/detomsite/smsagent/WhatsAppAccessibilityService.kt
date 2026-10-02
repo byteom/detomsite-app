@@ -37,8 +37,22 @@ class WhatsAppAccessibilityService : AccessibilityService() {
         if (!className.contains("Conversation")) return
 
         // Give WhatsApp a beat to render the pre-filled text box.
-        handler.postDelayed({ trySend() }, 120)
+        //
+        // BUG FIX (double send). Every matching event posted ANOTHER delayed
+        // trySend and nothing cancelled the previous one. WhatsApp fires
+        // TYPE_WINDOW_STATE_CHANGED several times while a chat opens (chat list →
+        // conversation, the compose box gaining focus, a re-layout), so three or
+        // four trySend calls could be queued for the same message. The first tap
+        // clears AutoSendState, but the others were already scheduled and re-read
+        // `id` at fire time — so a tap queued for message A could fire against
+        // message B if B was claimed in between, and a duplicate/incorrect send
+        // would reach the shop. One pending runnable, re-posted, means exactly
+        // one attempt is ever in flight and we act on the fully-rendered screen.
+        handler.removeCallbacks(trySendRunnable)
+        handler.postDelayed(trySendRunnable, 120)
     }
+
+    private val trySendRunnable = Runnable { trySend() }
 
     private fun trySend() {
         val id = AutoSendState.id ?: return
