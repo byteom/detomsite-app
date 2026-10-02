@@ -2011,6 +2011,61 @@ def update_parent_order_status(parent_order_id: str, status: str) -> dict[str, A
         return dict(updated) if updated else None
 
 
+def list_all_sub_orders() -> list[dict[str, Any]]:
+    """Every sub-order across every parent order, newest parent first.
+
+    Added for parity with ``supabase_db``: the admin orders view does
+    ``getattr(db, "list_all_sub_orders", None)`` and skips the section when it
+    is missing. Because the whole suite runs against this store, the ``None``
+    branch was the only one ever exercised — the admin sub-order view was
+    untested, and a typo in the Supabase implementation would have shipped
+    without a single test touching it.
+    """
+    with _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT s.* FROM shop_sub_orders s
+            JOIN parent_orders p ON p.id = s.parent_order_id
+            ORDER BY p.created_at DESC, s.rowid
+            """
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def cancel_parent_order(parent_order_id: str) -> dict[str, Any] | None:
+    """Cancel a parent order and every sub-order that is still open.
+
+    Mirrors ``supabase_db.cancel_parent_order`` exactly, including the
+    terminal-status exclusions: a sub-order that already reached Completed or
+    Delivered is left alone, because the goods changed hands and the money
+    moved. Without this function the store proxy raised ``AttributeError``,
+    so ``POST /orders/{id}/cancel`` on a multi-shop (combo) order could not be
+    tested at all — the one cancel path a student is most likely to need.
+    """
+    with _connect() as connection:
+        parent = connection.execute(
+            "SELECT * FROM parent_orders WHERE id = ?", (parent_order_id,)
+        ).fetchone()
+        if not parent:
+            return None
+        connection.execute(
+            """
+            UPDATE shop_sub_orders SET status = 'Cancelled'
+             WHERE parent_order_id = ?
+               AND status NOT IN ('Completed', 'Delivered', 'Cancelled')
+            """,
+            (parent_order_id,),
+        )
+        connection.execute(
+            "UPDATE parent_orders SET status = 'Cancelled' WHERE id = ?",
+            (parent_order_id,),
+        )
+        updated = connection.execute(
+            "SELECT * FROM parent_orders WHERE id = ?", (parent_order_id,)
+        ).fetchone()
+        return dict(updated) if updated else None
+
+
 def update_sub_order_status(
     sub_order_id: str, status: str, notes: str = ""
 ) -> dict[str, Any] | None:

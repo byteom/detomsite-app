@@ -78,3 +78,95 @@ def test_compose_order_wa_ref_is_unique_per_sub_order():
     assert "Ref: p20260921-18-1" in msg_a
     assert "Ref: p20260921-18-2" in msg_b
     assert msg_a != msg_b  # same token, still distinguishable
+
+
+# ─── Cancelling a combo order ───────────────────────────────────────────────
+#
+# `cancel_parent_order` existed ONLY in supabase_db. Since the entire suite runs
+# against local_demo_db, `POST /orders/{id}/cancel` on a multi-shop order was
+# never executed by any test: the store proxy raised AttributeError, so the
+# function was simply missing rather than broken. A wrong column name or status
+# list in the real implementation would have shipped unnoticed — and this is
+# the cancel path a student is most likely to need.
+
+
+async def test_multi_shop_order_can_be_cancelled(client, monkeypatch):
+    monkeypatch.setattr(local, "_notify_order_via_sms", AsyncMock())
+    token = await _register_and_login(client, "combo", "password123", "Combo Student", "student")
+    shop_a, prod_a = _shop_with_whatsapp("comboa@example.com", "Shop A", "9600000001", "Biryani A")
+    shop_b, prod_b = _shop_with_whatsapp("combob@example.com", "Shop B", "9600000002", "Dosa B")
+
+    res = await client.post("/api/v1/local/orders/multi", headers={"Authorization": f"Bearer {token}"}, json={
+        "shops": [
+            {"shop_id": shop_a["id"], "items": [{"product_id": prod_a["id"], "quantity": 1}]},
+            {"shop_id": shop_b["id"], "items": [{"product_id": prod_b["id"], "quantity": 1}]},
+        ],
+        "student_name": "Combo Student", "student_phone": "+919876543210",
+        "delivery_location": "VIT-AP Main Gate", "payment_method": "COD",
+    })
+    assert res.status_code == 200, res.text
+    parent_id = res.json()["id"]
+    sub_ids = [s["id"] for s in res.json()["sub_orders"]]
+    assert len(sub_ids) == 2
+
+    # The store function must exist at all — this is the assertion that was
+    # impossible to write before, because the attribute was missing.
+    assert hasattr(db, "cancel_parent_order"), "test store lost cancel_parent_order"
+
+    cancel = await client.post(
+        f"/api/v1/local/orders/{parent_id}/cancel",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert cancel.status_code == 200, cancel.text
+
+    parent = db.get_parent_order(parent_id)
+    assert parent["status"] == "Cancelled"
+    # EVERY sub-order must be cancelled too, or one shop keeps cooking an order
+    # the student believes they cancelled.
+    for sub_id in sub_ids:
+        assert db.get_sub_order(sub_id)["status"] == "Cancelled"
+
+
+async def test_cancelling_a_combo_leaves_a_delivered_sub_order_alone(client, monkeypatch):
+    """A sub-order that already reached Delivered must survive the cancel.
+
+    The goods changed hands and the money moved, so blanking it to Cancelled
+    would misreport a completed sale and hide it from the shop's revenue.
+    """
+    monkeypatch.setattr(local, "_notify_order_via_sms", AsyncMock())
+    token = await _register_and_login(client, "combo2", "password123", "Combo Two", "student")
+    shop_a, prod_a = _shop_with_whatsapp("combo2a@example.com", "Shop A", "9600000001", "Biryani A")
+    shop_b, prod_b = _shop_with_whatsapp("combo2b@example.com", "Shop B", "9600000002", "Dosa B")
+
+    res = await client.post("/api/v1/local/orders/multi", headers={"Authorization": f"Bearer {token}"}, json={
+        "shops": [
+            {"shop_id": shop_a["id"], "items": [{"product_id": prod_a["id"], "quantity": 1}]},
+            {"shop_id": shop_b["id"], "items": [{"product_id": prod_b["id"], "quantity": 1}]},
+        ],
+        "student_name": "Combo Two", "student_phone": "+919876543210",
+        "delivery_location": "VIT-AP Main Gate", "payment_method": "COD",
+    })
+    assert res.status_code == 200, res.text
+    parent_id = res.json()["id"]
+    done_id, open_id = [s["id"] for s in res.json()["sub_orders"]]
+
+    db.update_sub_order_status(done_id, "Delivered")
+
+    cancel = await client.post(
+        f"/api/v1/local/orders/{parent_id}/cancel",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert cancel.status_code == 200, cancel.text
+
+    assert db.get_sub_order(done_id)["status"] == "Delivered", "delivered sub-order was wrongly cancelled"
+    assert db.get_sub_order(open_id)["status"] == "Cancelled"
+
+
+def test_admin_sub_order_list_is_available_on_the_test_store():
+    """`local_admin` reads list_all_sub_orders via getattr(..., None).
+
+    With the attribute missing, the admin sub-order view silently rendered
+    nothing and the None branch was the only one any test ever hit.
+    """
+    assert hasattr(db, "list_all_sub_orders")
+    assert isinstance(db.list_all_sub_orders(), list)
