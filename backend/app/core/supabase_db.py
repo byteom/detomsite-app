@@ -317,7 +317,26 @@ def _rebuild_pool() -> None:
 
 class _DBContext:
     """Context manager: commits on success, rolls back on error, returns the
-    connection to the pool on exit."""
+    connection to the pool on exit.
+
+    BUG FIX (connection leak). The success path used to be::
+
+        self._connection.commit()
+        _release(self._connection)
+
+    so a ``commit()`` that raised skipped ``_release`` entirely and the pooled
+    connection was never handed back. Nothing would ever free it: the pool slot
+    stayed checked out for the life of the process, so every such failure
+    permanently shrank capacity by one. A burst that tripped it a few times
+    drained the pool and every later request — including unrelated, read-only
+    ones — failed with "connection pool exhausted", which surfaced as the
+    checkout page's "Could not load the live prices" and as every portal
+    feeling slow.
+
+    The release is now in a ``finally``, so the connection is returned on every
+    path: commit succeeded, commit raised, or the body raised. A connection that
+    cannot be rolled back is still discarded rather than reused.
+    """
 
     def __init__(self, connection: Any):
         self._connection = connection
@@ -327,16 +346,26 @@ class _DBContext:
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
         if exc_type is None:
-            self._connection.commit()
+            try:
+                self._connection.commit()
+            except Exception:
+                # The commit failed, so the connection's state is unknown. Close
+                # it rather than hand it to the next caller. Nothing is left
+                # checked out: _release(..., discard=True) puts the slot back.
+                _release(self._connection, discard=True)
+                return False
             _release(self._connection)
             return False
+
+        # The body raised: undo the partial work, then return the connection.
         try:
             self._connection.rollback()
-            _release(self._connection)
         except Exception:
             # Rollback failed → the connection itself is broken. Discard it so
             # the pool rebuilds with healthy connections.
             _release(self._connection, discard=True)
+            return False
+        _release(self._connection)
         return False
 
 
