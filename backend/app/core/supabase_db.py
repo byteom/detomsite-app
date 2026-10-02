@@ -10,6 +10,7 @@ using this store.
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
@@ -79,10 +80,19 @@ _pool: Any = None
 # queries, so a slot frees within milliseconds under realistic load.
 _POOL_WAIT_SECONDS = 8.0
 
-# Pool size. Supabase's free tier allows far more than 15 connections, and 15
-# proved too small: 20 simultaneous checkout requests produced 7 hard 500s.
-# 25 leaves headroom for a burst while staying modest for the database.
-_POOL_MAX = 25
+# Pool size.
+#
+# Deliberately SMALL, and the opposite of the instinct to make it bigger. The
+# real limit is the DATABASE's: Supabase allows 60 connections here, and that
+# budget is shared by every Vercel instance of this backend plus Supabase's own
+# PostgREST, pg_cron and pg_net sessions. A pool of 25 per instance means two
+# warm instances can exhaust the whole database on their own.
+#
+# The correct shape for a serverless deployment is therefore a small per-process
+# pool: it covers real concurrency, recycles slots promptly, and leaves the rest
+# of the database's budget for the other instances. Overridable for a host that
+# is genuinely single-instance and wants more.
+_POOL_MAX = int(os.environ.get("DB_POOL_MAX", "10"))
 
 
 def _dsn_options(dsn: str) -> str:
@@ -205,6 +215,32 @@ def _release(conn: Any, discard: bool = False) -> None:
     one dead socket turned a blip into tens of seconds of latency across the
     instance. Dropping just the broken connection keeps the healthy ones warm;
     the next checkout opens a replacement if the pool needs one.
+
+    BUG FIX (backend connection leak). ``pool.putconn()`` does NOT commit or
+    roll back — it just hands the connection to the next caller. So any code
+    path that returned a connection still inside a transaction leaked a real
+    Postgres backend for the life of the process, and the database showed it as
+    ``idle in transaction`` (observed: two Supavisor sessions stuck that way
+    for over seven minutes).
+
+    There were several such paths, all shaped like::
+
+        if row:
+            connection.commit()      # skipped when no row came back
+        return row
+    ...
+    finally:
+        _release(connection)
+
+    A read or an update that matched no row commits nothing, so the transaction
+    stayed open forever. That is a hard ceiling on capacity: the database's
+    60-connection limit was being eaten a few at a time until checkout — and
+    every other read — failed with 500s.
+
+    Fixing each call site would be whack-a-mole, so the guarantee is enforced
+    here, once, for every caller: never hand back a connection that is not
+    idle. An in-flight transaction is by definition uncommitted work that the
+    caller has abandoned, so rolling it back is the only correct action.
     """
     pool = _get_pool()
     if discard:
@@ -216,12 +252,38 @@ def _release(conn: Any, discard: bool = False) -> None:
         return
     try:
         if getattr(conn, "closed", 1) == 0:
+            # Never return a connection mid-transaction. IDLE == 0 means no
+            # transaction is open, which is the only safe state to reuse.
+            if _in_transaction(conn):
+                try:
+                    conn.rollback()
+                except Exception:
+                    # Rollback failed → the connection is no longer trustworthy.
+                    _putconn_discarding(pool, conn)
+                    return
             pool.putconn(conn)
             return
     except Exception:
         pass
     # Connection is dead — drop just this one so the rest of the pool survives.
     _putconn_discarding(pool, conn)
+
+
+def _in_transaction(conn: Any) -> bool:
+    """True when ``conn`` is inside an open transaction.
+
+    Uses the DBAPI transaction status so this works with psycopg2 (0 = IDLE)
+    and degrades safely for any other driver, including the fakes used in
+    tests. An unknown status is treated as "not in a transaction" so this can
+    never be the thing that breaks an otherwise healthy request.
+    """
+    try:
+        status_fn = getattr(conn, "get_transaction_status", None)
+        if status_fn is None:
+            return False
+        return int(status_fn()) != 0
+    except Exception:
+        return False
 
 
 def _next_suffixed_id(cursor: Any, table: str, prefix: str) -> str:
