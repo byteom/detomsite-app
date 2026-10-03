@@ -45,13 +45,16 @@ async def keep_alive_loop():
 
     logger.info(f"keep-alive: warm-up cron active every {KEEP_ALIVE_INTERVAL_SECONDS // 60} min → {base}")
     while True:
-        for path in KEEP_ALIVE_PATHS:
-            try:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    response = await client.get(f"{base}{path}")
-                logger.info(f"keep-alive: {path} → {response.status_code}")
-            except Exception as exc:
-                logger.warning(f"keep-alive: {path} error -> {exc}")
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                for path in KEEP_ALIVE_PATHS:
+                    try:
+                        response = await client.get(f"{base}{path}")
+                        logger.info(f"keep-alive: {path} → {response.status_code}")
+                    except Exception as exc:
+                        logger.warning(f"keep-alive: {path} error -> {exc}")
+        except Exception as exc:
+            logger.warning(f"keep-alive client session error -> {exc}")
         await asyncio.sleep(KEEP_ALIVE_INTERVAL_SECONDS)
 
 # Initialize Sentry if DSN is provided — sample 10% of traces (not 100%)
@@ -64,13 +67,26 @@ if sentry_sdk and settings.SENTRY_DSN:
 
 # ─── Simple in-memory rate limiter ───
 # Protects auth endpoints from brute-force attacks. No external deps needed.
-_rate_limit_store: dict[str, list[float]] = defaultdict(list)
+_rate_limit_store: dict[str, list[float]] = {}
+_last_rate_limit_cleanup: float = 0.0
 _RATE_LIMIT_WINDOW = 60  # seconds
 # Cap per real client IP (not per Vercel proxy IP), tuned for a campus behind
 # a shared NAT: generous enough that a lunch-rush login flash is never blocked,
 # tight enough to blunt naive flood attacks. Real brute-force defence happens
 # per-account in the auth endpoints themselves.
 _RATE_LIMIT_MAX = 60
+
+
+def _prune_rate_limit_store(now: float) -> None:
+    """Periodically purge all expired keys to prevent memory leak."""
+    global _last_rate_limit_cleanup
+    if now - _last_rate_limit_cleanup < 300 and len(_rate_limit_store) < 1000:
+        return
+    _last_rate_limit_cleanup = now
+    cutoff = now - _RATE_LIMIT_WINDOW
+    expired_keys = [k for k, timestamps in _rate_limit_store.items() if not timestamps or timestamps[-1] < cutoff]
+    for k in expired_keys:
+        _rate_limit_store.pop(k, None)
 
 
 async def rate_limit_middleware(request: Request, call_next):
@@ -96,15 +112,19 @@ async def rate_limit_middleware(request: Request, call_next):
 
     client_ip = resolve_client_ip(request)
     now = time.time()
+    _prune_rate_limit_store(now)
     key = f"{client_ip}:{path}"
-    # Prune old entries
-    _rate_limit_store[key] = [t for t in _rate_limit_store[key] if now - t < _RATE_LIMIT_WINDOW]
-    if len(_rate_limit_store[key]) >= _RATE_LIMIT_MAX:
+    cutoff = now - _RATE_LIMIT_WINDOW
+    existing = _rate_limit_store.get(key)
+    valid = [t for t in existing if t > cutoff] if existing else []
+    if len(valid) >= _RATE_LIMIT_MAX:
+        _rate_limit_store[key] = valid
         return JSONResponse(
             status_code=429,
             content={"detail": "Too many requests. Please try again later."}
         )
-    _rate_limit_store[key].append(now)
+    valid.append(now)
+    _rate_limit_store[key] = valid
     return await call_next(request)
 
 

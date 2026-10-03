@@ -41,11 +41,11 @@ export function ShopDetail() {
     apiCached.get<LocalShop>('/local/shops/' + shopId, undefined, 6000)
       .then(s => setShop(cur => same(cur, s) ? cur : s))
       .catch(() => setShop(null))
-    apiCached.get<LocalProduct[]>('/local/products', undefined, 6000)
-      .then(r => {
-        const filtered = (r || []).filter(p => (p.shop_id || '') === shopId)
-        setProducts(cur => same(cur, filtered) ? cur : filtered)
-      })
+    // The shop page only needs one shop's menu. Requesting the entire catalog
+    // on every 8-second poll made this page increasingly expensive as vendors
+    // added products and duplicated work already done by the server.
+    apiCached.get<LocalProduct[]>('/local/products', { shop_id: shopId }, 6000)
+      .then(r => setProducts(cur => same(cur, r || []) ? cur : (r || [])))
       .catch(() => setProducts([]))
       .finally(() => setLoading(false))
   }, [shopId])

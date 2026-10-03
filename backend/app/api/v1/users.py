@@ -145,7 +145,10 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token payload")
-    user = db.get_user_by_id(int(user_id))
+    # All store methods are synchronous (psycopg2/SQLite). Never run them on
+    # FastAPI's event loop: a slow pool checkout or database query otherwise
+    # stalls every request handled by that worker.
+    user = await asyncio.to_thread(db.get_user_by_id, int(user_id))
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     if user["role"] != "student":
@@ -163,8 +166,12 @@ async def register(data: UserRegisterRequest):
     if domain_error:
         raise HTTPException(status_code=400, detail=domain_error)
 
-    password_hash = hash_password(data.password)
-    user, conflict = db.register_user(
+    # bcrypt is intentionally CPU-expensive. Keep both hashing and the sync
+    # store call off the event loop so one registration cannot pause unrelated
+    # reads and polling requests on the same worker.
+    password_hash = await asyncio.to_thread(hash_password, data.password)
+    user, conflict = await asyncio.to_thread(
+        db.register_user,
         username=data.username,
         password_hash=password_hash,
         name=data.name,
@@ -179,7 +186,7 @@ async def register(data: UserRegisterRequest):
         raise HTTPException(status_code=409, detail="This email is already registered. Try signing in instead.")
     # Record registration for admin notification
     try:
-        db.record_registration(user)
+        await asyncio.to_thread(db.record_registration, user)
     except Exception as e:
         logger.warning(f"Could not record registration: {e}")
 
@@ -266,7 +273,7 @@ async def reset_password(data: ResetPasswordRequest):
         await asyncio.to_thread(db.bump_password_reset_attempts, user["username"])
         raise HTTPException(status_code=400, detail="Invalid or expired code. Please request a new one.")
 
-    password_hash = hash_password(data.new_password)
+    password_hash = await asyncio.to_thread(hash_password, data.new_password)
     updated = await asyncio.to_thread(db.update_user_password, user["username"], password_hash)
     if not updated:
         raise HTTPException(status_code=500, detail="Could not update the password. Please try again.")
@@ -322,12 +329,15 @@ async def login(data: UserLoginRequest, request: Request):
     if not rate_allow("login", f"{data.username}:{ip}", max_attempts=40, window_sec=300):
         raise HTTPException(status_code=429, detail="Too many sign-in attempts — please wait a few minutes and try again.")
 
-    user = db.get_user_by_username(data.username)
+    user = await asyncio.to_thread(db.get_user_by_username, data.username)
     # PENTEST FIX: identical message for "no such user" and "wrong password",
     # and the password is checked BEFORE the role hint — otherwise the distinct
     # 401/403 replies let an attacker enumerate which usernames exist.
     bad_credentials = "Invalid username or password."
-    if not user or not verify_password(data.password, user["password_hash"]):
+    valid_password = bool(user) and await asyncio.to_thread(
+        verify_password, data.password, user["password_hash"] if user else ""
+    )
+    if not valid_password:
         raise HTTPException(status_code=401, detail=bad_credentials)
     if user["role"] != "student":
         raise HTTPException(status_code=403, detail=f"This account is a {user['role']} account — please sign in from the {user['role']} portal instead.")
@@ -357,12 +367,16 @@ async def login(data: UserLoginRequest, request: Request):
 @router.get("/dashboard")
 async def dashboard(current_user: dict = Depends(get_current_user)):
     """Get student dashboard with approved shops and orders."""
-    shops = db.list_shops(public_only=True)
-    all_orders = db.list_orders()
-    # Filter orders belonging to this user (by name match for simplicity)
-    my_orders = [o for o in all_orders if o.get("student_name", "").lower() == current_user["name"].lower()]
-    active_orders = [o for o in my_orders if o["status"] not in ("Completed", "Cancelled")]
-    total_spent = sum(o["total"] for o in my_orders)
+    shops, my_orders = await asyncio.gather(
+        asyncio.to_thread(db.list_shops, public_only=True),
+        asyncio.to_thread(
+            db.list_orders_by_user_id,
+            str(current_user.get("id", "")),
+            student_name=current_user.get("name"),
+        ),
+    )
+    active_orders = [o for o in my_orders if o.get("status") not in ("Completed", "Cancelled")]
+    total_spent = sum(o.get("total", 0) for o in my_orders)
 
     return {
         "user": current_user,
@@ -380,22 +394,23 @@ async def dashboard(current_user: dict = Depends(get_current_user)):
 @router.get("/shops")
 async def list_shops():
     """List all approved shops visible to students."""
-    shops = db.list_shops(public_only=True)
-    return shops
+    return await asyncio.to_thread(db.list_shops, public_only=True)
 
 
 @router.get("/orders")
 async def student_orders(current_user: dict = Depends(get_current_user)):
     """Get student's orders."""
-    all_orders = db.list_orders()
-    my_orders = [o for o in all_orders if o.get("student_name", "").lower() == current_user["name"].lower()]
-    return my_orders
+    return await asyncio.to_thread(
+        db.list_orders_by_user_id,
+        str(current_user.get("id", "")),
+        student_name=current_user.get("name"),
+    )
 
 
 @router.post("/reviews")
 async def create_review(data: ReviewCreate, current_user: dict = Depends(get_current_user)):
     """Create a review for a shop — saved to the reviews table."""
-    review = db.create_review({
+    review = await asyncio.to_thread(db.create_review, {
         "user_id": current_user["id"],
         "username": current_user["username"],
         "student_name": current_user["name"],
@@ -411,7 +426,7 @@ async def create_review(data: ReviewCreate, current_user: dict = Depends(get_cur
 @router.get("/reviews")
 async def list_reviews(current_user: dict = Depends(get_current_user)):
     """Get reviews by this student."""
-    return db.list_reviews_by_user(current_user["id"])
+    return await asyncio.to_thread(db.list_reviews_by_user, current_user["id"])
 
 
 @router.get("/profile")
@@ -423,4 +438,21 @@ async def profile(current_user: dict = Depends(get_current_user)):
 @router.put("/profile")
 async def update_profile(data: dict, current_user: dict = Depends(get_current_user)):
     """Update student profile."""
-    return {"message": "Profile updated", "user": current_user}
+    allowed = {"name", "email", "phone"}
+    updates = {
+        key: str(value).strip()
+        for key, value in data.items()
+        if key in allowed and value is not None
+    }
+    if any(len(value) > 120 for value in updates.values()):
+        raise HTTPException(status_code=422, detail="Profile fields are too long")
+    updated = await asyncio.to_thread(
+        db.update_user_profile,
+        current_user["id"],
+        name=updates.get("name"),
+        email=updates.get("email"),
+        phone=updates.get("phone"),
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"message": "Profile updated", "user": updated}

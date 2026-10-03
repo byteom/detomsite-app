@@ -600,6 +600,8 @@ _MIGRATIONS = [
     # functional index serves that query without a full-table scan.
     "CREATE INDEX IF NOT EXISTS idx_shops_shopkeeper_email_lower ON shops (LOWER(shopkeeper_email))",
     "CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders (created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_orders_owner_user_id ON orders (owner_user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_parent_orders_owner_user_id ON parent_orders (owner_user_id)",
     # One account per email — case-insensitive, non-empty only (legacy rows
     # with a blank email are left alone). The app-level check in register_user
     # reports the friendly error; this index is the race-safe backstop.
@@ -1260,6 +1262,48 @@ def list_orders_by_shop(shop_id: str) -> list[dict[str, Any]]:
                 "SELECT * FROM orders WHERE shop_id = %s ORDER BY token DESC",
                 (shop_id,),
             )
+            return _rows_to_dicts(cursor.fetchall())
+
+
+def list_orders_by_user_id(
+    user_id: str,
+    student_name: str | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Orders belonging to a specific student, newest first.
+    Queries by owner_user_id (indexed), with fallback to student_name for legacy rows."""
+    uid = str(user_id or "").strip()
+    s_name = str(student_name or "").strip()
+    if not uid and not s_name:
+        return []
+
+    with _DBContext(_connect()) as connection:
+        with connection.cursor() as cursor:
+            if uid and s_name:
+                sql = (
+                    "SELECT * FROM orders WHERE owner_user_id = %s "
+                    "OR (owner_user_id = '' AND LOWER(student_name) = LOWER(%s)) "
+                    "ORDER BY created_at DESC, token DESC"
+                )
+                params: list[Any] = [uid, s_name]
+            elif uid:
+                sql = (
+                    "SELECT * FROM orders WHERE owner_user_id = %s "
+                    "ORDER BY created_at DESC, token DESC"
+                )
+                params = [uid]
+            else:
+                sql = (
+                    "SELECT * FROM orders WHERE LOWER(student_name) = LOWER(%s) "
+                    "ORDER BY created_at DESC, token DESC"
+                )
+                params = [s_name]
+
+            if limit:
+                sql += " LIMIT %s"
+                params.append(limit)
+
+            cursor.execute(sql, tuple(params))
             return _rows_to_dicts(cursor.fetchall())
 
 

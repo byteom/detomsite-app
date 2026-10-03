@@ -37,6 +37,16 @@ export function Shops() {
 
   const query = search.trim().toLowerCase()
 
+  const productsByShop = useMemo(() => {
+    const grouped = new Map<string, LocalProduct[]>()
+    for (const product of products) {
+      const current = grouped.get(product.shop_id)
+      if (current) current.push(product)
+      else grouped.set(product.shop_id, [product])
+    }
+    return grouped
+  }, [products])
+
   const categories = useMemo(() => ['all', ...new Set(shops.map(s => s.category))], [shops])
   const filtered = shops
     // Closed shops are hidden entirely — students only browse shops that are
@@ -46,7 +56,7 @@ export function Shops() {
     .filter(s => {
       if (!query) return true
       const shopMatch = `${s.name} ${s.category}`.toLowerCase().includes(query)
-      const foodMatch = products.some(p => p.shop_id === s.id && p.name.toLowerCase().includes(query))
+      const foodMatch = (productsByShop.get(s.id) || []).some(p => p.name.toLowerCase().includes(query))
       return shopMatch || foodMatch
     })
     .sort((a, b) => {
@@ -147,7 +157,7 @@ export function Shops() {
             {visible.map(shop => (
               <Link key={shop.id} to={`/shop/${shop.id}`}
                 className="group overflow-hidden rounded-[24px] border border-primary-light/30 bg-white/90 shadow-[0_10px_35px_rgba(15,118,110,0.08)] transition-all hover:-translate-y-1 hover:shadow-[0_16px_45px_rgba(15,118,110,0.16)]">
-                <img src={shop.shop_image || getShopImage(shop.category)} alt={`${shop.name} food`} className="h-32 w-full object-cover" onError={event => { event.currentTarget.src = getShopImage() }} />
+                <img loading="lazy" decoding="async" src={shop.shop_image || getShopImage(shop.category)} alt={`${shop.name} food`} className="h-32 w-full object-cover" onError={event => { event.currentTarget.src = getShopImage() }} />
                 <div className="p-4">
                   <div className="flex items-start justify-between gap-2">
                     <div><h3 className="font-bold text-primary-dark">{shop.name}</h3><p className="text-sm font-medium text-slate-500">{shop.category}</p></div>

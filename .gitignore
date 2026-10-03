@@ -34,6 +34,11 @@ phone-field-proof.png
 
 # Supabase local
 supabase/
+# Keep reviewed backend migrations versioned; the root rule above is only for
+# the Supabase CLI's local project state.
+!backend/supabase/
+!backend/supabase/migrations/
+!backend/supabase/migrations/*.sql
 
 # Local dev database / logs
 detomsite_local.db

@@ -57,15 +57,25 @@ export function Home() {
 
   const query = search.trim().toLowerCase()
 
+  const productsByShop = useMemo(() => {
+    const grouped = new Map<string, LocalProduct[]>()
+    for (const product of products) {
+      const current = grouped.get(product.shop_id)
+      if (current) current.push(product)
+      else grouped.set(product.shop_id, [product])
+    }
+    return grouped
+  }, [products])
+
   // Closed shops stay invisible to students everywhere
   const filteredShops = useMemo(() => shops.filter(s => canOrderFromShop(s)).filter(s => {
     if (!query) return true
     const shopMatch = `${s.name} ${s.category} ${s.description}`.toLowerCase().includes(query)
-    const hasFoodMatch = products.some(p => p.shop_id === s.id && p.name.toLowerCase().includes(query))
+    const hasFoodMatch = (productsByShop.get(s.id) || []).some(p => p.name.toLowerCase().includes(query))
     return shopMatch || hasFoodMatch
-  }), [shops, products, query])
+  }), [shops, productsByShop, query])
 
-  const openShops = shops.filter(s => canOrderFromShop(s))
+  const openShops = useMemo(() => shops.filter(s => canOrderFromShop(s)), [shops])
   const openShopIds = useMemo(() => new Set(openShops.map(s => s.id)), [openShops])
   const featured = openShops.slice(0, 4)
 
@@ -201,7 +211,7 @@ export function Home() {
             {featured.map(shop => (
               <Link key={shop.id} to={`/shop/${shop.id}`}
                 className="group overflow-hidden rounded-[24px] border border-primary-light/30 bg-white shadow-[0_10px_35px_rgba(15,118,110,0.08)] transition-all hover:-translate-y-1 hover:shadow-[0_16px_45px_rgba(15,118,110,0.16)]">
-                <img src={shop.shop_image || getShopImage(shop.category)} alt={`${shop.name} food`} className="h-28 w-full object-cover" onError={event => { event.currentTarget.src = getShopImage() }} />
+                <img loading="lazy" decoding="async" src={shop.shop_image || getShopImage(shop.category)} alt={`${shop.name} food`} className="h-28 w-full object-cover" onError={event => { event.currentTarget.src = getShopImage() }} />
                 <div className="p-4">
                   <div className="flex items-start justify-between gap-2">
                     <div><h3 className="font-bold text-primary-dark">{shop.name}</h3><p className="text-sm font-medium text-slate-500">{shop.category}</p></div>
@@ -359,7 +369,7 @@ export function Home() {
             {filteredShops.map(shop => (
               <Link key={shop.id} to={`/shop/${shop.id}`}
                 className="group overflow-hidden rounded-[24px] border border-primary-light/30 bg-white shadow-[0_10px_35px_rgba(15,118,110,0.08)] transition-all hover:-translate-y-1 hover:shadow-[0_16px_45px_rgba(15,118,110,0.16)]">
-                <img src={shop.shop_image || getShopImage(shop.category)} alt={`${shop.name} food`} className="h-28 w-full object-cover" onError={event => { event.currentTarget.src = getShopImage() }} />
+                <img loading="lazy" decoding="async" src={shop.shop_image || getShopImage(shop.category)} alt={`${shop.name} food`} className="h-28 w-full object-cover" onError={event => { event.currentTarget.src = getShopImage() }} />
                 <div className="p-4">
                   <div className="flex items-start justify-between gap-2">
                     <div><h3 className="font-bold text-primary-dark">{shop.name}</h3><p className="text-sm font-medium text-slate-500">{shop.category}</p></div>

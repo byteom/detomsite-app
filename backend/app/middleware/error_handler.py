@@ -9,13 +9,11 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from app.core.config import settings
 import logging
+import time
 import uuid
 
 logger = logging.getLogger(__name__)
 
-# TEMPORARY diagnostic switch, default OFF. Enabled for one deploy to identify
-# the class of a production-only 500, then removed. It reveals the exception
-# TYPE NAME only — never the message, which can contain SQL or credentials.
 # TEMPORARY diagnostic switch, default OFF. Enabled for one deploy to identify
 # the class of a production-only 500, then removed. It reveals the exception
 # TYPE NAME only — never the message, which can contain SQL or credentials.
@@ -129,14 +127,12 @@ class ErrorHandlingMiddleware(BaseHTTPMiddleware):
                     headers={"Retry-After": "2"},
                 )
 
-            # TEMPORARY DIAGNOSTIC (will be removed once identified): expose only
-            # the exception CLASS NAME — never its message, which can carry SQL
-            # fragments and connection strings.
+            # Determine error message safely based on environment
             if _EXPOSE_ERROR_CLASS:
                 error_message = f"{type(e).__name__}"
-
-            # Don't expose internal errors in production
-            if not settings.DEBUG and not _EXPOSE_ERROR_CLASS:
+            elif settings.DEBUG:
+                error_message = str(e)
+            else:
                 error_message = "Internal Server Error"
 
             return JSONResponse(
@@ -153,11 +149,28 @@ class LoggingMiddleware(BaseHTTPMiddleware):
     
     async def dispatch(self, request: Request, call_next):
         """Log request and response"""
-        logger.info(f"{request.method} {request.url.path}")
-        
+        started = time.perf_counter()
         response = await call_next(request)
-        
-        logger.info(f"Response status: {response.status_code}")
+        duration_ms = (time.perf_counter() - started) * 1000
+        response.headers.setdefault("Server-Timing", f"app;dur={duration_ms:.1f}")
+        request_id = getattr(request.state, "request_id", "-")
+        logger.info(
+            "%s %s -> %s in %.1fms request_id=%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+            request_id,
+        )
+        if duration_ms >= 1000:
+            logger.warning(
+                "slow_request path=%s method=%s duration_ms=%.1f status=%s request_id=%s",
+                request.url.path,
+                request.method,
+                duration_ms,
+                response.status_code,
+                request_id,
+            )
         return response
 
 

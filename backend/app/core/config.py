@@ -104,34 +104,6 @@ class Settings(BaseSettings):
     REDIS_BREAKER_FAILURES: int = 5
     REDIS_BREAKER_COOLDOWN_SECONDS: float = 30.0
 
-    # ─── Redis read cache (OPTIONAL — the portals run fine without it) ───
-    # Every portal polls read endpoints (orders, products, stock, batch) and on
-    # serverless hosts each poll can land on a *different* instance, so the
-    # in-process cache misses constantly. A shared Redis makes every instance
-    # serve the same warm data at single-digit-ms latency.
-    #
-    # Two ways to configure it (either one is enough):
-    #   1. Upstash / Vercel KV REST API (recommended on Vercel — HTTPS, no new
-    #      dependency, no TCP pool to leak):
-    #        KV_REST_API_URL / KV_REST_API_TOKEN
-    #        (or UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN)
-    #   2. Raw Redis protocol (Redis Cloud, Railway, Render Key Value, self-hosted):
-    #        REDIS_URL=rediss://default:<password>@<host>:<port>
-    KV_REST_API_URL: str = ""
-    KV_REST_API_TOKEN: str = ""
-    UPSTASH_REDIS_REST_URL: str = ""
-    UPSTASH_REDIS_REST_TOKEN: str = ""
-    REDIS_URL: str = ""
-    # Namespace for every key this app writes. ``clear()`` only ever deletes
-    # keys under this prefix, so a shared Redis instance is never wiped.
-    REDIS_KEY_PREFIX: str = "detomsite:"
-    # Per-call socket timeout. Kept short: a cache must never be slower than
-    # the query it is trying to avoid.
-    REDIS_TIMEOUT_SECONDS: float = 1.5
-    # Circuit breaker — after N consecutive failures the cache stops being
-    # tried for the cooldown, so an outage cannot add a timeout to every read.
-    REDIS_BREAKER_FAILURES: int = 5
-    REDIS_BREAKER_COOLDOWN_SECONDS: float = 30.0
 
     # ─── Bounded waits (a slow dependency must never pin a request) ───
     # Server-side cap on a single Postgres statement. Without it a query that

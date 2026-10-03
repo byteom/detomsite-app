@@ -1457,6 +1457,46 @@ def list_orders_by_shop(shop_id: str) -> list[dict[str, Any]]:
         return _rows_to_dicts(rows)
 
 
+def list_orders_by_user_id(
+    user_id: str,
+    student_name: str | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Orders belonging to a specific student, newest first."""
+    uid = str(user_id or "").strip()
+    s_name = str(student_name or "").strip()
+    if not uid and not s_name:
+        return []
+
+    with _connect() as connection:
+        if uid and s_name:
+            sql = (
+                "SELECT * FROM orders WHERE owner_user_id = ? "
+                "OR (owner_user_id = '' AND LOWER(student_name) = LOWER(?)) "
+                "ORDER BY created_at DESC, token DESC"
+            )
+            params = [uid, s_name]
+        elif uid:
+            sql = (
+                "SELECT * FROM orders WHERE owner_user_id = ? "
+                "ORDER BY created_at DESC, token DESC"
+            )
+            params = [uid]
+        else:
+            sql = (
+                "SELECT * FROM orders WHERE LOWER(student_name) = LOWER(?) "
+                "ORDER BY created_at DESC, token DESC"
+            )
+            params = [s_name]
+
+        if limit:
+            sql += " LIMIT ?"
+            params.append(limit)
+
+        rows = connection.execute(sql, params).fetchall()
+        return _rows_to_dicts(rows)
+
+
 def find_order_by_client_ref(client_ref: str, owner_user_id: str = "") -> dict[str, Any] | None:
     """Find a student's own order by the checkout idempotency key.
 
