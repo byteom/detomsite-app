@@ -1,46 +1,12 @@
-import { useState, useCallback } from 'react'
+import React, { useState, useCallback } from 'react'
+import { Check, X, Clock, ShoppingBag, AlertCircle, RefreshCw } from 'lucide-react'
 import api, { dedupeGet } from '../services/api'
 import { usePolling } from '../hooks/usePolling'
+import { apiError, fmtTime } from '../utils/formatters'
+import { Button } from '../components/ui/Button'
+import { Badge } from '../components/ui/Badge'
+import { Card } from '../components/ui/Card'
 
-/* Same message extraction the rest of the admin portal uses, so a failed
-   Confirm shows the server's real reason ("already cancelled") instead of a
-   generic "Request failed". */
-function apiError(e: any, fb = 'Request failed') {
-  const d = e?.response?.data?.detail
-  if (typeof d === 'string' && d.trim()) return d
-  if (Array.isArray(d)) {
-    const msgs = d.map((x: any) => (x?.msg || x?.message)).filter(Boolean)
-    if (msgs.length) return msgs.join(' - ')
-  }
-  const m = e?.response?.data?.message
-  if (typeof m === 'string' && m.trim()) return m
-  if (e?.userMessage) return e.userMessage as string
-  return (e?.message as string) || fb
-}
-
-/** Renders a stored timestamp (UTC ISO from Supabase, IST wall-clock from SQLite). */
-export function fmtDateTime(value: any) {
-  const raw = String(value || '')
-  if (!raw) return 'just now'
-  let iso = raw
-  if (!/T/.test(raw) && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(raw)) iso = raw.replace(' ', 'T') + '+05:30'
-  const d = new Date(iso)
-  if (isNaN(d.getTime())) return raw.slice(0, 16)
-  return new Intl.DateTimeFormat('en-IN', {
-    timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit', hour12: true,
-  }).format(d)
-}
-
-/* ─── Order Approvals ───
-   Every order the admin still has to confirm, newest first. This is the same
-   queue the notification bell summarises, rendered as a working list so a busy
-   service can be cleared order-by-order without opening the bell each time.
-
-   One tap on Confirm:
-     • marks the order Confirmed (visible in every portal at once),
-     • fires the shopkeeper's WhatsApp confirmation automatically,
-     • texts the student, and
-     • settles the queue row so it can never be confirmed twice. */
 export default function ApprovalsPage() {
   const [queue, setQueue] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
@@ -52,29 +18,29 @@ export default function ApprovalsPage() {
     if (document.visibilityState !== 'visible') return
     return dedupeGet('/admin/order-confirmations')
       .then((r: any) => setQueue(Array.isArray(r.data) ? r.data : []))
-      .catch(() => { /* keep the last known queue through a network blip */ })
+      .catch(() => {})
       .finally(() => setLoading(false))
   }, [])
 
-  // Visible-only polling that never overlaps a tick. 10 s here because this is
-  // the one screen an admin genuinely watches during a service.
   const { pollNow } = usePolling(load, 10000, [])
 
   const confirm = async (row: any) => {
     if (!row?.order_id || busy) return
     setBusy(row.order_id)
-    setMsg(''); setErr('')
+    setMsg('')
+    setErr('')
     try {
-      const r = await api.post(`/admin/orders/${row.order_id}/confirm`, { notification_id: row.notification_id })
+      const r = await api.post(`/admin/orders/${row.order_id}/confirm`, {
+        notification_id: row.notification_id,
+      })
       const d = r.data || {}
       setMsg(
         d.whatsapp_sent
           ? `${d.message} — the shop was notified on WhatsApp automatically.`
           : d.whatsapp_queued
-            ? `${d.message} — the WhatsApp confirmation is queued in the WhatsApp Centre.`
-            : d.message,
+          ? `${d.message} — the WhatsApp confirmation is queued in the WhatsApp Center.`
+          : d.message || 'Order confirmed'
       )
-      // Drop it locally right away so the row never lingers as "waiting".
       setQueue(q => q.filter(x => x.order_id !== row.order_id))
       pollNow()
     } catch (e: any) {
@@ -91,67 +57,165 @@ export default function ApprovalsPage() {
     try {
       await api.post(`/admin/order-confirmations/${row.notification_id}/dismiss`)
       setQueue(q => q.filter(x => x.notification_id !== row.notification_id))
-      setMsg('Removed from the queue — the order itself is unchanged.')
+      setMsg('Removed from queue — the order itself remains unchanged.')
     } catch (e: any) {
-      setErr(apiError(e, 'Could not remove this from the queue'))
+      setErr(apiError(e, 'Could not remove this item from the queue'))
     } finally {
       setBusy('')
     }
   }
 
   return (
-    <div className="mx-auto max-w-5xl px-4 py-6">
-      <div className="mb-4">
-        <h1 className="text-2xl font-bold text-white">Order Approvals</h1>
-        <p className="text-sm text-gray-400">
-          Every new student order lands here and in your notification bell. Confirming marks the order
-          {' '}<b className="text-gold">Confirmed</b>, sends the shopkeeper a WhatsApp message automatically,
-          and lets the student download their payment QR to pay from their own UPI app.
-        </p>
-      </div>
-
-      {msg && <div className="mb-4 rounded-btn border border-emerald-900/60 bg-emerald-900/20 px-4 py-3 text-sm font-semibold text-emerald-300">{msg}</div>}
-      {err && <div className="mb-4 rounded-btn border border-red-900/60 bg-red-900/20 px-4 py-3 text-sm font-semibold text-red-300">{err}</div>}
-
-      {loading ? <p className="py-8 text-center text-gray-500">Loading…</p> : queue.length === 0 ? (
-        <div className="rounded-card border border-gray-800 bg-gray-900 p-10 text-center">
-          <p className="text-4xl">✅</p>
-          <p className="mt-3 text-gray-400">Nothing waiting for approval.</p>
-          <p className="mt-1 text-sm text-gray-600">
-            Every order has been confirmed. New ones appear here the moment a student places one.
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-200 dark:border-admin-border-dark pb-4">
+        <div>
+          <div className="flex items-center gap-2.5">
+            <h1 className="text-2xl font-black text-gray-900 dark:text-white tracking-tight">
+              Order Approvals Queue
+            </h1>
+            {queue.length > 0 && (
+              <Badge variant="gold" size="md">
+                {queue.length} Pending
+              </Badge>
+            )}
+          </div>
+          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+            Incoming student orders requiring administrator confirmation before dispatch
           </p>
         </div>
+
+        <div className="flex items-center gap-2">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => {
+              setLoading(true)
+              load()
+            }}
+            icon={<RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />}
+          >
+            Refresh Queue
+          </Button>
+        </div>
+      </div>
+
+      {/* Messages */}
+      {msg && (
+        <div
+          className="p-3.5 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-800 text-xs font-semibold text-emerald-800 dark:text-emerald-300"
+          style={{ borderRadius: 0 }}
+        >
+          {msg}
+        </div>
+      )}
+
+      {err && (
+        <div
+          className="p-3.5 bg-red-50 dark:bg-red-950/40 border border-red-300 dark:border-red-800 text-xs font-semibold text-red-800 dark:text-red-300"
+          style={{ borderRadius: 0 }}
+        >
+          {err}
+        </div>
+      )}
+
+      {/* Queue Listing */}
+      {loading ? (
+        <div className="p-12 text-center text-xs text-gray-500">
+          <Clock className="w-8 h-8 mx-auto mb-2 animate-spin text-emerald-600 opacity-60" />
+          Loading approvals queue...
+        </div>
+      ) : queue.length === 0 ? (
+        <Card className="text-center py-12">
+          <div
+            className="w-12 h-12 mx-auto flex items-center justify-center bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 mb-3 border border-emerald-500/20"
+            style={{ borderRadius: 0 }}
+          >
+            <Check className="w-6 h-6" />
+          </div>
+          <h3 className="text-base font-bold text-gray-900 dark:text-white">
+            Queue is All Cleared
+          </h3>
+          <p className="mt-1 text-xs text-gray-500 dark:text-gray-400 max-w-sm mx-auto">
+            Every incoming order has been confirmed. New orders will appear here immediately as
+            students place them.
+          </p>
+        </Card>
       ) : (
         <div className="space-y-3">
           {queue.map(row => (
-            <div key={row.order_id} className="rounded-card border border-gold/30 bg-gray-900 p-4">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div className="min-w-0 flex-1">
+            <div
+              key={row.order_id}
+              className="border border-emerald-500/40 dark:border-emerald-700/50 bg-white dark:bg-admin-surface-dark p-4 shadow-xs hover:border-emerald-600 transition-colors"
+              style={{ borderRadius: 0 }}
+            >
+              <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
+                {/* Details */}
+                <div className="space-y-1.5 flex-1 min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-lg font-black text-white">#{row.token}</span>
-                    <span className="rounded-pill bg-gray-800 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-gray-300">
-                      {row.shop_name || 'Shop'}
+                    <span className="font-mono text-base font-black text-gray-900 dark:text-white">
+                      #{row.token}
                     </span>
-                    <span className="rounded-pill bg-blue-900/40 px-2 py-0.5 text-[10px] font-bold uppercase text-blue-300">
-                      {row.payment_method === 'COD' ? 'Cash on Delivery' : 'UPI'}
-                    </span>
-                    <span className="rounded-pill bg-amber-900/40 px-2 py-0.5 text-[10px] font-bold uppercase text-amber-300">{row.status}</span>
+                    <Badge variant="default" size="xs">
+                      {row.shop_name || 'Campus Kitchen'}
+                    </Badge>
+                    <Badge variant={row.payment_method === 'COD' ? 'gold' : 'info'} size="xs">
+                      {row.payment_method === 'COD' ? 'Cash on Delivery' : 'UPI Payment'}
+                    </Badge>
+                    <Badge variant="warning" size="xs">
+                      {row.status || 'Pending'}
+                    </Badge>
                   </div>
-                  <p className="mt-1.5 text-sm font-semibold text-gray-200">{row.student_name || 'A student'}</p>
-                  {row.items && <p className="mt-0.5 text-sm text-gray-400">{row.items}</p>}
-                  <p className="mt-1 text-xs text-gray-500">
-                    {row.delivery_location ? `${row.delivery_location} · ` : ''}₹{row.total} · placed {fmtDateTime(row.created_at)}
-                  </p>
+
+                  <div>
+                    <span className="text-sm font-bold text-gray-900 dark:text-gray-100">
+                      {row.student_name || 'Student'}
+                    </span>
+                    {row.student_phone && (
+                      <span className="ml-2 text-xs text-gray-500 font-mono">
+                        ({row.student_phone})
+                      </span>
+                    )}
+                  </div>
+
+                  {row.items && (
+                    <div className="text-xs text-gray-600 dark:text-gray-400 font-medium">
+                      Items: <span className="text-gray-800 dark:text-gray-200">{row.items}</span>
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap items-center gap-3 text-xs text-gray-500 dark:text-gray-400 pt-1">
+                    {row.delivery_location && <span>📍 {row.delivery_location}</span>}
+                    <span className="font-mono font-bold text-emerald-700 dark:text-emerald-400">
+                      ₹{row.total}
+                    </span>
+                    <span>·</span>
+                    <span>Placed {fmtTime(row.created_at)}</span>
+                  </div>
                 </div>
-                <div className="flex shrink-0 flex-col gap-2">
-                  <button onClick={() => confirm(row)} disabled={busy === row.order_id}
-                    className="rounded-pill bg-gold px-5 py-2 text-sm font-black text-black transition-colors hover:bg-gold/80 disabled:opacity-50">
-                    {busy === row.order_id ? 'Confirming…' : 'Confirm order'}
-                  </button>
-                  <button onClick={() => dismiss(row)} disabled={busy === row.order_id}
-                    className="rounded-pill bg-gray-800 px-5 py-2 text-xs font-bold text-gray-400 hover:bg-gray-700 disabled:opacity-50">
-                    Not now
-                  </button>
+
+                {/* Actions */}
+                <div className="flex sm:flex-col gap-2 shrink-0">
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={() => confirm(row)}
+                    disabled={busy === row.order_id}
+                    loading={busy === row.order_id}
+                    icon={<Check className="w-3.5 h-3.5" />}
+                  >
+                    Confirm Order
+                  </Button>
+
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => dismiss(row)}
+                    disabled={busy === row.order_id}
+                    icon={<X className="w-3.5 h-3.5" />}
+                  >
+                    Dismiss
+                  </Button>
                 </div>
               </div>
             </div>

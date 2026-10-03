@@ -1,6 +1,7 @@
 /** @type {import('tailwindcss').Config} */
 export default {
   content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
+  darkMode: 'class',
   theme: {
     extend: {
       colors: {
@@ -8,19 +9,44 @@ export default {
           DEFAULT: '#15803D',
           dark: '#166534',
           light: '#DCFCE7',
+          50: '#F0FDF4',
+          100: '#DCFCE7',
+          200: '#BBF7D0',
+          300: '#86EFAC',
+          400: '#4ADE80',
+          500: '#22C55E',
+          600: '#16A34A',
+          700: '#15803D',
+          800: '#166534',
+          900: '#14532D',
+        },
+        brand: {
+          emerald: '#10B981',
+          dark: '#064E3B',
+          glow: 'rgba(16, 185, 129, 0.15)',
         },
         gold: {
           DEFAULT: '#D4A017',
           light: '#FEF3C7',
           dark: '#A16207',
         },
-        surface: '#FFFFFF',
-        border: '#E2E8F0',
-        divider: '#F1F5F9',
-        text: {
-          primary: '#111827',
-          secondary: '#64748B',
-          muted: '#94A3B8',
+        admin: {
+          bg: {
+            dark: '#090D0B',
+            light: '#F5F7F5',
+          },
+          surface: {
+            dark: '#111713',
+            darkHover: '#161F1A',
+            light: '#FFFFFF',
+            lightHover: '#F0F4F1',
+          },
+          border: {
+            dark: '#1E2B22',
+            darkSubtle: '#141E18',
+            light: '#E2E8F0',
+            lightSubtle: '#EDF2EE',
+          },
         },
         status: {
           success: '#16A34A',
@@ -35,52 +61,28 @@ export default {
       },
       fontFamily: {
         sans: ['Inter', 'system-ui', '-apple-system', 'BlinkMacSystemFont', '"Segoe UI"', 'sans-serif'],
-      },
-      boxShadow: {
-        'card': '0 1px 3px rgba(15, 23, 42, 0.06)',
-        'card-hover': '0 4px 12px rgba(15, 23, 42, 0.08)',
-        'modal': '0 12px 32px rgba(15, 23, 42, 0.14)',
-        'dropdown': '0 8px 24px rgba(15, 23, 42, 0.12)',
-        'toast': '0 8px 24px rgba(15, 23, 42, 0.12)',
+        mono: ['"JetBrains Mono"', 'Menlo', 'Monaco', 'Consolas', 'monospace'],
       },
       borderRadius: {
-        'sm': '6px',
-        'btn': '8px',
-        'input': '8px',
-        'card': '12px',
-        'panel': '16px',
-        'pill': '9999px',
+        none: '0px',
+        sm: 'var(--admin-radius, 0px)',
+        DEFAULT: 'var(--admin-radius, 0px)',
+        md: 'var(--admin-radius, 0px)',
+        lg: 'var(--admin-radius, 0px)',
+        xl: 'var(--admin-radius, 0px)',
+        '2xl': 'var(--admin-radius, 0px)',
+        '3xl': 'var(--admin-radius, 0px)',
+        full: 'var(--admin-radius, 0px)',
+        btn: 'var(--admin-radius, 0px)',
+        input: 'var(--admin-radius, 0px)',
+        card: 'var(--admin-radius, 0px)',
+        panel: 'var(--admin-radius, 0px)',
+        pill: 'var(--admin-radius, 0px)',
       },
-      spacing: {
-        '18': '4.5rem',
-        '88': '22rem',
-        '112': '28rem',
-        '128': '32rem',
-        '144': '36rem',
-      },
-      maxWidth: {
-        'content': '1280px',
-      },
-      fontSize: {
-        'heading-h1': ['32px', { lineHeight: '40px', fontWeight: '700' }],
-        'heading-h2': ['24px', { lineHeight: '32px', fontWeight: '700' }],
-        'heading-h3': ['20px', { lineHeight: '28px', fontWeight: '600' }],
-        'body': ['15px', { lineHeight: '24px', fontWeight: '400' }],
-        'small': ['13px', { lineHeight: '20px', fontWeight: '400' }],
-      },
-      animation: {
-        'fade-in': 'fadeIn 0.2s ease-out forwards',
-        'slide-up': 'slideUp 0.2s ease-out forwards',
-      },
-      keyframes: {
-        fadeIn: {
-          from: { opacity: '0' },
-          to: { opacity: '1' },
-        },
-        slideUp: {
-          from: { opacity: '0', transform: 'translateY(4px)' },
-          to: { opacity: '1', transform: 'translateY(0)' },
-        },
+      boxShadow: {
+        card: '0 1px 3px rgba(0, 0, 0, 0.08)',
+        'card-dark': '0 2px 8px rgba(0, 0, 0, 0.4)',
+        glow: '0 0 16px rgba(16, 185, 129, 0.2)',
       },
     },
   },

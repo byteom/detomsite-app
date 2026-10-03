@@ -1,37 +1,52 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  --primary: #15803D;
-  --primary-dark: #166534;
-  --primary-light: #DCFCE7;
-  --gold: #D4A017;
-  --gold-light: #FEF3C7;
-  --gold-dark: #A16207;
-  --bg: #F8FAFC;
-  --surface: #FFFFFF;
-  --text-primary: #111827;
-  --text-secondary: #64748B;
+  --admin-radius: 0px;
+  --bg-primary: #F5F7F5;
+  --bg-surface: #FFFFFF;
+  --bg-surface-elevated: #F8FAF8;
+  --border-color: #E2E8F0;
+  --border-subtle: #EDF2EE;
+  --text-main: #0F172A;
+  --text-muted: #64748B;
+  --text-dim: #94A3B8;
+  --brand-green: #15803D;
+  --brand-emerald: #10B981;
+}
+
+.dark {
+  --bg-primary: #090D0B;
+  --bg-surface: #111713;
+  --bg-surface-elevated: #161F1A;
+  --border-color: #1E2B22;
+  --border-subtle: #141E18;
+  --text-main: #F1F5F9;
   --text-muted: #94A3B8;
-  --border: #E2E8F0;
-  --divider: #F1F5F9;
-  --success: #16A34A;
-  --success-bg: #DCFCE7;
-  --warning: #D97706;
-  --warning-bg: #FEF3C7;
-  --error: #DC2626;
-  --error-bg: #FEE2E2;
-  --info: #2563EB;
-  --info-bg: #DBEAFE;
+  --text-dim: #64748B;
+  --brand-green: #15803D;
+  --brand-emerald: #10B981;
 }
 
 * {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
+}
+
+/* Centralized rectangular token enforcement for the UI experiment */
+button,
+input,
+select,
+textarea,
+.card,
+.badge,
+.modal,
+[class*="rounded"] {
+  border-radius: var(--admin-radius, 0px) !important;
 }
 
 html {
@@ -42,8 +57,8 @@ body {
   font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background: var(--bg);
-  color: var(--text-primary);
+  background-color: var(--bg-primary);
+  color: var(--text-main);
   min-height: 100vh;
 }
 
@@ -51,39 +66,45 @@ body {
   min-height: 100vh;
 }
 
-::selection {
-  background: var(--primary-light);
-  color: var(--primary-dark);
-}
-
+/* Custom scrollbars for desktop */
 ::-webkit-scrollbar {
   width: 6px;
+  height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: var(--bg);
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #CBD5E1;
-  border-radius: 3px;
+  background: rgba(148, 163, 184, 0.25);
+  border-radius: 0px;
 }
 
-button {
-  transition: all 150ms ease-out;
-  cursor: pointer;
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.45);
 }
 
-button:active {
-  transform: scale(0.98);
+/* Mobile no-scrollbar utility - scrollable without showing scrollbars */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
 }
 
-input, select, textarea {
-  transition: border-color 150ms ease-out, box-shadow 150ms ease-out;
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
 }
 
-input:focus, select:focus, textarea:focus {
+/* Input focus states with emerald glow */
+input:focus,
+select:focus,
+textarea:focus {
   outline: none;
-  border-color: var(--primary) !important;
-  box-shadow: 0 0 0 3px rgba(21, 128, 61, 0.12);
+  border-color: #10B981 !important;
+  box-shadow: 0 0 0 1px #10B981 !important;
+}
+
+/* Monospace tabular numbers for tables, prices, IDs */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
 }
