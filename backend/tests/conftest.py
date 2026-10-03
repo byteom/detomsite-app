@@ -99,6 +99,8 @@ _INTENTIONALLY_PUBLIC = (
     "/api/v1/local/student-notice",
     "/api/v1/local/announcements",
     "/api/v1/local/batch",
+    "/api/v1/local/home-feed",
+    "/api/v1/local/checkout-data",
     "/api/v1/local/feedback",
     "/api/v1/users/login",
     "/api/v1/users/register",

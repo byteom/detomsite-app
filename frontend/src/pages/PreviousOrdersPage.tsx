@@ -79,7 +79,7 @@ export function PreviousOrdersPage() {
       (filter === 'completed' && ['Delivered', 'Completed'].includes(o.status)) ||
       (filter === 'cancelled' && o.status === 'Cancelled')
     const matchesSearch = search.trim() === '' ||
-      `${o.token} ${o.status} ${o.sub_orders?.map((s: any) => s.shop_name).join(' ')}`.toLowerCase().includes(search.toLowerCase())
+      `${o.token} ${o.status} ${(o.sub_orders || []).map(s => s.shop_name).join(' ')}`.toLowerCase().includes(search.toLowerCase())
     return matchesFilter && matchesSearch
   })
 

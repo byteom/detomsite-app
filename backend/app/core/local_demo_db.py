@@ -1946,14 +1946,25 @@ def get_parent_order(parent_order_id: str, with_items: bool = True) -> dict[str,
         return parent
 
 
-def list_parent_orders(limit: int = 200, status: str | None = None) -> list[dict[str, Any]]:
-    """List parent orders, newest first, optional status filter."""
+def list_parent_orders(
+    limit: int = 200,
+    status: str | None = None,
+    owner_user_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """List parent orders, newest first, optional status / owner filter."""
+    owner = str(owner_user_id or "").strip()
     with _connect() as connection:
         sql = "SELECT * FROM parent_orders"
         args: list[Any] = []
+        clauses: list[str] = []
         if status:
-            sql += " WHERE status = ?"
+            clauses.append("status = ?")
             args.append(status)
+        if owner:
+            clauses.append("owner_user_id = ?")
+            args.append(owner)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY rowid DESC LIMIT ?"
         args.append(limit)
         rows = connection.execute(sql, args).fetchall()

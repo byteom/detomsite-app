@@ -1,8 +1,11 @@
-import { FormEvent, ReactNode, useEffect, useState } from 'react'
+import type { FormEvent, ReactNode } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import axios from 'axios'
 import api from '../services/api'
 import { getLocalSession, saveLocalSession } from '../utils/session'
 import { PhoneInput, isValidMobile } from './PhoneInput'
+import { getErrorMessage } from '../utils/helpers'
 
 interface RoleGateProps { children: ReactNode }
 
@@ -43,7 +46,7 @@ export function RoleGate({ children }: RoleGateProps) {
   }, [])
 
   const finish = (
-    access_token?: string, refresh_token?: string, user?: any,
+    access_token?: string, refresh_token?: string, user?: { username?: string; name?: string },
     displayName?: string, phoneNo?: string,
   ) => {
     if (access_token) localStorage.setItem('access_token', access_token)
@@ -86,14 +89,14 @@ export function RoleGate({ children }: RoleGateProps) {
         return
       }
       finish(access_token, refresh_token, user, name.trim(), phone.trim())
-    } catch (err: any) {
+    } catch (err: unknown) {
       // A saved password that is no longer accepted (rotated, or an account that
       // predates it) — drop it and ask for the current one instead of looping.
-      if (err?.response?.status === 401 && getSavedPassword()) {
+      if (axios.isAxiosError(err) && err?.response?.status === 401 && getSavedPassword()) {
         clearSavedPassword()
         setError('Your saved password was not accepted. Please enter your password to sign in.')
       } else {
-        setError(err?.response?.data?.detail || 'Could not sign you in. Please try again.')
+        setError(getErrorMessage(err, 'Could not sign you in. Please try again.'))
       }
     } finally {
       setLoading(false)

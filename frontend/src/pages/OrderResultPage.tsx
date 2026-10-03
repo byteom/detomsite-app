@@ -102,9 +102,11 @@ export function OrderResultPage() {
       .finally(() => setLoading(false))
   }, [orderId])
 
-  // Poll every 5s while this tab is visible so the student sees the order get
-  // auto-accepted; background tabs pause and refresh instantly on switch-back.
-  usePolling(load, 5000, [orderId])
+  // Poll adaptively: 5s only while the order is unsettled (Pending/Confirmed),
+  // 30s once it reaches a steady state — a Delivered order re-polled every 5s
+  // forever was pure load. Background tabs pause and refresh on switch-back.
+  const orderSettled = order ? !['Pending', 'Confirmed', 'Accepted'].includes(String(order.status)) : false
+  usePolling(load, orderSettled ? 30000 : 5000, [orderId, orderSettled])
 
   /* The UTR paste/recovery box was removed with the UTR verification method.
      The payment settings below power the "Scan for better option" pay button

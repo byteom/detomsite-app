@@ -84,25 +84,28 @@ export function AdminDashboard() {
   const load = useCallback(async () => {
     setError('')
     try {
-      // Load critical data first (shops, summary) with shorter timeouts
+      // Load critical data first (shops, summary). TTLs cover the 30s poll
+      // cadence below so every tick is served warm instead of re-hitting the DB.
       const [s, su] = await Promise.all([
-        apiCached.get<LocalShop[]>('/local/shops', undefined, 5000),
-        apiCached.get<LocalSummary>('/local/summary', undefined, 5000),
+        apiCached.get<LocalShop[]>('/local/shops', undefined, 30000),
+        apiCached.get<LocalSummary>('/local/summary', undefined, 30000),
       ])
       setShops(cur => same(cur, s) ? cur : s)
       setSummary(cur => same(cur, su) ? cur : su)
 
-      // Load remaining data in parallel with shorter timeouts
+      // Load remaining data in parallel. Orders/payments are bounded to the
+      // latest 100 — the dashboard renders recent activity, not full history —
+      // so each poll ships KBs instead of the whole tables.
       const [p, o, pa, ps, cm, re, se, mc, nt] = await Promise.all([
-        apiCached.get<LocalProduct[]>('/local/products', undefined, 8000),
-        apiCached.get<LocalOrder[]>('/local/orders', undefined, 8000),
-        apiCached.get<LocalPayment[]>('/local/payments', undefined, 8000),
-        apiCached.get<LocalPaymentSettings>('/local/payment-settings', undefined, 5000),
-        apiCached.get<LocalComplaint[]>('/local/complaints', undefined, 8000),
-        apiCached.get<LocalRefund[]>('/local/refunds', undefined, 8000),
+        apiCached.get<LocalProduct[]>('/local/products', undefined, 30000),
+        apiCached.get<LocalOrder[]>('/local/orders', { limit: 100 }, 15000),
+        apiCached.get<LocalPayment[]>('/local/payments', undefined, 30000),
+        apiCached.get<LocalPaymentSettings>('/local/payment-settings', undefined, 30000),
+        apiCached.get<LocalComplaint[]>('/local/complaints', undefined, 30000),
+        apiCached.get<LocalRefund[]>('/local/refunds', undefined, 30000),
         api.get<LocalSettlement[]>('/local/settlements'),
         api.get<LocalMenuChangeRequest[]>('/local/menu-change-requests'),
-        api.get<LocalStudentNotice>('/local/student-notice'),
+        apiCached.get<LocalStudentNotice>('/local/student-notice', undefined, 30000),
       ])
       setProducts(cur => same(cur, p) ? cur : p)
       setOrders(cur => same(cur, o) ? cur : o)
@@ -112,15 +115,16 @@ export function AdminDashboard() {
       setRefunds(cur => same(cur, re) ? cur : re)
       setSettlements(cur => same(cur, se.data) ? cur : se.data)
       setMenuChanges(cur => same(cur, mc.data) ? cur : mc.data)
-      setNotice(cur => same(cur, nt.data) ? cur : nt.data)
+      setNotice(cur => same(cur, nt) ? cur : nt)
     } catch {
       setError('Backend not reachable')
     }
   }, [])
 
-  // Poll every 15s while this tab is visible; background tabs pause and refresh
-  // instantly when you switch back.
-  usePolling(load, 15000, [load])
+  // Poll every 30s while this tab is visible (was 15s — 11 requests × 4/min
+  // with 5–8s TTLs meant nearly every tick re-hit the DB); background tabs
+  // pause and refresh instantly when you switch back.
+  usePolling(load, 30000, [load])
 
   /* ─── Web push notifications (ring this phone) ─── */
   /* Start the app service worker and wait until it is really ACTIVE so

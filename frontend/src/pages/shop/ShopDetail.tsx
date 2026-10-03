@@ -38,19 +38,21 @@ export function ShopDetail() {
 
   const load = useCallback(() => {
     if (!shopId) return
-    apiCached.get<LocalShop>('/local/shops/' + shopId, undefined, 6000)
+    apiCached.get<LocalShop>('/local/shops/' + shopId, undefined, 15000)
       .then(s => setShop(cur => same(cur, s) ? cur : s))
       .catch(() => setShop(null))
     // The shop page only needs one shop's menu. Requesting the entire catalog
-    // on every 8-second poll made this page increasingly expensive as vendors
-    // added products and duplicated work already done by the server.
-    apiCached.get<LocalProduct[]>('/local/products', { shop_id: shopId }, 6000)
+    // on every poll made this page increasingly expensive as vendors added
+    // products and duplicated work already done by the server.
+    apiCached.get<LocalProduct[]>('/local/products', { shop_id: shopId }, 15000)
       .then(r => setProducts(cur => same(cur, r || []) ? cur : (r || [])))
       .catch(() => setProducts([]))
       .finally(() => setLoading(false))
   }, [shopId])
 
-  usePolling(load, 8000, [shopId])
+  // 15s poll (was 8s) with 15s TTLs — every tick is warm; open/closed flips
+  // still surface within seconds via pollNow after mutations.
+  usePolling(load, 15000, [shopId])
 
   useEffect(() => () => { if (addedTimer.current) clearTimeout(addedTimer.current) }, [])
 

@@ -61,29 +61,58 @@ export default function PayPage() {
   const groupKey = groups.map(g => `${g.shop_id}:${g.items.map(i => i.product_id).join('|')}`).join('~')
   useEffect(() => {
     if (!groups.length) { setLoading(false); return }
-    Promise.all(groups.map(g =>
-      Promise.all([
-        api.get<LocalProduct[]>('/local/products', { params: { shop_id: g.shop_id } }),
-        api.get<LocalShop>(`/local/shops/${g.shop_id}`),
-      ]).then(([pr, sr]) => ({ shopId: g.shop_id, products: pr.data, shop: sr.data })),
-    ))
-      .then(results => {
-        const prices: Record<string, number> = {}
-        let anyMissing = false
-        for (const g of groups) {
-          const result = results.find(r => r.shopId === g.shop_id)
-          for (const item of g.items) {
-            const product = result?.products.find(p => p.id === item.product_id)
-            if (!product || !product.available) { anyMissing = true; continue }
-            prices[item.product_id] = Number(product.price) * item.quantity
-          }
+    // ONE aggregated request (shops + per-shop products + payment settings)
+    // instead of 1 + 2N. Falls back to the old fan-out on old backends.
+    const ids = groups.map(g => g.shop_id).filter(Boolean).join(',')
+    setLoading(true)
+    api.get<{
+      shops: LocalShop[]; products: Record<string, LocalProduct[]>;
+      payment_settings: LocalPaymentSettings;
+    }>(`/local/checkout-data?shop_ids=${encodeURIComponent(ids)}`).then(r => {
+      if (r.data.payment_settings) setPs(r.data.payment_settings)
+      const results = (r.data.shops || []).map(s => ({
+        shopId: s.id, shop: s,
+        products: (r.data.products || {})[s.id] || [],
+      }))
+      const prices: Record<string, number> = {}
+      let anyMissing = false
+      for (const g of groups) {
+        const result = results.find(rr => rr.shopId === g.shop_id)
+        for (const item of g.items) {
+          const product = result?.products.find(p => p.id === item.product_id)
+          if (!product || !product.available) { anyMissing = true; continue }
+          prices[item.product_id] = Number(product.price) * item.quantity
         }
-        if (anyMissing) setError('Something in your cart is no longer available. Go back to the cart and remove it, then try again.')
-        setLive(prices)
-        setShop(results[0]?.shop ?? null)
-      })
-      .catch(() => setError('Could not load the live prices for your cart. Check your connection and try again.'))
-      .finally(() => setLoading(false))
+      }
+      if (anyMissing) setError('Something in your cart is no longer available. Go back to the cart and remove it, then try again.')
+      setLive(prices)
+      setShop(results[0]?.shop ?? null)
+      setLoading(false)
+    }).catch(() => {
+      Promise.all(groups.map(g =>
+        Promise.all([
+          api.get<LocalProduct[]>('/local/products', { params: { shop_id: g.shop_id } }),
+          api.get<LocalShop>(`/local/shops/${g.shop_id}`),
+        ]).then(([pr, sr]) => ({ shopId: g.shop_id, products: pr.data, shop: sr.data })),
+      ))
+        .then(results => {
+          const prices: Record<string, number> = {}
+          let anyMissing = false
+          for (const g of groups) {
+            const result = results.find(r => r.shopId === g.shop_id)
+            for (const item of g.items) {
+              const product = result?.products.find(p => p.id === item.product_id)
+              if (!product || !product.available) { anyMissing = true; continue }
+              prices[item.product_id] = Number(product.price) * item.quantity
+            }
+          }
+          if (anyMissing) setError('Something in your cart is no longer available. Go back to the cart and remove it, then try again.')
+          setLive(prices)
+          setShop(results[0]?.shop ?? null)
+        })
+        .catch(() => setError('Could not load the live prices for your cart. Check your connection and try again.'))
+        .finally(() => setLoading(false))
+    })
   }, [groupKey])
 
   const amount = useMemo(

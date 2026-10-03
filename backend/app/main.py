@@ -259,9 +259,15 @@ app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
 # Drop every read-cache layer after any successful write, so cached portals
-# (admin/shopkeeper lists) never show stale rows once an action lands. The clear
-# is awaited: the response would otherwise race the invalidation, and on a
-# serverless host the instance can freeze the moment the response is sent.
+# (admin/shopkeeper lists) never show stale rows once an action lands. The
+# write path pays ZERO shared-cache round trips: the in-process layer is
+# dropped synchronously (this instance is fresh immediately) and the Redis /
+# Postgres copies expire on their own short TTLs (5–30 s). The old code
+# awaited a bounded shared clear (Redis SCAN + Postgres DELETE) on EVERY
+# POST/PATCH/DELETE — on a slow or unreachable shared cache that added up to
+# 250 ms of user-facing latency to the exact requests a user is waiting on
+# (order placement, payment, profile save) for at most seconds of cross-
+# instance staleness in return.
 from app.core import embedded_redis, read_cache, redis_cache, shared_cache, ttl_cache
 
 
@@ -272,15 +278,10 @@ async def cache_invalidation_middleware(request: Request, call_next):
         # rows once an action lands — otherwise a confirmed order keeps showing
         # as "pending" until the TTL runs out.
         #
-        # This used to `await read_cache.clear()` UNBOUNDED, so every order
-        # placement, payment and profile write paid for a Redis round trip AND a
-        # Postgres round trip before the response could go out. `clear_bounded`
-        # drops this instance's copy instantly (so the write's own instance is
-        # already fresh) and gives the shared layers a 0.25 s budget; every shared
-        # entry has a TTL anyway, so blowing the budget degrades to "at most a few
-        # more seconds of staleness on another instance" instead of "the user's
-        # request hangs on a slow cache".
-        await read_cache.clear_bounded()
+        # Synchronous local drop only: the instance that handled the write is
+        # already fresh; every other instance follows within one TTL window.
+        ttl_cache.clear()
+        read_cache.clear_local()
     return response
 
 

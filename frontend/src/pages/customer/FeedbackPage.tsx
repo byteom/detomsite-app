@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import api from '../../services/api'
 import { LocalFeedback } from '../../types/localApi'
 import { getLocalSession } from '../../utils/session'
+import { getErrorMessage } from '../../utils/helpers'
 
 const CATEGORIES = [
   { id: 'Bug', label: 'Bug', icon: '🐞', desc: 'Something is broken', cls: 'from-red-500 to-rose-600', active: 'border-red-300 bg-red-50 text-red-700' },
@@ -72,8 +73,8 @@ export function FeedbackPage() {
       setSent(res.data)
       setSubject(''); setPage(''); setMessage(''); setCategory('Bug')
       loadMine()
-    } catch (err: any) {
-      setError(err?.response?.data?.detail || 'Could not send your report. Please try again.')
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Request failed'))
     } finally {
       setSending(false)
     }

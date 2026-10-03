@@ -6,6 +6,7 @@ import { InstallPwaCard } from '../../components/InstallPwaCard'
 import { syncProfileToSupabase } from '../../services/supabase'
 import { PhoneInput, isValidMobile } from '../../components/PhoneInput'
 import { PasswordInput } from '../../components/PasswordInput'
+import { getErrorMessage } from '../../utils/helpers'
 
 export function VendorRegister() {
   const [form, setForm] = useState({
@@ -75,8 +76,8 @@ export function VendorRegister() {
 
       setRegistered(true)
       setApprovalStatus('pending')
-    } catch (err: any) {
-      setError(err?.response?.data?.detail || 'Registration failed. Try a different username.')
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Request failed'))
     } finally {
       setLoading(false)
     }

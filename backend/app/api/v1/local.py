@@ -1096,44 +1096,67 @@ async def patch_product(product_id: str, data: LocalProductUpdate, _admin: dict 
     return product
 
 
-async def _list_orders_sliced(current_user: dict) -> list[dict]:
-    """Return orders for the current user. Admins get a bounded slice (latest 300)
-    to keep the payload tiny; students get only their own orders. The bounded
-    slice is safe because the admin dashboard and shopkeeper portal never need
-    the full multi-day history on a poll — they only render recent activity."""
-    limit = 300
-    all_orders = await _db(db.list_orders, limit=limit)
+async def _list_orders_sliced(current_user: dict, limit: int = 100, offset: int = 0) -> list[dict]:
+    """Return orders for the current user — filtered in SQL, never in Python.
+
+    Students read only their own rows via ``list_orders_by_user_id`` (indexed);
+    admins get a bounded newest-first slice. ``limit``/``offset`` keep every
+    poll payload small no matter how large the tables grow.
+    """
+    limit = max(1, min(int(limit or 100), 200))
+    offset = max(0, int(offset or 0))
     if current_user.get("role") == "admin":
-        return all_orders
-    return [o for o in all_orders if _same_student(current_user, o)]
+        return await _db(db.list_orders, limit=limit + offset)
+    uid = str(current_user.get("id") or "")
+    name = str(current_user.get("name") or current_user.get("username") or "")
+    rows = await _db(db.list_orders_by_user_id, uid, name, limit + offset)
+    return rows[offset:offset + limit]
 
 
 @router.get("/orders")
-async def orders(current_user: dict = Depends(get_current_local_user)):
-    """List orders. Students only ever see their own orders (matched by name or
-    phone); admins may list everything. A valid token is always required — the
-    same-identity rule the student app already applies client-side is now also
-    enforced server-side so an account holder can't enumerate other students'
+async def orders(
+    current_user: dict = Depends(get_current_local_user),
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """List orders. Students only ever see their own orders (matched by the
+    server-assigned account id); admins may list everything. A valid token is
+    always required so an account holder can't enumerate other students'
     names, phones and delivery locations.
 
-    Server-side TTL cache (10 s) so the admin dashboard's constant polling no
-    longer re-hits the DB on every refresh — the client polls every 15 s, so a
-    10 s cache is always warm and still fresh enough for status updates."""
+    Server-side TTL cache (10 s) so dashboard polling rarely re-hits the DB —
+    the cache key includes the user digest plus ``limit``/``offset`` so
+    filtered results never cross wires.
+    """
     cache_key = "orders"
-    return await _cached_read(10, cache_key, _list_orders_sliced, current_user)
+    return await _cached_read(10, cache_key, _list_orders_sliced, current_user, limit, offset)
 
 
 @router.get("/orders/parent")
-async def parent_orders_list(status: str | None = None, current_user: dict = Depends(get_current_local_user)):
+async def parent_orders_list(
+    status: str | None = None,
+    limit: int = Query(100, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_local_user),
+):
     """List parent (multi-shop) orders. Logged-in students only ever receive
-    THEIR OWN parent orders (name or phone match); admins may list everything.
+    THEIR OWN parent orders (filtered in SQL by the server-assigned account
+    id); admins may list everything. Bounded + paginated so the response never
+    ships the platform's full history on a poll.
     Declared before ``/orders/{order_id}`` so it can't be shadowed by the
     dynamic route (GET /orders/parent previously fell through to the dynamic
     segment with ``order_id="parent"`` and 404'd)."""
-    all_orders = await _db(db.list_parent_orders, status=status)
+    limit = max(1, min(int(limit or 100), 200))
+    offset = max(0, int(offset or 0))
     if current_user.get("role") == "admin":
-        return all_orders
-    return [o for o in all_orders if _same_student(current_user, o)]
+        rows = await _db(db.list_parent_orders, limit + offset, status)
+        return rows[offset:offset + limit]
+    uid = str(current_user.get("id") or "")
+    rows = await _db(db.list_parent_orders, limit + offset, status, uid)
+    # Legacy rows with no owner stay admin-visible only — never leak them to a
+    # student whose id merely sorts nearby.
+    mine = [o for o in rows if _same_student(current_user, o)]
+    return mine[offset:offset + limit]
 
 
 @router.get("/orders/parent/{parent_order_id}")
@@ -3117,7 +3140,40 @@ def _load_current_batch() -> dict:
 @router.get("/batch")
 async def current_batch():
     """Which delivery batch is accepting orders right now + stock info."""
-    return await _cached_read(5, "batch", _load_current_batch)
+    return await _cached_read(30, "batch", _load_current_batch)
+
+
+def _load_home_feed() -> dict:
+    """Storefront home feed in ONE worker hop: shops + products + announcements.
+
+    The Home page used to fire 5 separate HTTP calls (shops, products,
+    announcements, student-notice, batch), each paying its own pool checkout
+    and cache chain. One aggregated, cached payload removes 4 round trips.
+    """
+    shops = db.list_shops(public_only=True)
+    products = db.list_products()
+    announcements = db.list_shop_announcements(None, True)
+    notice = db.get_student_notice()
+    batch_type = db.get_current_batch()
+    return {
+        "shops": [_public_shop(s) for s in shops],
+        "products": products,
+        "announcements": announcements,
+        "notice": notice,
+        "batch": {
+            "batch_type": batch_type,
+            "next_token": db.get_next_token(),
+            "date_key": db._day_key(),
+            "accepted_until": "12:30" if batch_type == "Afternoon" else "18:00",
+            "delivery_window": "13:00-13:30" if batch_type == "Afternoon" else "19:30-19:45",
+        },
+    }
+
+
+@router.get("/home-feed")
+async def home_feed():
+    """Aggregated storefront payload for the Home page (1 request, not 5)."""
+    return await _cached_read(30, "home-feed", _load_home_feed)
 
 
 def _load_products_with_stock() -> list[dict]:
@@ -3172,9 +3228,8 @@ async def checkout_data(shop_ids: str = Query("", max_length=600)):
                     grouped.setdefault(str(p.get("shop_id")), []).append(p)
             products_by_shop = grouped
 
-        # Shops are primary-key lookups, so N of them is cheap; only they vary
-        # per cart, so only they are keyed per cart.
-        #
+        # Shops are primary-key lookups; run them concurrently in ONE worker hop
+        # (the old sequential ``await`` chain cost N pool checkouts in series).
         # PENTEST FIX (data exposure). This returned ``db.get_shop()`` raw. This
         # route has NO auth dependency — a student must see live prices before
         # logging in — so every field came straight off the shops table:
@@ -3185,11 +3240,11 @@ async def checkout_data(shop_ids: str = Query("", max_length=600)):
         # /shops routes already funnel through _public_shop() for exactly this
         # reason; this one was added later and missed it. Verified live: an
         # anonymous GET returned all of them.
-        shops = [
-            _public_shop(shop)
-            for shop in [await _db(db.get_shop, sid) for sid in wanted]
-            if shop
-        ]
+        def _load_shops(sids: list[str]) -> list[dict]:
+            return [s for s in (db.get_shop(sid) for sid in sids) if s]
+
+        shop_rows = await _db(_load_shops, wanted) if wanted else []
+        shops = [_public_shop(shop) for shop in shop_rows]
         settings = await _db(db.get_payment_settings)
         return {
             "shops": shops,

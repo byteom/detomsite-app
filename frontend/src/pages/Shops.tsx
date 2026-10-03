@@ -24,16 +24,17 @@ export function Shops() {
   }, [])
 
   const loadShops = useCallback(() => {
-    // Short cache dedupes concurrent mounts; still resolves fresh-ish values.
-    apiCached.get<LocalShop[]>('/local/shops', { public_only: true }, 7000)
+    // 15s TTL covers the 15s poll below — steady-state ticks never hit the DB.
+    apiCached.get<LocalShop[]>('/local/shops', { public_only: true }, 15000)
       .then(res => setShops(cur => same(cur, res || []) ? cur : (res || [])))
       .catch(() => { /* keep the last known list on transient failures */ })
       .finally(() => setLoading(false))
   }, [])
 
-  // Re-poll every 8s while visible; background tabs stop hammering the API and
-  // refresh instantly when you switch back.
-  usePolling(loadShops, 8000, [loadShops])
+  // Re-poll every 15s while visible (was 8s — the 7s TTL meant nearly every
+  // tick re-hit the DB); background tabs stop hammering the API and refresh
+  // instantly when you switch back.
+  usePolling(loadShops, 15000, [loadShops])
 
   const query = search.trim().toLowerCase()
 

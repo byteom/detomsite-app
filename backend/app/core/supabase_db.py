@@ -3184,18 +3184,34 @@ def get_parent_order(parent_order_id: str, with_items: bool = True) -> dict[str,
         _release(connection)
 
 
-def list_parent_orders(limit: int = 200, status: str | None = None) -> list[dict[str, Any]]:
-    """List parent orders, newest first, optional status filter."""
+def list_parent_orders(
+    limit: int = 200,
+    status: str | None = None,
+    owner_user_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """List parent orders, newest first, optional status / owner filter.
+
+    ``owner_user_id`` pushes the per-student filter into SQL (indexed) instead
+    of loading every student's orders into Python and filtering there — the
+    old ``/orders/parent`` path scaled with the whole platform on every poll.
+    """
+    owner = str(owner_user_id or "").strip()
     connection = _connect()
     try:
         with connection.cursor() as cur:
+            clauses: list[str] = []
+            params: list[Any] = []
             if status:
-                cur.execute(
-                    "SELECT * FROM parent_orders WHERE status = %s ORDER BY created_at DESC LIMIT %s",
-                    (status, limit),
-                )
-            else:
-                cur.execute("SELECT * FROM parent_orders ORDER BY created_at DESC LIMIT %s", (limit,))
+                clauses.append("status = %s")
+                params.append(status)
+            if owner:
+                clauses.append("owner_user_id = %s")
+                params.append(owner)
+            where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+            cur.execute(
+                f"SELECT * FROM parent_orders{where} ORDER BY created_at DESC LIMIT %s",
+                (*params, limit),
+            )
             return _rows_to_dicts(cur.fetchall())
     finally:
         _release(connection)

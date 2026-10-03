@@ -47,12 +47,26 @@ export function Home() {
   ], [])
 
   useEffect(() => {
-    apiCached.get<LocalShop[]>('/local/shops', { public_only: true }, 10000)
-      .then(setShops).catch(() => setShops([]))
-    apiCached.get<LocalProduct[]>('/local/products', undefined, 10000).then(setProducts).catch(() => setProducts([]))
-    apiCached.get<LocalAnnouncement[]>('/local/announcements', undefined, 10000).then(setAnnouncements).catch(() => setAnnouncements([]))
-    apiCached.get<LocalStudentNotice>('/local/student-notice', undefined, 30000).then(setNotice).catch(() => setNotice(null))
-    apiCached.get<BatchInfo>('/local/batch', undefined, 10000).then(setBatch).catch(() => setBatch(null))
+    // One aggregated request (shops + products + announcements + notice +
+    // batch) instead of 5 parallel ones — 1 pool checkout, 1 cache entry, and
+    // no per-endpoint cold-start stacking. Falls back to the old fan-out only
+    // if the aggregated route is unavailable (old backend during rollout).
+    apiCached.get<{
+      shops: LocalShop[]; products: LocalProduct[];
+      announcements: LocalAnnouncement[]; notice: LocalStudentNotice | null;
+      batch: BatchInfo | null;
+    }>('/local/home-feed', undefined, 30000).then(feed => {
+      setShops(feed.shops || []); setProducts(feed.products || [])
+      setAnnouncements(feed.announcements || [])
+      setNotice(feed.notice || null); setBatch(feed.batch || null)
+    }).catch(() => {
+      apiCached.get<LocalShop[]>('/local/shops', { public_only: true }, 10000)
+        .then(setShops).catch(() => setShops([]))
+      apiCached.get<LocalProduct[]>('/local/products', undefined, 10000).then(setProducts).catch(() => setProducts([]))
+      apiCached.get<LocalAnnouncement[]>('/local/announcements', undefined, 10000).then(setAnnouncements).catch(() => setAnnouncements([]))
+      apiCached.get<LocalStudentNotice>('/local/student-notice', undefined, 30000).then(setNotice).catch(() => setNotice(null))
+      apiCached.get<BatchInfo>('/local/batch', undefined, 10000).then(setBatch).catch(() => setBatch(null))
+    })
   }, [])
 
   const query = search.trim().toLowerCase()
