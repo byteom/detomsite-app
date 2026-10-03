@@ -3824,7 +3824,26 @@ def claim_next_whatsapp_log(
                    SET status = 'Sending', claimed_at = NOW()
                  WHERE id = (
                        SELECT id FROM whatsapp_logs
-                        WHERE id = ANY(%s)
+                        -- BUG FIX (this was what blocked every shop message).
+                        -- `whatsapp_logs.id` is a bigint, and psycopg2 renders a
+                        -- Python list of strings as a text[] array, so Postgres
+                        -- raised `operator does not exist: bigint = text` on
+                        -- EVERY call. The queue feed therefore 500'd whenever the
+                        -- bot polled it, and no shop ever received a WhatsApp
+                        -- message - while the orders table looked perfectly
+                        -- healthy, which is why it presented as "the bot does
+                        -- nothing".
+                        --
+                        -- Comparing the id as text works whether the column is
+                        -- bigint or text, so this does not care how the column
+                        -- was created. The cast is inside the subquery only; the
+                        -- outer comparison still matches like with like.
+                        --
+                        -- NOTE: never write a literal placeholder in a comment
+                        -- inside these strings. psycopg2 counts every one of
+                        -- them, comment or not, and the mismatch surfaces as a
+                        -- baffling "IndexError: tuple index out of range".
+                        WHERE id::text = ANY(%s)
                           AND (
                                status = 'Pending'
                             OR (status = 'Sending'
