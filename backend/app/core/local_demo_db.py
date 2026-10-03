@@ -1095,9 +1095,16 @@ def save_session(email: str, name: str, role: str) -> dict[str, Any]:
         return dict(row)
 
 
-def list_shops(public_only: bool = False) -> list[dict[str, Any]]:
+def list_shops(public_only: bool = False, search: str | None = None) -> list[dict[str, Any]]:
     with _connect() as connection:
-        rows = connection.execute("SELECT * FROM shops ORDER BY rating DESC").fetchall()
+        query = "SELECT * FROM shops"
+        params = []
+        if search and search.strip():
+            s = f"%{search.strip().lower()}%"
+            query += " WHERE (LOWER(name) LIKE ? OR LOWER(category) LIKE ? OR LOWER(description) LIKE ?)"
+            params.extend([s, s, s])
+        query += " ORDER BY rating DESC"
+        rows = connection.execute(query, params).fetchall()
         shops = _rows_to_dicts(rows)
         if public_only:
             # Students see every APPROVED shop (open or closed) so they can browse
@@ -1326,15 +1333,22 @@ def update_share_payment_status(payment_id: str, status: str) -> dict[str, Any] 
         return dict(row) if row else None
 
 
-def list_products(shop_id: str | None = None) -> list[dict[str, Any]]:
+def list_products(shop_id: str | None = None, search: str | None = None) -> list[dict[str, Any]]:
     with _connect() as connection:
+        query = "SELECT * FROM products"
+        params = []
+        conditions = []
         if shop_id:
-            rows = connection.execute(
-                "SELECT * FROM products WHERE shop_id = ? ORDER BY category, name",
-                (shop_id,),
-            ).fetchall()
-        else:
-            rows = connection.execute("SELECT * FROM products ORDER BY category, name").fetchall()
+            conditions.append("shop_id = ?")
+            params.append(shop_id)
+        if search and search.strip():
+            s = f"%{search.strip().lower()}%"
+            conditions.append("(LOWER(name) LIKE ? OR LOWER(description) LIKE ? OR LOWER(category) LIKE ? OR LOWER(combo_items) LIKE ?)")
+            params.extend([s, s, s, s])
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY category, name"
+        rows = connection.execute(query, params).fetchall()
         return _rows_to_dicts(rows)
 
 

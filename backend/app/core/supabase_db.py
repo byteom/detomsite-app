@@ -808,10 +808,17 @@ def save_session(email: str, name: str, role: str) -> dict[str, Any]:
 # ─── Shops ───
 
 
-def list_shops(public_only: bool = False) -> list[dict[str, Any]]:
+def list_shops(public_only: bool = False, search: str | None = None) -> list[dict[str, Any]]:
     with _DBContext(_connect()) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM shops ORDER BY rating DESC")
+            query = "SELECT * FROM shops"
+            params = []
+            if search and search.strip():
+                s = f"%{search.strip().lower()}%"
+                query += " WHERE (LOWER(name) LIKE %s OR LOWER(category) LIKE %s OR LOWER(description) LIKE %s)"
+                params.extend([s, s, s])
+            query += " ORDER BY rating DESC"
+            cursor.execute(query, params)
             shops = _rows_to_dicts(cursor.fetchall())
         if public_only:
             # Students see every APPROVED shop (open or closed) so they can browse
@@ -972,16 +979,23 @@ def _update_shop_impl(shop_id: str, values: dict[str, Any]) -> dict[str, Any] | 
 # ─── Products ───
 
 
-def list_products(shop_id: str | None = None) -> list[dict[str, Any]]:
+def list_products(shop_id: str | None = None, search: str | None = None) -> list[dict[str, Any]]:
     with _DBContext(_connect()) as connection:
         with connection.cursor() as cursor:
+            query = "SELECT * FROM products"
+            params = []
+            conditions = []
             if shop_id:
-                cursor.execute(
-                    "SELECT * FROM products WHERE shop_id = %s ORDER BY category, name",
-                    (shop_id,),
-                )
-            else:
-                cursor.execute("SELECT * FROM products ORDER BY category, name")
+                conditions.append("shop_id = %s")
+                params.append(shop_id)
+            if search and search.strip():
+                s = f"%{search.strip().lower()}%"
+                conditions.append("(LOWER(name) LIKE %s OR LOWER(description) LIKE %s OR LOWER(category) LIKE %s OR LOWER(combo_items) LIKE %s)")
+                params.extend([s, s, s, s])
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+            query += " ORDER BY category, name"
+            cursor.execute(query, params)
             return _rows_to_dicts(cursor.fetchall())
 
 

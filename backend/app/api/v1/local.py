@@ -1038,14 +1038,14 @@ def _is_staff(user: Optional[dict]) -> bool:
 
 
 @router.get("/shops")
-async def shops(public_only: bool = False, user: Optional[dict] = Depends(_optional_user)):
-    """List shops.
-
-    ``public_only`` keeps the browser-facing menu list to APPROVED, non-removed
-    shops. The response is redacted unless the caller is staff, because this
-    endpoint is reachable without a token.
-    """
-    rows = await _cached_read(10, "shops", db.list_shops, public_only=public_only)
+async def shops(
+    public_only: bool = False,
+    search: Optional[str] = Query(None),
+    user: Optional[dict] = Depends(_optional_user),
+):
+    """List shops with optional database-backed name/category/description search."""
+    cache_key = f"shops:{public_only}:{search or ''}"
+    rows = await _cached_read(10, cache_key, db.list_shops, public_only=public_only, search=search)
     if _is_staff(user):
         return rows
     return [_public_shop(s) for s in rows]
@@ -1077,10 +1077,28 @@ async def shop(shop_id: str, user: Optional[dict] = Depends(_optional_user)):
 
 
 @router.get("/products")
-async def products(shop_id: str | None = None):
-    if shop_id:
-        return await _cached_read(10, "products", db.list_products, shop_id)
-    return await _cached_read(10, "products", db.list_products)
+async def products(shop_id: str | None = None, search: Optional[str] = Query(None)):
+    """List products with optional database-backed search and shop filtering."""
+    cache_key = f"products:{shop_id or ''}:{search or ''}"
+    return await _cached_read(10, cache_key, db.list_products, shop_id=shop_id, search=search)
+
+
+@router.get("/search")
+async def search_endpoint(q: str = Query(..., min_length=1), user: Optional[dict] = Depends(_optional_user)):
+    """Unified search endpoint across approved kitchens and dishes."""
+    term = q.strip()
+    if not term:
+        return {"query": "", "shops": [], "products": [], "total": 0}
+    matching_shops = await _cached_read(5, f"search_shops:{term}", db.list_shops, public_only=True, search=term)
+    matching_products = await _cached_read(5, f"search_products:{term}", db.list_products, search=term)
+    if not _is_staff(user):
+        matching_shops = [_public_shop(s) for s in matching_shops]
+    return {
+        "query": term,
+        "shops": matching_shops,
+        "products": matching_products,
+        "total": len(matching_shops) + len(matching_products),
+    }
 
 
 @router.post("/products")
