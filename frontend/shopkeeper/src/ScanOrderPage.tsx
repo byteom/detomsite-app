@@ -1,19 +1,23 @@
-/* Scan orders — the student's order QR carries `DETOMSITE-ORDER:<order id>`.
-   The shopkeeper scans it (or types the id) to pull the order up. "Download
-   scanner" saves a standalone copy of this page so a shop can keep it on a
-   home screen / a spare phone; the lookup still needs the network + a token, so
-   the downloaded copy is a shortcut, not an offline database. */
-import { useCallback, useEffect, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
+import {
+  QrCode,
+  Camera,
+  CameraOff,
+  Download,
+  ArrowLeft,
+  Search,
+  CheckCircle2,
+  AlertCircle,
+} from 'lucide-react'
 import api from './services/api'
+import { ShopkeeperLayout } from './components/layout/ShopkeeperLayout'
+import { Card } from './components/ui/Card'
+import { Button } from './components/ui/Button'
+import { Input } from './components/ui/Input'
+import { apiError } from './utils/formatters'
 
-/* Same message extraction the shop app uses; kept local so this page does not
-   import from App.tsx (which would create a circular module). */
-function apiError(e: any, fb = 'Request failed') {
-  return e?.response?.data?.detail || e?.response?.data?.message || e?.message || fb
-}
-
-const SCAN_PLACEHOLDER = 'DETOMSITE-ORDER:… or the order id'
+const SCAN_PLACEHOLDER = 'DETOMSITE-ORDER:… or enter order ID'
 
 type BarcodeDetectorCtor = new (opts: { formats: string[] }) => {
   detect: (source: HTMLVideoElement) => Promise<{ rawValue?: string }[]>
@@ -40,20 +44,26 @@ export default function ScanOrderPage() {
 
   useEffect(() => stopCamera, [stopCamera])
 
-  const lookup = useCallback(async (code: string) => {
-    const raw = (code || '').trim()
-    if (!raw) { setScanErr('Enter or scan an order code'); return }
-    setScanErr('')
-    setScanMsg('Looking up the order…')
-    try {
-      const r = await api.get(`/vendor/orders/lookup?code=${encodeURIComponent(raw)}`)
-      stopCamera()
-      navigate('/mobile')
-    } catch (err: any) {
-      setScanErr(apiError(err, 'Order not found'))
-      setScanMsg('')
-    }
-  }, [navigate, stopCamera])
+  const lookup = useCallback(
+    async (code: string) => {
+      const raw = (code || '').trim()
+      if (!raw) {
+        setScanErr('Enter or scan an order code')
+        return
+      }
+      setScanErr('')
+      setScanMsg('Looking up order in database…')
+      try {
+        await api.get(`/vendor/orders/lookup?code=${encodeURIComponent(raw)}`)
+        stopCamera()
+        navigate('/mobile/orders')
+      } catch (err: any) {
+        setScanErr(apiError(err, 'Order not found'))
+        setScanMsg('')
+      }
+    },
+    [navigate, stopCamera]
+  )
 
   const startCamera = async () => {
     setScanErr('')
@@ -74,16 +84,23 @@ export default function ScanOrderPage() {
           try {
             const codes = await new Detector({ formats: ['qr_code'] }).detect(video)
             const value = codes?.[0]?.rawValue
-            if (value) { await lookup(value); return }
+            if (value) {
+              await lookup(value)
+              return
+            }
           } catch {
-            /* a decode hiccup is normal — keep the preview running */
+            /* normal frame decode skip */
           }
         }
-        rafRef.current = requestAnimationFrame(() => { void tick() })
+        rafRef.current = requestAnimationFrame(() => {
+          void tick()
+        })
       }
-      rafRef.current = requestAnimationFrame(() => { void tick() })
+      rafRef.current = requestAnimationFrame(() => {
+        void tick()
+      })
     } catch {
-      setScanErr('Camera not available — type the order code below instead.')
+      setScanErr('Camera not accessible — type the order code manually below instead.')
       setCameraOn(false)
     }
   }
@@ -96,7 +113,7 @@ export default function ScanOrderPage() {
 <style>body{font-family:system-ui;margin:2rem;max-width:30rem}
 input{font-size:1.1rem;padding:.6rem;width:100%;box-sizing:border-box}
 button{font-size:1rem;padding:.7rem 1rem;width:100%;margin-top:.6rem}
-a.btn{display:block;text-align:center;text-decoration:none;padding:.8rem;background:#0f766e;color:#fff;border-radius:.5rem;margin-top:1rem}</style>
+a.btn{display:block;text-align:center;text-decoration:none;padding:.8rem;background:#15803d;color:#fff;border-radius:0;margin-top:1rem}</style>
 </head><body>
 <h1>DETOMSITE — Order Scanner</h1>
 <p>Type the order id printed under the student's QR, then open the shopkeeper app.</p>
@@ -117,49 +134,129 @@ if(!c)return;window.open('${origin}/scan?code='+encodeURIComponent(c),'_blank');
     URL.revokeObjectURL(url)
   }
 
-
   return (
-    <div className="min-h-screen bg-gray-50 p-4">
-      <div className="mx-auto max-w-md">
-        <div className="mb-4 flex items-center justify-between">
-          <h1 className="text-lg font-bold text-gray-900">Scan an order</h1>
-          <Link to="/mobile" className="text-sm font-semibold text-primary">← Back</Link>
-        </div>
-
-        <div className="overflow-hidden rounded-lg border-2 border-gray-200 bg-gray-900">
-          <video ref={videoRef} playsInline muted className={cameraOn ? 'h-64 w-full object-cover' : 'hidden'} />
-          {!cameraOn && (
-            <div className="flex h-40 items-center justify-center text-sm text-gray-300">
-              Camera is off
+    <ShopkeeperLayout>
+      <div className="max-w-xl mx-auto space-y-4">
+        {/* Header */}
+        <div className="flex items-center justify-between border-b border-[var(--border-main)] pb-3">
+          <div className="flex items-center gap-2">
+            <Link
+              to="/mobile"
+              className="p-2 text-[var(--text-dim)] hover:text-[var(--text-heading)] border border-[var(--border-main)] rounded-lg hover:bg-[var(--bg-surface-hover)] transition-colors"
+            >
+              <ArrowLeft className="w-4 h-4" />
+            </Link>
+            <div>
+              <h1 className="text-base sm:text-lg font-bold text-[var(--text-heading)] flex items-center gap-2">
+                <QrCode className="w-5 h-5 text-emerald-600" />
+                Scan & Verify Order
+              </h1>
+              <p className="text-[11px] text-[var(--text-muted)]">
+                Scan the QR code shown on the student's phone to pull up order
+              </p>
             </div>
-          )}
+          </div>
+
+          <Button
+            variant="secondary"
+            size="sm"
+            icon={<Download className="w-3.5 h-3.5" />}
+            onClick={downloadScanner}
+          >
+            Standalone Scanner
+          </Button>
         </div>
 
-        <div className="mt-3 flex gap-2">
-          {!cameraOn ? (
-            <button onClick={() => void startCamera()} className="flex-1 rounded-btn bg-primary py-3 text-sm font-bold text-white">Start camera</button>
-          ) : (
-            <button onClick={stopCamera} className="flex-1 rounded-btn border border-gray-300 py-3 text-sm font-bold">Stop camera</button>
-          )}
-          <button onClick={downloadScanner} className="rounded-btn border-2 border-primary px-4 py-3 text-sm font-bold text-primary">Download scanner</button>
-        </div>
+        {/* Camera Viewfinder */}
+        <Card noPadding>
+          <div className="relative overflow-hidden bg-black aspect-video flex items-center justify-center">
+            <video
+              ref={videoRef}
+              playsInline
+              muted
+              className={cameraOn ? 'h-full w-full object-cover' : 'hidden'}
+            />
+            {!cameraOn && (
+              <div className="flex flex-col items-center justify-center p-8 text-center text-slate-400">
+                <CameraOff className="w-10 h-10 mb-2 opacity-50" />
+                <p className="text-xs font-semibold">Camera is currently paused</p>
+                <p className="text-[11px] text-slate-500 mt-1 max-w-xs">
+                  Tap "Start Camera" to scan student QR codes in real-time
+                </p>
+              </div>
+            )}
+          </div>
 
-        <div className="mt-4">
-          <label className="mb-1 block text-sm font-bold text-gray-600">Or type the order code</label>
-          <input
-            value={manual}
-            onChange={(e) => setManual(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') void lookup(manual) }}
-            placeholder={SCAN_PLACEHOLDER}
-            className="w-full rounded-btn border-2 border-gray-200 px-4 py-2.5 text-sm outline-none focus:border-primary"
-          />
-          <button onClick={() => void lookup(manual)} className="mt-2 w-full rounded-btn bg-primary py-3 text-sm font-bold text-white">Find order</button>
-        </div>
+          <div className="p-3 border-t border-[var(--border-main)] bg-[var(--bg-surface-subtle)] flex gap-2">
+            {!cameraOn ? (
+              <Button
+                variant="primary"
+                size="md"
+                icon={<Camera className="w-4 h-4" />}
+                onClick={() => void startCamera()}
+                className="w-full"
+              >
+                Start Camera Scanner
+              </Button>
+            ) : (
+              <Button
+                variant="danger"
+                size="md"
+                icon={<CameraOff className="w-4 h-4" />}
+                onClick={stopCamera}
+                className="w-full"
+              >
+                Stop Camera
+              </Button>
+            )}
+          </div>
+        </Card>
 
-        {scanMsg && <p className="mt-3 text-sm font-semibold text-primary">{scanMsg}</p>}
-        {scanErr && <p className="mt-3 text-sm font-semibold text-red-600">{scanErr}</p>}
+        {/* Manual Lookup Card */}
+        <Card
+          title={
+            <span className="flex items-center gap-2 text-sm font-bold text-[var(--text-heading)]">
+              <Search className="w-4 h-4 text-emerald-600" />
+              Manual Order Code Lookup
+            </span>
+          }
+          subtitle="If student's phone screen is cracked or camera is unavailable"
+        >
+          <div className="space-y-3">
+            <Input
+              value={manual}
+              onChange={(e) => setManual(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void lookup(manual)
+              }}
+              placeholder={SCAN_PLACEHOLDER}
+            />
+
+            <Button
+              variant="primary"
+              size="md"
+              onClick={() => void lookup(manual)}
+              className="w-full"
+            >
+              Lookup & Open Order
+            </Button>
+          </div>
+        </Card>
+
+        {scanMsg && (
+          <div className="p-3.5 rounded-xl border border-emerald-600/40 bg-emerald-50 dark:bg-emerald-950/30 text-xs font-semibold text-emerald-800 dark:text-emerald-300 flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span>{scanMsg}</span>
+          </div>
+        )}
+
+        {scanErr && (
+          <div className="p-3.5 rounded-xl border border-red-300 dark:border-red-900 bg-red-50 dark:bg-red-950/30 text-xs font-semibold text-red-700 dark:text-red-300 flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+            <span>{scanErr}</span>
+          </div>
+        )}
       </div>
-    </div>
+    </ShopkeeperLayout>
   )
 }
-

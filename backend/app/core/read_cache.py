@@ -22,6 +22,7 @@ import hashlib
 import inspect
 import logging
 import threading
+import time
 from typing import Any
 
 from app.core import redis_cache, shared_cache, ttl_cache
@@ -92,8 +93,11 @@ async def cached_read(ttl: float, key: str, loader, *args, **kwargs) -> Any:
     """
     store_key = cache_key(key, args, kwargs)
 
+    t_c0 = time.perf_counter()
     value = ttl_cache.get(store_key)
     if value is not None:
+        from app.core.timing import record_timing
+        record_timing("cache", (time.perf_counter() - t_c0) * 1000)
         return value
 
     # In-flight request coalescing (single-flight) to prevent cache stampedes
@@ -117,6 +121,8 @@ async def cached_read(ttl: float, key: str, loader, *args, **kwargs) -> Any:
         value = await _cached_lookup(redis_cache.get(store_key), "redis")
         if value is not None:
             ttl_cache.set(store_key, value, ttl)
+            from app.core.timing import record_timing
+            record_timing("cache", (time.perf_counter() - t_c0) * 1000)
             return value
 
         if shared_cache.enabled():
@@ -126,7 +132,12 @@ async def cached_read(ttl: float, key: str, loader, *args, **kwargs) -> Any:
             if value is not None:
                 ttl_cache.set(store_key, value, ttl)
                 redis_cache.set_pair_bg(store_key, value, ttl)
+                from app.core.timing import record_timing
+                record_timing("cache", (time.perf_counter() - t_c0) * 1000)
                 return value
+
+        from app.core.timing import record_timing
+        record_timing("cache", (time.perf_counter() - t_c0) * 1000)
 
         # Synchronous store loaders run on the dedicated db pool (never the
         # shared default executor — see app.core.db_executor); an async loader
@@ -174,18 +185,14 @@ def clear_local() -> None:
 
 
 def clear_matching(*prefixes: str) -> int:
-    """Drop only the in-process entries under ``prefixes`` (see
-    :func:`ttl_cache.clear_prefix`).
-
-    The shared layers (Redis/Postgres) are deliberately untouched: they
-    already expire on their own short TTLs, and awaiting a shared clear on
-    the write path is what used to add latency to every order placement.
-    Returns the number of local entries dropped.
+    """Drop the in-process entries under ``prefixes`` (see
+    :func:`ttl_cache.clear_prefix`) and queue scoped Redis invalidation in bg.
     """
     if prefixes:
         for k in list(_inflight.keys()):
             if k.startswith(prefixes):
                 _inflight.pop(k, None)
+        redis_cache.clear_prefixes_bg(*prefixes)
     return ttl_cache.clear_prefix(*prefixes)
 
 

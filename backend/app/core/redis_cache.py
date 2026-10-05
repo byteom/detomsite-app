@@ -379,6 +379,32 @@ async def clear() -> None:
     _succeed()
 
 
+async def clear_prefixes(*prefixes: str) -> None:
+    """Drop only the keys matching the given prefixes in Redis (scoped, best-effort)."""
+    if not enabled() or not prefixes:
+        return
+    if _breaker_open():
+        _succeed()
+    base_prefix = settings.REDIS_KEY_PREFIX or "detomsite:"
+    for p in prefixes:
+        full_prefix = f"{base_prefix}{p}"
+        try:
+            if transport() == "rest":
+                await _clear_rest(full_prefix)
+            else:
+                await asyncio.to_thread(_resp_clear, full_prefix)
+        except Exception as e:
+            _fail(e)
+            return
+    _succeed()
+
+
+def clear_prefixes_bg(*prefixes: str) -> None:
+    """Queue scoped Redis key deletion in background without blocking the caller."""
+    if prefixes and enabled():
+        spawn(clear_prefixes(*prefixes))
+
+
 def reset_client() -> None:
     """Forget any memoised RESP client so the next call re-reads ``REDIS_URL``.
 

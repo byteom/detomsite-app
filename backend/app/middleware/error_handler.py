@@ -159,14 +159,33 @@ class ErrorHandlingMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    """Middleware for logging requests"""
+    """Middleware for logging requests with Server-Timing breakdown"""
     
     async def dispatch(self, request: Request, call_next):
         """Log request and response"""
+        from app.core.timing import init_request_timing, get_request_timing
         started = time.perf_counter()
+        init_request_timing()
         response = await call_next(request)
         duration_ms = (time.perf_counter() - started) * 1000
-        response.headers.setdefault("Server-Timing", f"app;dur={duration_ms:.1f}")
+
+        # Build detailed Server-Timing breakdown
+        timings = get_request_timing() or {}
+        parts = [f"total;dur={duration_ms:.1f}"]
+        
+        known_time = sum(timings.get(k, 0.0) for k in ("cache", "db_conn", "db_query"))
+        py_proc = max(0.0, duration_ms - known_time)
+        if py_proc > 0.05 and known_time > 0:
+            timings.setdefault("py_proc", py_proc)
+
+        for stage in ("cache", "db_conn", "db_query", "py_proc", "serialization"):
+            if stage in timings:
+                parts.append(f"{stage};dur={timings[stage]:.1f}")
+        for k, v in timings.items():
+            if k not in ("cache", "db_conn", "db_query", "py_proc", "serialization", "total"):
+                parts.append(f"{k};dur={v:.1f}")
+
+        response.headers["Server-Timing"] = ", ".join(parts)
         request_id = getattr(request.state, "request_id", "-")
         logger.info(
             "%s %s -> %s in %.1fms request_id=%s",

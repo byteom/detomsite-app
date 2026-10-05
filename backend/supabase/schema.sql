@@ -230,6 +230,7 @@ create index if not exists idx_orders_status on public.orders (status);
 create index if not exists idx_orders_created_at on public.orders (created_at);
 create index if not exists idx_orders_shop_id on public.orders (shop_id);
 create index if not exists idx_products_shop_id on public.products (shop_id);
+create index if not exists idx_products_shop_category_name on public.products (shop_id, category, name);
 create index if not exists idx_payments_order_id on public.payments (order_id);
 create index if not exists idx_payments_created_at on public.payments (created_at);
 

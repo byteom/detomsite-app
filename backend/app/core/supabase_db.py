@@ -185,11 +185,19 @@ class FastConnectionPool:
         self._prewarm()
 
     def _prewarm(self) -> None:
-        """Eagerly open minconn warm connections on startup."""
-        for _ in range(self.minconn):
-            conn = self._create_connection()
-            if conn:
-                self._pool.put(conn)
+        """Eagerly open warm connections on startup without blocking sequentially."""
+        conn = self._create_connection()
+        if conn:
+            self._pool.put(conn)
+
+        remaining = self.minconn - 1
+        if remaining > 0:
+            def _warm():
+                for _ in range(remaining):
+                    c = self._create_connection()
+                    if c:
+                        self._pool.put(c)
+            threading.Thread(target=_warm, daemon=True, name="db-pool-warm").start()
 
     def _create_connection(self) -> Any | None:
         try:
@@ -292,14 +300,17 @@ class FastConnectionPool:
         return self._pool.qsize()
 
     def ping_all(self) -> None:
-        """Keep-alive ping on all idle connections in the pool."""
-        conns = []
-        while True:
+        """Keep-alive ping on idle connections in the pool without draining the pool.
+
+        Pings connections one-by-one and immediately returns them, ensuring concurrent
+        requests always find warm connections in the pool instead of facing empty-pool waits.
+        """
+        count = self._pool.qsize()
+        for _ in range(count):
             try:
-                conns.append(self._pool.get_nowait())
+                c = self._pool.get_nowait()
             except queue.Empty:
                 break
-        for c in conns:
             try:
                 if getattr(c, "closed", 1) == 0:
                     with c.cursor() as cur:
@@ -345,7 +356,11 @@ def _get_pool() -> Any:
 def _connect() -> Any:
     """Get a pooled Postgres connection with dict-row support."""
     pool = _get_pool()
-    return pool.getconn(timeout=_POOL_WAIT_SECONDS)
+    t0 = time.perf_counter()
+    conn = pool.getconn(timeout=_POOL_WAIT_SECONDS)
+    from app.core.timing import record_timing
+    record_timing("db_conn", (time.perf_counter() - t0) * 1000)
+    return conn
 
 
 def _release(conn: Any, discard: bool = False) -> None:
@@ -353,6 +368,11 @@ def _release(conn: Any, discard: bool = False) -> None:
     if conn is None:
         return
     is_dead = bool(discard or getattr(conn, "closed", 0))
+    if not is_dead and _in_transaction(conn):
+        try:
+            conn.rollback()
+        except Exception:
+            is_dead = True
     pool = _get_pool()
     pool.putconn(conn, close=is_dead)
     if is_dead:
@@ -484,6 +504,7 @@ class _DBContext:
         self._readonly = readonly
 
     def __enter__(self) -> Any:
+        self._t0 = time.perf_counter()
         if self._readonly:
             try:
                 self._connection.autocommit = True
@@ -492,6 +513,9 @@ class _DBContext:
         return self._connection
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
+        dur = (time.perf_counter() - getattr(self, "_t0", time.perf_counter())) * 1000
+        from app.core.timing import record_timing
+        record_timing("db_query", dur)
         if self._readonly:
             try:
                 if getattr(self._connection, "closed", 1) == 0:

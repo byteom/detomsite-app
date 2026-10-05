@@ -330,24 +330,28 @@ app.add_middleware(GZipMiddleware, minimum_size=500)
 from app.core import embedded_redis, read_cache, redis_cache, shared_cache, ttl_cache
 
 
+_NOOP_WRITE_PATHS = (
+    "/login", "/auth/login", "/users/login", "/vendor/login", "/admin/login",
+    "/users/forgot-password", "/users/forgot-username", "/users/reset-password",
+    "/users/verify-reset-otp", "/local/session", "/local/push/subscribe",
+)
+
+
 async def cache_invalidation_middleware(request: Request, call_next):
     response = await call_next(request)
     if request.method in ("POST", "PUT", "PATCH", "DELETE") and response.status_code < 400:
-        # Scoped eviction, not a global wipe. The old code dropped the ENTIRE
-        # in-process cache on every write, so in a live canteen (a steady
-        # trickle of orders, payments, vendor toggles) the cache was
-        # perpetually cold and every portal re-paid full WAN reads — including
-        # the 37k-row catalogue scan behind checkout-data — for data the write
-        # never touched. Each write path below lists only the key prefixes it
-        # can actually stale; staleness everywhere else stays bounded by the
-        # short per-entry TTLs (5–60 s).
-        #
-        # Prefixes are matched against every layer-1 key (plain keys like
-        # "payment-settings" and param-built keys like "shops:True::0:<digest>"
-        # alike, plus the store-internal "shop:id:"/"user:id:" keys). A path
-        # with no audited mapping falls back to the old full clear — safe, and
-        # no worse than before.
-        await read_cache.clear()
+        path = request.url.path
+        # Auth, login, session and push subscription endpoints mutate no domain data
+        if any(path.endswith(p) for p in _NOOP_WRITE_PATHS):
+            return response
+
+        # Scoped eviction: only evict the cache key prefixes that the write target stales.
+        # This keeps the read cache warm across unrelated writes (orders, products, shops).
+        prefixes = _evict_prefixes_for(path)
+        if prefixes is not None:
+            read_cache.clear_matching(*prefixes)
+        else:
+            read_cache.clear_bg()
     return response
 
 
