@@ -61,9 +61,22 @@ export function clearCart() {
   saveCart([])
 }
 
+/* Single-restaurant cart: a student orders from ONE kitchen at a time.
+   Adding an item from another shop does NOT merge — the caller must ask
+   first (see cartShopConflict) and, on OK, replace the cart. */
+export type AddProductResult = 'added' | 'confirm-required'
+
+export function cartShopConflict(shopId: string): { conflict: boolean; currentShopName: string } {
+  const current = getCart()
+  if (!current.length || current[0].shop_id === shopId) {
+    return { conflict: false, currentShopName: '' }
+  }
+  return { conflict: true, currentShopName: current[0].shop_name || 'another kitchen' }
+}
+
 /** Add a product to the cart with a given quantity. If the product is already
  *  in the cart, the quantity is incremented (merged) instead. */
-export function addProductToCart(product: LocalProduct, shop: LocalShop, quantity = 1) {
+export function addProductToCart(product: LocalProduct, shop: LocalShop, quantity = 1): AddProductResult {
   const current = getCart()
   const existing = current.find(item => item.product_id === product.id)
   let nextItems: StoredCartItem[]
@@ -74,6 +87,7 @@ export function addProductToCart(product: LocalProduct, shop: LocalShop, quantit
         : item
     )
   } else {
+    if (cartShopConflict(shop.id).conflict) return 'confirm-required'
     nextItems = [
       ...current,
       {
@@ -88,7 +102,13 @@ export function addProductToCart(product: LocalProduct, shop: LocalShop, quantit
     ]
   }
   saveCart(nextItems)
-  return nextItems
+  return 'added'
+}
+
+/* Replace the whole cart with one item (after the cross-shop confirm). */
+export function replaceCartWithProduct(product: LocalProduct, shop: LocalShop, quantity = 1): AddProductResult {
+  saveCart([])
+  return addProductToCart(product, shop, quantity)
 }
 
 /** Set an explicit quantity for a product (used by stepper -/+ buttons). */

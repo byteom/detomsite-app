@@ -15,7 +15,7 @@ export function AdminHeader({ onOpenMobileMenu, onLogout }: AdminHeaderProps) {
 
   return (
     <header
-      className="h-14 sticky top-0 z-30 flex items-center justify-between px-4 border-b border-gray-200 dark:border-admin-border-dark bg-white/95 dark:bg-admin-surface-dark/95 backdrop-blur-xs select-none"
+      className="h-14 sticky top-0 z-30 flex items-center justify-between px-4 border-b border-[var(--border-main)] bg-[var(--bg-surface)]/95 backdrop-blur-xs select-none"
       style={{ borderRadius: 0 }}
     >
       {/* Left: Mobile hamburger & Status */}
@@ -23,7 +23,7 @@ export function AdminHeader({ onOpenMobileMenu, onLogout }: AdminHeaderProps) {
         <button
           type="button"
           onClick={onOpenMobileMenu}
-          className="p-1.5 md:hidden text-gray-500 hover:text-gray-900 dark:hover:text-white border border-gray-200 dark:border-admin-border-dark"
+          className="p-1.5 md:hidden text-[var(--text-muted)] hover:text-[var(--text-heading)] border border-[var(--border-main)]"
           style={{ borderRadius: 0 }}
           aria-label="Open navigation menu"
         >
@@ -35,9 +35,9 @@ export function AdminHeader({ onOpenMobileMenu, onLogout }: AdminHeaderProps) {
             <span className="animate-ping absolute inline-flex h-full w-full bg-emerald-400 opacity-75" />
             <span className="relative inline-flex h-2 w-2 bg-emerald-500" />
           </span>
-          <span className="font-semibold text-gray-700 dark:text-gray-300">Operations Desk</span>
-          <span className="text-gray-400">·</span>
-          <span className="text-gray-500 dark:text-gray-400 font-mono">v1.2.0</span>
+          <span className="font-semibold text-[var(--text-heading)]">Operations Desk</span>
+          <span className="text-[var(--text-dim)]">·</span>
+          <span className="text-[var(--text-muted)] font-mono">v1.2.0</span>
         </div>
       </div>
 
@@ -47,22 +47,22 @@ export function AdminHeader({ onOpenMobileMenu, onLogout }: AdminHeaderProps) {
         <button
           type="button"
           onClick={toggleTheme}
-          className="p-2 text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-admin-surface-darkHover border border-transparent hover:border-gray-200 dark:hover:border-admin-border-dark transition-colors"
+          className="p-2 text-[var(--text-muted)] hover:text-[var(--text-heading)] hover:bg-[var(--bg-surface-hover)] border border-[var(--border-main)] transition-colors"
           style={{ borderRadius: 0 }}
           title={isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
           aria-label="Toggle theme"
         >
-          {isDark ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4 text-gray-600" />}
+          {isDark ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4 text-slate-700" />}
         </button>
 
         {/* Live Notification Bell */}
         <NotificationBell />
 
-        <div className="h-5 w-px bg-gray-200 dark:bg-admin-border-dark mx-1" />
+        <div className="h-5 w-px bg-[var(--border-main)] mx-1" />
 
         {/* Admin User Chip */}
         <div
-          className="flex items-center gap-2 px-2.5 py-1 text-xs border border-gray-200 dark:border-admin-border-dark bg-gray-50 dark:bg-admin-surface-darkSubtle/40"
+          className="flex items-center gap-2 px-2.5 py-1 text-xs border border-[var(--border-main)] bg-[var(--bg-surface-subtle)]"
           style={{ borderRadius: 0 }}
         >
           <div
@@ -71,7 +71,7 @@ export function AdminHeader({ onOpenMobileMenu, onLogout }: AdminHeaderProps) {
           >
             <User className="w-3 h-3" />
           </div>
-          <span className="font-semibold text-gray-800 dark:text-gray-200 max-w-[100px] truncate">
+          <span className="font-semibold text-[var(--text-heading)] max-w-[100px] truncate">
             {admin.name || admin.username || 'Admin'}
           </span>
         </div>

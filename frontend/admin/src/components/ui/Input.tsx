@@ -30,7 +30,7 @@ export function Input({
       {label && (
         <label
           htmlFor={inputId}
-          className="block text-xs font-bold uppercase tracking-wider text-gray-700 dark:text-gray-300 mb-1.5"
+          className="block text-xs font-bold uppercase tracking-wider text-[var(--text-heading)] mb-1.5"
         >
           {label}
         </label>
@@ -38,7 +38,7 @@ export function Input({
 
       <div className="relative">
         {icon && (
-          <div className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none">
+          <div className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-dim)] pointer-events-none">
             {icon}
           </div>
         )}
@@ -46,11 +46,11 @@ export function Input({
         <input
           id={inputId}
           type={inputType}
-          className={`w-full bg-white dark:bg-admin-surface-dark border ${
+          className={`w-full bg-[var(--bg-surface)] border ${
             error
               ? 'border-red-500 focus:border-red-500'
-              : 'border-gray-300 dark:border-admin-border-dark focus:border-emerald-600'
-          } px-3.5 py-2.5 text-sm text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 outline-none transition-colors duration-150 ${
+              : 'border-[var(--border-main)] focus:border-emerald-600'
+          } px-3.5 py-2.5 text-sm text-[var(--text-heading)] placeholder:text-[var(--text-dim)] outline-none transition-colors duration-150 ${
             icon ? 'pl-9' : ''
           } ${isPassword || iconRight ? 'pr-10' : ''} ${className}`}
           style={{ borderRadius: 0 }}
@@ -61,7 +61,7 @@ export function Input({
           <button
             type="button"
             onClick={() => setShowPassword(p => !p)}
-            className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition-colors p-1"
+            className="absolute right-3 top-1/2 -translate-y-1/2 text-[var(--text-dim)] hover:text-[var(--text-heading)] transition-colors p-1"
             aria-label={showPassword ? 'Hide password' : 'Show password'}
             tabIndex={-1}
           >
@@ -70,7 +70,7 @@ export function Input({
         )}
 
         {!isPassword && iconRight && (
-          <div className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400">
+          <div className="absolute right-3 top-1/2 -translate-y-1/2 text-[var(--text-dim)]">
             {iconRight}
           </div>
         )}
@@ -78,7 +78,7 @@ export function Input({
 
       {error && <p className="mt-1 text-xs text-red-600 dark:text-red-400">{error}</p>}
       {!error && helperText && (
-        <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">{helperText}</p>
+        <p className="mt-1 text-xs text-[var(--text-muted)]">{helperText}</p>
       )}
     </div>
   )

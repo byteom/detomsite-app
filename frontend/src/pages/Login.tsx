@@ -3,7 +3,6 @@ import { Link, useNavigate } from 'react-router-dom'
 import api from '../services/api'
 import { saveSessionToBackend } from '../services/localApi'
 import { getLocalSession, saveLocalSession, getDashboardPath, UserRoleChoice } from '../utils/session'
-import { getErrorMessage } from '../utils/helpers'
 
 const roles: { id: UserRoleChoice; label: string; icon: string }[] = [
   { id: 'student', label: 'Student', icon: '🎓' },

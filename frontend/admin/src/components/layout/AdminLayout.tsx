@@ -53,7 +53,7 @@ export function AdminLayout({ children }: AdminLayoutProps) {
   }
 
   return (
-    <div className="min-h-screen bg-admin-bg-light dark:bg-admin-bg-dark text-gray-900 dark:text-gray-100 flex">
+    <div className="min-h-screen bg-[var(--bg-page)] text-[var(--text-body)] flex">
       {/* Desktop Sidebar */}
       <div className="hidden md:block shrink-0 sticky top-0 h-screen z-40">
         <AdminSidebar
@@ -85,13 +85,13 @@ export function AdminLayout({ children }: AdminLayoutProps) {
       )}
 
       {/* Main Column */}
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0 bg-[var(--bg-page)]">
         <AdminHeader
           onOpenMobileMenu={() => setMobileOpen(true)}
           onLogout={() => setShowLogoutConfirm(true)}
         />
 
-        <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto animate-fade-in">
+        <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto animate-fade-in text-[var(--text-body)]">
           {children}
         </main>
       </div>

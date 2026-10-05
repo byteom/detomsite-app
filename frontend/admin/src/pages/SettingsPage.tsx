@@ -82,13 +82,13 @@ export function SettingsPage() {
   }
 
   return (
-    <div className="space-y-6 max-w-4xl">
+    <div className="space-y-6 max-w-4xl text-[var(--text-body)]">
       {/* Header */}
-      <div className="border-b border-gray-200 dark:border-admin-border-dark pb-4">
-        <h1 className="text-2xl font-black text-gray-900 dark:text-white tracking-tight">
+      <div className="border-b border-[var(--border-main)] pb-4">
+        <h1 className="text-2xl font-black text-[var(--text-heading)] tracking-tight">
           System Configuration & Broadcasts
         </h1>
-        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+        <p className="text-xs text-[var(--text-muted)] mt-0.5">
           Configure financial settlement accounts and campus-wide real-time student announcements
         </p>
       </div>
@@ -105,7 +105,7 @@ export function SettingsPage() {
       >
         {upiMsg && (
           <div
-            className="mb-4 p-3 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-800 text-xs font-semibold text-emerald-800 dark:text-emerald-300"
+            className="mb-4 p-3 bg-emerald-500/10 border border-emerald-500/30 text-xs font-semibold text-emerald-800 dark:text-emerald-300"
             style={{ borderRadius: 0 }}
           >
             {upiMsg}
@@ -114,7 +114,7 @@ export function SettingsPage() {
 
         {upiErr && (
           <div
-            className="mb-4 p-3 bg-red-50 dark:bg-red-950/40 border border-red-300 dark:border-red-800 text-xs font-semibold text-red-800 dark:text-red-300"
+            className="mb-4 p-3 bg-red-500/10 border border-red-500/30 text-xs font-semibold text-red-800 dark:text-red-300"
             style={{ borderRadius: 0 }}
           >
             {upiErr}
@@ -132,7 +132,7 @@ export function SettingsPage() {
           />
 
           <div className="flex items-center justify-between pt-2">
-            <p className="text-xs text-gray-500 max-w-md">
+            <p className="text-xs text-[var(--text-muted)] max-w-md">
               Note: Customer payments go directly to individual shopkeeper UPI VPAs. This account is
               exclusively for collecting platform commission.
             </p>
@@ -162,7 +162,7 @@ export function SettingsPage() {
       >
         {noticeMsg && (
           <div
-            className="mb-4 p-3 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-800 text-xs font-semibold text-emerald-800 dark:text-emerald-300"
+            className="mb-4 p-3 bg-emerald-500/10 border border-emerald-500/30 text-xs font-semibold text-emerald-800 dark:text-emerald-300"
             style={{ borderRadius: 0 }}
           >
             {noticeMsg}
@@ -171,7 +171,7 @@ export function SettingsPage() {
 
         {noticeErr && (
           <div
-            className="mb-4 p-3 bg-red-50 dark:bg-red-950/40 border border-red-300 dark:border-red-800 text-xs font-semibold text-red-800 dark:text-red-300"
+            className="mb-4 p-3 bg-red-500/10 border border-red-500/30 text-xs font-semibold text-red-800 dark:text-red-300"
             style={{ borderRadius: 0 }}
           >
             {noticeErr}
@@ -187,13 +187,13 @@ export function SettingsPage() {
               className="h-4 w-4 accent-emerald-600"
               style={{ borderRadius: 0 }}
             />
-            <span className="text-xs font-bold text-gray-900 dark:text-white">
+            <span className="text-xs font-bold text-[var(--text-heading)]">
               Enable and display this announcement on the Student Portal
             </span>
           </label>
 
           <div>
-            <label className="block text-xs font-bold uppercase tracking-wider text-gray-700 dark:text-gray-300 mb-1.5">
+            <label className="block text-xs font-bold uppercase tracking-wider text-[var(--text-heading)] mb-1.5">
               Announcement Message
             </label>
             <textarea
@@ -202,10 +202,10 @@ export function SettingsPage() {
               value={noticeText}
               onChange={e => setNoticeText(e.target.value)}
               placeholder="e.g. Campus Cafeteria closes early at 8:30 PM today for maintenance. Please place night orders before 8:00 PM."
-              className="w-full bg-white dark:bg-admin-surface-dark border border-gray-300 dark:border-admin-border-dark p-3 text-xs text-gray-900 dark:text-white outline-none focus:border-emerald-600"
+              className="w-full bg-[var(--bg-surface)] border border-[var(--border-main)] p-3 text-xs text-[var(--text-heading)] outline-none focus:border-emerald-600 transition-colors"
               style={{ borderRadius: 0 }}
             />
-            <div className="flex items-center justify-between text-[11px] text-gray-400 mt-1">
+            <div className="flex items-center justify-between text-[11px] text-[var(--text-muted)] mt-1">
               <span>Supports formatting and line breaks</span>
               <span>{noticeText.length}/500 characters</span>
             </div>
@@ -214,11 +214,11 @@ export function SettingsPage() {
           {/* Real-time Student Preview */}
           {noticeOn && noticeText.trim() && (
             <div className="pt-2">
-              <p className="text-[10px] font-bold uppercase tracking-wider text-gray-400 mb-1.5">
+              <p className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)] mb-1.5">
                 Live Student Portal Preview:
               </p>
               <div
-                className="p-3 bg-emerald-50 dark:bg-emerald-950/50 border border-emerald-300 dark:border-emerald-700 text-xs font-semibold text-emerald-800 dark:text-emerald-200 whitespace-pre-line leading-relaxed"
+                className="p-3 bg-emerald-500/10 border border-emerald-500/30 text-xs font-semibold text-emerald-800 dark:text-emerald-300 whitespace-pre-line leading-relaxed"
                 style={{ borderRadius: 0 }}
               >
                 📢 {noticeText.trim()}

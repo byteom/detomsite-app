@@ -70,17 +70,31 @@ export function clearCart(): void {
   saveCart([])
 }
 
-export function addToCart(p: Product, s: Shop, qty = 1): boolean {
+/* Single-restaurant cart: a student orders from ONE kitchen at a time.
+   Adding an item from another shop does NOT merge — the caller must ask
+   first (see cartShopConflict) and, on OK, replace the cart. */
+export type AddResult = 'added' | 'confirm-required' | 'limit-reached'
+
+export function cartShopConflict(shopId: string): { conflict: boolean; currentShopName: string } {
+  const c = getCart()
+  if (!c.length || c[0].shop_id === shopId) {
+    return { conflict: false, currentShopName: '' }
+  }
+  return { conflict: true, currentShopName: c[0].shop_name || 'another kitchen' }
+}
+
+export function addToCart(p: Product, s: Shop, qty = 1): AddResult {
   const c = getCart()
   const existing = c.find((i) => i.product_id === p.id)
   if (existing) {
     const next = (existing.quantity || 1) + qty
-    if (next > MAX_ITEM_QTY) return false
+    if (next > MAX_ITEM_QTY) return 'limit-reached'
     saveCart(
       c.map((i) => (i.product_id === p.id ? { ...i, quantity: next } : i))
     )
-    return true
+    return 'added'
   }
+  if (cartShopConflict(s.id).conflict) return 'confirm-required'
   saveCart([
     ...c,
     {
@@ -95,7 +109,13 @@ export function addToCart(p: Product, s: Shop, qty = 1): boolean {
       combo_items: p.combo_items,
     },
   ])
-  return true
+  return 'added'
+}
+
+/* Replace the whole cart with one item (after the cross-shop confirm). */
+export function replaceCartWith(p: Product, s: Shop, qty = 1): AddResult {
+  saveCart([])
+  return addToCart(p, s, qty)
 }
 
 export function setItemQty(productId: string, qty: number): void {
@@ -155,6 +175,41 @@ export function fetchShopsCached(): Promise<Shop[]> {
       return r.data
     })
     .catch(() => cachedShops() || [])
+}
+
+export interface MenuSummaryData {
+  shops: Record<string, { dishes: number; has_combo: boolean; matched?: number }>
+  total_dishes: number
+}
+
+/* ─── Client Cache for Menu Flags ─── */
+export const MENUFLAGS_CACHE_KEY = 'detomsite-menuflags-cache'
+// Same 60s client cache as shops: the /shops grid remounts on every
+// back-navigation, and without this each visit re-fetched menu-summary and
+// flashed skeletons even when nothing changed.
+export function fetchMenuSummaryCached(match: string): Promise<MenuSummaryData> {
+  try {
+    const raw = localStorage.getItem(MENUFLAGS_CACHE_KEY)
+    if (raw) {
+      const { t, data, m } = JSON.parse(raw)
+      if (m === match && Date.now() - t < 60000 && data) return Promise.resolve(data)
+    }
+  } catch {
+    /* corrupt cache — fall through to network */
+  }
+  return api
+    .get<MenuSummaryData>('/local/menu-summary', { params: { match } })
+    .then((r) => {
+      try {
+        localStorage.setItem(
+          MENUFLAGS_CACHE_KEY,
+          JSON.stringify({ t: Date.now(), m: match, data: r.data })
+        )
+      } catch {
+        /* storage full */
+      }
+      return r.data
+    })
 }
 
 export const ORDERS_CACHE_KEY = 'detomsite-orders-cache'

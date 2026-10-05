@@ -9,6 +9,7 @@ import {
 import { dedupeGet } from './services/api'
 import ErrorBoundary from './components/ErrorBoundary'
 import { Layout } from './components/layout/Layout'
+import { ScrollToTop } from './components/common/ScrollToTop'
 
 // Pages
 import { ShopsPage } from './pages/ShopsPage'
@@ -165,6 +166,7 @@ function FallbackRedirect() {
 export default function App() {
   return (
     <Router>
+      <ScrollToTop />
       <ErrorBoundary>
         <Routes>
           {/* Public Auth Routes */}

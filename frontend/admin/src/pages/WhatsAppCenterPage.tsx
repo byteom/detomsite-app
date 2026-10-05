@@ -102,19 +102,19 @@ export function WhatsAppCenterPage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 text-[var(--text-body)]">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-200 dark:border-admin-border-dark pb-4">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[var(--border-main)] pb-4">
         <div>
           <div className="flex items-center gap-2.5">
-            <h1 className="text-2xl font-black text-gray-900 dark:text-white tracking-tight">
+            <h1 className="text-2xl font-black text-[var(--text-heading)] tracking-tight">
               WhatsApp Dispatch Center
             </h1>
             <Badge variant="success" size="sm" dot>
               Polling 8s
             </Badge>
           </div>
-          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+          <p className="text-xs text-[var(--text-muted)] mt-0.5">
             Verified orders auto-generate pre-filled WhatsApp messages to shopkeepers from your phone number
           </p>
         </div>
@@ -148,7 +148,7 @@ export function WhatsAppCenterPage() {
       {/* Status banner */}
       {msg && (
         <div
-          className="p-3.5 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-800 text-xs font-semibold text-emerald-800 dark:text-emerald-300"
+          className="p-3.5 bg-emerald-500/10 border border-emerald-500/30 text-xs font-semibold text-emerald-800 dark:text-emerald-300"
           style={{ borderRadius: 0 }}
         >
           {msg}
@@ -157,7 +157,7 @@ export function WhatsAppCenterPage() {
 
       {/* Main Content */}
       {loading ? (
-        <div className="p-12 text-center text-xs text-gray-500">
+        <div className="p-12 text-center text-xs text-[var(--text-muted)]">
           <RefreshCw className="w-8 h-8 mx-auto mb-2 animate-spin text-emerald-600 opacity-60" />
           Loading pending WhatsApp notifications...
         </div>
@@ -169,10 +169,10 @@ export function WhatsAppCenterPage() {
           >
             <CheckCircle2 className="w-6 h-6" />
           </div>
-          <h3 className="text-base font-bold text-gray-900 dark:text-white">
+          <h3 className="text-base font-bold text-[var(--text-heading)]">
             All Orders Dispatched
           </h3>
-          <p className="mt-1 text-xs text-gray-500 dark:text-gray-400 max-w-md mx-auto">
+          <p className="mt-1 text-xs text-[var(--text-muted)] max-w-md mx-auto">
             When a customer's payment is verified or an order is confirmed, the shop dispatch package
             appears here ready to transmit.
           </p>
@@ -182,13 +182,13 @@ export function WhatsAppCenterPage() {
           {pending.map(item => (
             <div
               key={item.id}
-              className="border border-emerald-500/30 dark:border-emerald-700/40 bg-white dark:bg-admin-surface-dark p-4 shadow-xs"
+              className="border border-emerald-500/30 dark:border-emerald-700/40 bg-[var(--bg-surface)] p-4 shadow-xs"
               style={{ borderRadius: 0 }}
             >
               <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
                 <div className="flex-1 space-y-1.5 min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
-                    <span className="font-mono text-base font-black text-gray-900 dark:text-white">
+                    <span className="font-mono text-base font-black text-[var(--text-heading)]">
                       #{item.order_token}
                     </span>
                     <Badge variant="default" size="xs">
@@ -199,17 +199,17 @@ export function WhatsAppCenterPage() {
                     </Badge>
                   </div>
 
-                  <p className="text-xs text-gray-800 dark:text-gray-200 font-semibold">
+                  <p className="text-xs text-[var(--text-heading)] font-semibold">
                     {item.student_name} ·{' '}
                     <span className="font-mono text-emerald-700 dark:text-emerald-400 font-bold">
                       ₹{item.total}
                     </span>
                   </p>
 
-                  <p className="text-xs text-gray-500 font-mono">Recipient: {item.phone}</p>
+                  <p className="text-xs text-[var(--text-muted)] font-mono">Recipient: {item.phone}</p>
 
                   <div
-                    className="mt-2 p-2.5 bg-gray-50 dark:bg-admin-surface-darkSubtle border border-gray-200 dark:border-admin-border-dark text-[11px] font-mono text-gray-700 dark:text-gray-300 whitespace-pre-line leading-relaxed max-w-2xl"
+                    className="mt-2 p-2.5 bg-[var(--bg-surface-subtle)] border border-[var(--border-main)] text-[11px] font-mono text-[var(--text-body)] whitespace-pre-line leading-relaxed max-w-2xl"
                     style={{ borderRadius: 0 }}
                   >
                     {String(item.message || '').slice(0, 240)}
@@ -233,7 +233,7 @@ export function WhatsAppCenterPage() {
                     href={item.url}
                     target="_blank"
                     rel="noreferrer"
-                    className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-gray-600 dark:text-gray-400 hover:text-emerald-600 dark:hover:text-emerald-400"
+                    className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[var(--text-muted)] hover:text-emerald-600 dark:hover:text-emerald-400 transition-colors"
                   >
                     <ExternalLink className="w-3 h-3" /> Link Only
                   </a>

@@ -7,7 +7,6 @@ import { getLocalSession, saveLocalSession } from '../../utils/session'
 import { subscribeNotifications } from '../../services/notifStore'
 import { usePolling } from '../../hooks/usePolling'
 import { same } from '../../utils/same'
-import { getErrorMessage } from '../../utils/helpers'
 
 type Notice = { kind: 'ok' | 'error'; text: string } | null
 

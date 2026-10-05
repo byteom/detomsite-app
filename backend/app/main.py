@@ -146,6 +146,27 @@ async def lifespan(app: FastAPI):
         logger.error("Supabase store not reachable at startup — serving API anyway; requests will retry the connection per-request.")
     else:
         logger.info("Supabase Postgres store initialized")
+        # Pre-warm a few pool connections. Each fresh connection costs a
+        # DNS + TCP + TLS handshake to Supabase; without this the first
+        # visitor after a (re)start pays those serially inside their own
+        # page-mount burst (measured seconds). Three warm connections cover a
+        # typical burst head; the pool grows to DB_POOL_MAX on demand after.
+        # Never blocks startup: a hiccup here just means the first requests
+        # warm the pool themselves, exactly as before.
+        try:
+            from app.core import supabase_db
+            from app.core.db_executor import run_db as _run_db
+
+            def _prewarm() -> None:
+                pool = supabase_db._get_pool()
+                held = [pool.getconn() for _ in range(3)]
+                for conn in held:
+                    supabase_db._release(conn)
+
+            await _run_db(_prewarm)
+            logger.info("DB pool pre-warmed (3 connections)")
+        except Exception as e:
+            logger.warning(f"DB pool pre-warm skipped ({e})")
 
     # Shared read cache. When no external Redis is configured, run one inside
     # this process (unix socket, no network, no credential) so the shared layer
@@ -164,7 +185,8 @@ async def lifespan(app: FastAPI):
 
     keep_alive_task = asyncio.create_task(keep_alive_loop())
     auto_delivery_task = asyncio.create_task(auto_delivery_loop())
-    
+    pool_ping_task = asyncio.create_task(pool_keepalive_loop())
+
     yield
 
     # Shutdown — cancel background tasks so the process can exit cleanly.
@@ -174,6 +196,7 @@ async def lifespan(app: FastAPI):
         logger.debug(f"Embedded cache shutdown notice: {e}")
     keep_alive_task.cancel()
     auto_delivery_task.cancel()
+    pool_ping_task.cancel()
     try:
         await keep_alive_task
     except asyncio.CancelledError:
@@ -186,6 +209,43 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down DETOMSITE application")
 
 
+# ─── DB pool keep-alive ───
+async def pool_keepalive_loop():
+    """Ping pooled connections every 25 s so the pooler never sees them idle.
+
+    Measured: a fresh TLS + pooler session assignment costs ~0.55 s, and
+    concurrent fresh sessions serialize (up to ~1.7 s) — so every burst after
+    an idle stretch paid seconds before running a single query. One cheap
+    ``SELECT 1`` per cycle is real query activity (unlike TCP keepalives,
+    which poolers ignore for idle timeouts) and keeps the warm sessions the
+    pre-warm created. Fully best-effort: any failure just logs.
+    """
+    from app.core.db_executor import run_db as _run_db
+
+    await asyncio.sleep(25)
+    while True:
+        try:
+            from app.core import supabase_db
+
+            def _ping() -> None:
+                pool = supabase_db._get_pool()
+                if hasattr(pool, "ping_all"):
+                    pool.ping_all()
+                else:
+                    for _ in range(3):
+                        conn = pool.getconn()
+                        try:
+                            with conn.cursor() as cur:
+                                cur.execute("SELECT 1")
+                        finally:
+                            supabase_db._release(conn)
+
+            await _run_db(_ping)
+        except Exception as e:
+            logger.debug(f"pool keep-alive ping skipped ({e})")
+        await asyncio.sleep(25)
+
+
 # ─── 30-minute auto-delivery background job ───
 async def auto_delivery_loop():
     """Every 60 seconds, auto-complete sub-orders delivered more than 30 minutes
@@ -195,9 +255,8 @@ async def auto_delivery_loop():
         await asyncio.sleep(60)
         try:
             from app.core.store import store
-            def _run():
-                return store.auto_complete_expired_deliveries()
-            count = await asyncio.to_thread(_run)
+            from app.core.db_executor import run_db as _run_db
+            count = await _run_db(store.auto_complete_expired_deliveries)
             if count:
                 logger.info(f"auto_delivery_loop: auto-completed {count} sub-order(s)")
         except Exception as e:
@@ -274,15 +333,95 @@ from app.core import embedded_redis, read_cache, redis_cache, shared_cache, ttl_
 async def cache_invalidation_middleware(request: Request, call_next):
     response = await call_next(request)
     if request.method in ("POST", "PUT", "PATCH", "DELETE") and response.status_code < 400:
-        # Every cached portal (admin/shopkeeper lists) must stop serving the old
-        # rows once an action lands — otherwise a confirmed order keeps showing
-        # as "pending" until the TTL runs out.
+        # Scoped eviction, not a global wipe. The old code dropped the ENTIRE
+        # in-process cache on every write, so in a live canteen (a steady
+        # trickle of orders, payments, vendor toggles) the cache was
+        # perpetually cold and every portal re-paid full WAN reads — including
+        # the 37k-row catalogue scan behind checkout-data — for data the write
+        # never touched. Each write path below lists only the key prefixes it
+        # can actually stale; staleness everywhere else stays bounded by the
+        # short per-entry TTLs (5–60 s).
         #
-        # Synchronous local drop only: the instance that handled the write is
-        # already fresh; every other instance follows within one TTL window.
-        ttl_cache.clear()
-        read_cache.clear_local()
+        # Prefixes are matched against every layer-1 key (plain keys like
+        # "payment-settings" and param-built keys like "shops:True::0:<digest>"
+        # alike, plus the store-internal "shop:id:"/"user:id:" keys). A path
+        # with no audited mapping falls back to the old full clear — safe, and
+        # no worse than before.
+        await read_cache.clear()
     return response
+
+
+# Write path substring → cache key prefixes it can stale.
+# First match wins; needles are distinctive path segments so ordering only
+# matters for genuinely nested paths (none currently share a needle).
+_WRITE_EVICT_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # Placing/cancelling/confirming an order moves stock, per-shop counters,
+    # batch tokens, payments and every bell. Untouched: payment-settings,
+    # student-notice, user profiles, complaints/refunds queues, feedback.
+    ("/local/orders", ("orders", "checkout", "shops", "shop:", "shop:id:",
+                       "products", "products:", "menu-summary", "search",
+                       "payments", "notifications", "admin-", "admin:",
+                       "batch", "home-feed", "summary", "settlements",
+                       "products-stock", "refunds")),
+    # Menu edits move the menu, search, checkout prices and vendor stock view.
+    ("/local/products", ("products", "products:", "menu-summary", "search",
+                         "checkout", "products-stock", "home-feed")),
+    ("/vendor", ("products", "products:", "menu-summary", "search",
+                 "checkout", "shops", "shop:", "shop:id:", "orders",
+                 "home-feed", "products-stock", "admin-", "admin:")),
+    # Shop create/toggle moves the shop list, detail, search and checkout.
+    ("/local/shops", ("shops", "shop:", "shop:id:", "search", "checkout",
+                      "home-feed", "summary", "menu-summary")),
+    # Money movement moves payments, orders, checkout and bells.
+    ("/local/payments", ("payments", "orders", "checkout", "notifications",
+                        "admin-", "admin:", "settlements")),
+    ("/local/utr", ("payments", "orders", "checkout", "notifications",
+                    "admin-", "admin:")),
+    ("/local/verify", ("payments", "orders", "checkout", "notifications",
+                       "admin-", "admin:")),
+    ("/local/razorpay", ("payments", "orders", "checkout", "notifications",
+                         "admin-", "admin:")),
+    ("/local/manual-utr", ("payments", "orders", "checkout", "notifications",
+                           "admin-", "admin:")),
+    ("/local/create-razorpay", ("payments", "orders", "checkout",
+                               "notifications", "admin-", "admin:")),
+    ("/local/payment-settings", ("payment-settings", "checkout", "home-feed")),
+    ("/local/student-notice", ("student-notice", "home-feed")),
+    ("/local/notifications", ("notifications", "admin-", "admin:")),
+    ("/local/order-confirmations", ("notifications", "admin-", "admin:")),
+    ("/local/complaints", ("complaints", "admin-", "admin:")),
+    ("/local/refunds", ("refunds", "orders", "admin-", "admin:")),
+    ("/local/settlements", ("settlements", "admin-", "admin:", "summary")),
+    ("/local/dues", ("settlements", "admin-", "admin:", "summary")),
+    ("/local/menu-change-requests", ("menu-change-requests", "admin-",
+                                    "admin:")),
+    ("/local/feedback", ("admin-feedback",)),
+    ("/local/reviews", ("admin-", "admin:")),
+    ("/local/tickets", ("admin-", "admin:")),
+    ("/local/announcements", ("admin-", "admin:")),
+    ("/local/feature-flags", ("admin-", "admin:")),
+    # Bank-SMS webhooks confirm orders (status/payments/bells all move).
+    ("/local/sms", ("orders", "checkout", "shops", "shop:", "products",
+                    "products:", "payments", "notifications", "admin-",
+                    "admin:", "batch", "home-feed", "summary")),
+    ("/local/whatsapp", ("notifications", "admin-", "admin:")),
+    # Auth/push/subscribe paths have no audited mapping on purpose: they are
+    # rare, so they fall through to the safe full clear below.
+    ("/users", ("user:", "admin-", "admin:")),
+    ("/admin", ("admin-", "admin:", "shops", "shop:", "shop:id:", "products",
+                "products:", "orders", "menu-summary", "search", "checkout",
+                "home-feed", "summary", "complaints", "refunds",
+                "settlements", "notifications")),
+)
+
+
+def _evict_prefixes_for(path: str) -> tuple[str, ...] | None:
+    """Return the cache prefixes a write to ``path`` can stale, or None when
+    the path has no audited mapping (caller falls back to a full clear)."""
+    for needle, prefixes in _WRITE_EVICT_MAP:
+        if needle in path:
+            return prefixes
+    return None
 
 
 app.add_middleware(BaseHTTPMiddleware, dispatch=cache_invalidation_middleware)
@@ -294,9 +433,9 @@ from app.middleware.error_handler import ErrorHandlingMiddleware, LoggingMiddlew
 
 # Add middleware (order matters — last added = first executed)
 app.add_middleware(SecurityHeadersMiddleware)
-app.add_middleware(ErrorHandlingMiddleware)
-app.add_middleware(LoggingMiddleware)
 app.add_middleware(BaseHTTPMiddleware, dispatch=rate_limit_middleware)
+app.add_middleware(LoggingMiddleware)
+app.add_middleware(ErrorHandlingMiddleware)
 
 app.include_router(
     local.router,

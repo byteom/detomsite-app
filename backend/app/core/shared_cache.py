@@ -13,8 +13,12 @@ def enabled() -> bool:
 
 
 def _pg_enabled() -> bool:
-    return bool(settings.SUPABASE_DATABASE_URL or
-                (settings.SUPABASE_DB_HOST and settings.SUPABASE_DB_PASSWORD))
+    # Off by default: querying Postgres app_cache table across the WAN adds 80-170ms
+    # overhead on cache misses. Fast in-memory TTL cache + Redis provide sub-millisecond caching.
+    return bool(getattr(settings, "ENABLE_PG_CACHE", False) and (
+        settings.SUPABASE_DATABASE_URL or
+        (settings.SUPABASE_DB_HOST and settings.SUPABASE_DB_PASSWORD)
+    ))
 
 
 # ─── provider: Supabase Postgres ``app_cache`` table ─────────────────────

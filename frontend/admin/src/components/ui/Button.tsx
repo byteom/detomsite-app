@@ -15,11 +15,11 @@ const variantStyles: Record<ButtonVariant, string> = {
   primary:
     'bg-emerald-700 hover:bg-emerald-600 active:bg-emerald-800 text-white font-semibold border border-emerald-600 dark:bg-emerald-600 dark:hover:bg-emerald-500 dark:border-emerald-500 shadow-sm',
   secondary:
-    'bg-white dark:bg-admin-surface-dark border border-gray-300 dark:border-admin-border-dark text-gray-800 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-admin-surface-darkHover font-medium shadow-sm',
+    'bg-[var(--bg-surface)] border border-[var(--border-main)] text-[var(--text-heading)] hover:bg-[var(--bg-surface-hover)] font-medium shadow-xs',
   danger:
     'bg-red-600 hover:bg-red-500 active:bg-red-700 text-white font-semibold border border-red-700 dark:bg-red-700 dark:hover:bg-red-600 shadow-sm',
   ghost:
-    'bg-transparent hover:bg-gray-100 dark:hover:bg-gray-800/80 text-gray-700 dark:text-gray-300 font-medium',
+    'bg-transparent hover:bg-[var(--bg-surface-hover)] text-[var(--text-heading)] font-medium',
   outline:
     'bg-transparent border border-emerald-600 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-950/30 font-semibold',
   gold:

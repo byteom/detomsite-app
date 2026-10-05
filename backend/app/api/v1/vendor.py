@@ -13,6 +13,7 @@ from app.core.status_values import ShopStatus, VendorOrderStatus
 from app.core.rate_limit import allow as rate_allow, reset as rate_reset, client_ip as rate_ip
 from app.core.store import store as db
 from app.core.security import hash_password, verify_password, create_access_token, create_refresh_token, decode_token
+from app.core import ttl_cache
 from app.services import push_service
 
 logger = logging.getLogger(__name__)
@@ -115,19 +116,18 @@ def get_current_vendor(authorization: Optional[str] = Header(None)) -> dict:
 
 
 def _find_shop(current_vendor: dict) -> dict | None:
-    """The vendor's shop, or ``None``.
+    """The vendor's shop, or ``None``. Cached in memory for 60s per vendor."""
+    cache_k = f"vendor:shop:{current_vendor.get('id')}"
+    cached = ttl_cache.get(cache_k)
+    if cached is not None:
+        return cached
 
-    Some shops are auto-created with the shopkeeper's real email, others with
-    ``{username}@campus.local`` — so check both (one indexed lookup each) before
-    giving up. Every vendor endpoint used to look up ONLY the campus.local
-    address, which meant a vendor who registered with their real email got
-    "Shop not found" from the product, order and dashboard routes.
-    """
     for vendor_email in (current_vendor.get("email") or "", f"{current_vendor['username']}@campus.local"):
         if not vendor_email:
             continue
         shop = db.get_shop_by_shopkeeper_email(vendor_email)
         if shop:
+            ttl_cache.set(cache_k, shop, ttl=60.0)
             return shop
     return None
 
@@ -302,12 +302,23 @@ def dashboard(current_vendor: dict = Depends(get_current_vendor)):
     # with every order and made the vendor app feel slow). Multi-shop
     # sub-orders are merged in so they appear too. One DB read, sliced twice.
     shop_orders = _shop_orders_merged(my_shop["id"])
-    # Same "paid only" rule as GET /orders: an unpaid prepaid order is withheld
-    # from the shop, so it must not inflate this shop's pending count or its
-    # revenue either. Otherwise a withheld order would still show as a
-    # "Pending Payment" the vendor is meant to act on — and, worse, be counted
-    # as earnings the vendor has not actually been paid for.
-    shop_orders = [o for o in shop_orders if _visible_to_shop_with_payment(o)]
+    # Batch load payments in ONE DB query to avoid the N+1 per-order lookup loop
+    pay_keys = [o.get("parent_order_id") if o.get("is_sub_order") else o.get("id") for o in shop_orders]
+    pay_keys = [k for k in pay_keys if k]
+    payments_map = db.get_payments_map_by_order_ids(pay_keys) if hasattr(db, "get_payments_map_by_order_ids") else {}
+    for o in shop_orders:
+        if o.get("payment") is None:
+            pay_key = o.get("parent_order_id") if o.get("is_sub_order") else o.get("id")
+            payment = payments_map.get(pay_key) if payments_map else (db.get_payment_by_order_id(pay_key) if pay_key else None)
+            if payment:
+                o["payment"] = {
+                    "id": payment.get("id"),
+                    "method": payment.get("method"),
+                    "status": payment.get("status"),
+                    "utr_number": payment.get("utr_number"),
+                    "amount": payment.get("amount"),
+                }
+    shop_orders = [o for o in shop_orders if _visible_to_shop(o)]
     feed_orders = shop_orders[:250]
     pending = [o for o in shop_orders if o["status"] in ("Pending Payment", "Pending Acceptance")]
     active = [o for o in shop_orders if o["status"] in ("Confirmed", "Preparing", "Ready")]
@@ -407,6 +418,10 @@ def update_shop(data: ShopStatusUpdate, current_vendor: dict = Depends(get_curre
     updated = db.update_shop(shop_id, updates)
     if not updated:
         raise HTTPException(status_code=404, detail="Shop not found")
+    ttl_cache.pop(f"vendor:shop:{current_vendor.get('id')}")
+    ttl_cache.pop(f"shop:id:{shop_id}")
+    if current_vendor.get("email"):
+        ttl_cache.pop(f"shop:email:{current_vendor['email'].lower()}")
     return updated
 
 
@@ -452,13 +467,13 @@ def get_orders(current_vendor: dict = Depends(get_current_vendor)):
     if not my_shop:
         return []
     orders = _shop_orders_merged(my_shop["id"])
-    # Enrich each order with its payment record (method, status, UTR) so the
-    # shop can verify the payment right from the order card. The screenshot
-    # upload system was removed — UTR is the only proof the platform accepts.
-    # Multi sub-orders pay on the PARENT order id, so resolve that one.
+    # Batch resolve payments in ONE query instead of N queries in a loop
+    pay_keys = [o.get("parent_order_id") if o.get("is_sub_order") else o.get("id") for o in orders]
+    pay_keys = [k for k in pay_keys if k]
+    payments_map = db.get_payments_map_by_order_ids(pay_keys) if hasattr(db, "get_payments_map_by_order_ids") else {}
     for o in orders:
-        pay_key = o.get("parent_order_id") if o.get("is_sub_order") else o["id"]
-        payment = db.get_payment_by_order_id(pay_key)
+        pay_key = o.get("parent_order_id") if o.get("is_sub_order") else o.get("id")
+        payment = payments_map.get(pay_key) if payments_map else (db.get_payment_by_order_id(pay_key) if pay_key else None)
         if payment:
             o["payment"] = {
                 "id": payment.get("id"),

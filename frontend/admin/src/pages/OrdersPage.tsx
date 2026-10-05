@@ -101,7 +101,7 @@ export function OrdersPage() {
       sortable: true,
       width: '90px',
       render: (o: any) => (
-        <span className="font-mono font-black text-xs text-gray-900 dark:text-white">
+        <span className="font-mono font-black text-xs text-[var(--text-heading)]">
           #{o.token}
         </span>
       ),
@@ -111,7 +111,7 @@ export function OrdersPage() {
       header: 'Shop',
       sortable: true,
       render: (o: any) => (
-        <span className="font-semibold text-gray-800 dark:text-gray-200">{o.shop_name}</span>
+        <span className="font-semibold text-[var(--text-body)]">{o.shop_name}</span>
       ),
     },
     {
@@ -120,9 +120,9 @@ export function OrdersPage() {
       sortable: true,
       render: (o: any) => (
         <div>
-          <p className="font-semibold text-gray-900 dark:text-gray-100">{o.student_name}</p>
+          <p className="font-semibold text-[var(--text-heading)]">{o.student_name}</p>
           {o.student_phone && (
-            <p className="text-[11px] text-gray-400 font-mono">{o.student_phone}</p>
+            <p className="text-[11px] text-[var(--text-muted)] font-mono">{o.student_phone}</p>
           )}
         </div>
       ),
@@ -138,7 +138,7 @@ export function OrdersPage() {
       sortable: true,
       align: 'right',
       render: (o: any) => (
-        <span className="font-mono font-bold text-gray-900 dark:text-white">
+        <span className="font-mono font-bold text-[var(--text-heading)]">
           ₹{o.total}
         </span>
       ),
@@ -148,19 +148,23 @@ export function OrdersPage() {
       header: 'Method',
       sortable: true,
       align: 'center',
-      render: (o: any) => (
-        <Badge variant={o.payment_method === 'COD' ? 'gold' : 'info'} size="xs">
-          {o.payment_method || 'UPI'}
-        </Badge>
-      ),
+      render: (o: any) => {
+        const m = (o.payment_method || 'UPI').toUpperCase()
+        const variant = m === 'COD' ? 'gold' : 'cyan'
+        return (
+          <Badge variant={variant} size="xs">
+            {m}
+          </Badge>
+        )
+      },
     },
     {
       key: 'delivery_location',
       header: 'Location & Slot',
       render: (o: any) => (
         <div className="text-xs">
-          <p className="text-gray-800 dark:text-gray-200">{o.delivery_location || 'Campus'}</p>
-          {o.delivery_slot && <p className="text-[11px] text-gray-400">{o.delivery_slot}</p>}
+          <p className="text-[var(--text-body)] font-medium">{o.delivery_location || 'Campus'}</p>
+          {o.delivery_slot && <p className="text-[11px] text-[var(--text-muted)] font-mono">{o.delivery_slot}</p>}
         </div>
       ),
     },
@@ -169,15 +173,20 @@ export function OrdersPage() {
       header: 'Status',
       sortable: true,
       render: (o: any) => {
-        const s = o.status
-        const variant =
-          s === 'Completed' || s === 'Delivered'
-            ? 'success'
-            : s === 'Cancelled'
-            ? 'error'
-            : s === 'Pending Payment' || s === 'Placed'
-            ? 'warning'
-            : 'info'
+        const s = o.status || 'Placed'
+        const sLower = s.toLowerCase()
+        let variant: 'success' | 'warning' | 'error' | 'info' | 'purple' = 'info'
+        if (sLower === 'completed' || sLower === 'delivered') {
+          variant = 'success'
+        } else if (sLower === 'cancelled' || sLower === 'rejected' || sLower === 'failed') {
+          variant = 'error'
+        } else if (sLower.includes('pending') || sLower === 'placed') {
+          variant = 'warning'
+        } else if (sLower === 'ready' || sLower.includes('delivery') || sLower.includes('out')) {
+          variant = 'purple'
+        } else {
+          variant = 'info'
+        }
         return <Badge variant={variant}>{s}</Badge>
       },
     },
@@ -186,7 +195,7 @@ export function OrdersPage() {
       header: 'Placed',
       sortable: true,
       render: (o: any) => (
-        <span className="text-gray-500 dark:text-gray-400 whitespace-nowrap">
+        <span className="text-[var(--text-muted)] whitespace-nowrap">
           {fmtTime(o.created_at)}
         </span>
       ),
@@ -227,7 +236,7 @@ export function OrdersPage() {
             size="xs"
             onClick={() => setSelectedOrder(o)}
             title="Inspect full order details"
-            icon={<Eye className="w-3.5 h-3.5 text-gray-500" />}
+            icon={<Eye className="w-3.5 h-3.5 text-[var(--text-dim)]" />}
           />
         </div>
       ),
@@ -237,19 +246,19 @@ export function OrdersPage() {
   const hasActiveFilters = fStatus !== 'all' || fMethod !== 'all' || Boolean(fDate)
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 text-[var(--text-body)]">
       {/* Page Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-200 dark:border-admin-border-dark pb-4">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[var(--border-main)] pb-4">
         <div>
           <div className="flex items-center gap-2.5">
-            <h1 className="text-2xl font-black text-gray-900 dark:text-white tracking-tight">
+            <h1 className="text-2xl font-black text-[var(--text-heading)] tracking-tight">
               Orders Operations Desk
             </h1>
             <Badge variant="default" size="md">
               {filteredOrders.length} {filteredOrders.length === 1 ? 'Order' : 'Orders'}
             </Badge>
           </div>
-          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+          <p className="text-xs text-[var(--text-muted)] mt-0.5">
             Live order tracking, customer information, status management, and WhatsApp dispatch
           </p>
         </div>
@@ -272,7 +281,7 @@ export function OrdersPage() {
       {/* Action Messages */}
       {actionMsg && (
         <div
-          className="p-3.5 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-800 text-xs font-semibold text-emerald-800 dark:text-emerald-300"
+          className="p-3.5 bg-emerald-500/10 border border-emerald-500/30 text-xs font-semibold text-emerald-800 dark:text-emerald-300"
           style={{ borderRadius: 0 }}
         >
           {actionMsg}
@@ -281,7 +290,7 @@ export function OrdersPage() {
 
       {actionErr && (
         <div
-          className="p-3.5 bg-red-50 dark:bg-red-950/40 border border-red-300 dark:border-red-800 text-xs font-semibold text-red-800 dark:text-red-300"
+          className="p-3.5 bg-red-500/10 border border-red-500/30 text-xs font-semibold text-red-800 dark:text-red-300"
           style={{ borderRadius: 0 }}
         >
           {actionErr}
@@ -300,12 +309,12 @@ export function OrdersPage() {
             <select
               value={fStatus}
               onChange={e => setFStatus(e.target.value)}
-              className="bg-white dark:bg-admin-surface-dark border border-gray-300 dark:border-admin-border-dark px-2.5 py-1.5 text-xs text-gray-800 dark:text-gray-200 outline-none focus:border-emerald-600"
+              className="bg-[var(--bg-surface)] text-[var(--text-heading)] border border-[var(--border-main)] px-2.5 py-1.5 text-xs outline-none focus:border-emerald-600 transition-colors"
               style={{ borderRadius: 0 }}
             >
-              <option value="all">All Statuses</option>
+              <option value="all" className="bg-[var(--bg-surface)] text-[var(--text-heading)]">All Statuses</option>
               {statuses.map(s => (
-                <option key={s} value={s}>
+                <option key={s} value={s} className="bg-[var(--bg-surface)] text-[var(--text-heading)]">
                   {s}
                 </option>
               ))}
@@ -314,21 +323,23 @@ export function OrdersPage() {
             <select
               value={fMethod}
               onChange={e => setFMethod(e.target.value)}
-              className="bg-white dark:bg-admin-surface-dark border border-gray-300 dark:border-admin-border-dark px-2.5 py-1.5 text-xs text-gray-800 dark:text-gray-200 outline-none focus:border-emerald-600"
+              className="bg-[var(--bg-surface)] text-[var(--text-heading)] border border-[var(--border-main)] px-2.5 py-1.5 text-xs outline-none focus:border-emerald-600 transition-colors"
               style={{ borderRadius: 0 }}
             >
-              <option value="all">All Payment Methods</option>
-              <option value="UPI">UPI</option>
-              <option value="COD">COD</option>
+              <option value="all" className="bg-[var(--bg-surface)] text-[var(--text-heading)]">All Payment Methods</option>
+              <option value="UPI" className="bg-[var(--bg-surface)] text-[var(--text-heading)]">UPI Online</option>
+              <option value="COD" className="bg-[var(--bg-surface)] text-[var(--text-heading)]">Cash on Delivery</option>
             </select>
 
-            <input
-              type="date"
-              value={fDate}
-              onChange={e => setFDate(e.target.value)}
-              className="bg-white dark:bg-admin-surface-dark border border-gray-300 dark:border-admin-border-dark px-2.5 py-1 text-xs text-gray-800 dark:text-gray-200 outline-none focus:border-emerald-600"
-              style={{ borderRadius: 0 }}
-            />
+            <div className="flex items-center gap-1.5 bg-[var(--bg-surface)] border border-[var(--border-main)] px-2 py-1">
+              <Calendar className="w-3.5 h-3.5 text-[var(--text-dim)] shrink-0" />
+              <input
+                type="date"
+                value={fDate}
+                onChange={e => setFDate(e.target.value)}
+                className="bg-transparent text-xs text-[var(--text-heading)] outline-none"
+              />
+            </div>
 
             {hasActiveFilters && (
               <Button
@@ -341,17 +352,13 @@ export function OrdersPage() {
                 }}
                 icon={<X className="w-3 h-3" />}
               >
-                Clear Filters
+                Reset Filters
               </Button>
             )}
           </div>
         }
         emptyTitle="No orders found"
-        emptyDescription={
-          hasActiveFilters
-            ? 'No orders match your filter criteria. Try clearing filters to view all records.'
-            : 'No orders have been recorded in the system yet.'
-        }
+        emptyDescription="There are currently no student orders matching your status, payment method, or date filters."
       />
 
       {/* Order Detail Modal */}
@@ -359,22 +366,24 @@ export function OrdersPage() {
         <Modal
           open={Boolean(selectedOrder)}
           onClose={() => setSelectedOrder(null)}
-          title={`Order #${selectedOrder.token} Details`}
-          description={`Placed by ${selectedOrder.student_name} at ${fmtTime(selectedOrder.created_at)}`}
+          title={`Order #${selectedOrder.token} Breakdown`}
+          description={`Placed on ${fmtTime(selectedOrder.created_at)}`}
           maxWidth="lg"
           footer={
             <div className="flex items-center justify-between w-full">
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => handleOpenWhatsApp(selectedOrder.id)}
-                icon={<MessageSquare className="w-3.5 h-3.5 text-emerald-600" />}
-              >
-                Open Shop WhatsApp
-              </Button>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => handleOpenWhatsApp(selectedOrder.id)}
+                  icon={<MessageSquare className="w-3.5 h-3.5 text-emerald-600" />}
+                >
+                  WhatsApp Dispatch
+                </Button>
+              </div>
 
               <div className="flex items-center gap-2">
-                {['Pending Payment', 'Pending Acceptance', 'Pending', 'Placed', 'Accepted'].includes(
+                {['Pending Payment', 'Pending Acceptance', 'Pending', 'Placed'].includes(
                   selectedOrder.status
                 ) && (
                   <Button
@@ -394,46 +403,65 @@ export function OrdersPage() {
             </div>
           }
         >
-          <div className="space-y-4">
+          <div className="space-y-4 text-[var(--text-body)]">
             {/* Meta stats */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               <div
-                className="p-3 border border-gray-200 dark:border-admin-border-dark bg-gray-50/50 dark:bg-admin-surface-darkSubtle/40"
+                className="p-3 border border-[var(--border-main)] bg-[var(--bg-surface-subtle)]"
                 style={{ borderRadius: 0 }}
               >
-                <p className="text-[10px] uppercase font-bold text-gray-400">Total Amount</p>
-                <p className="text-lg font-black text-gray-900 dark:text-white font-mono mt-0.5">
+                <p className="text-[10px] uppercase font-bold text-[var(--text-dim)]">Total Amount</p>
+                <p className="text-lg font-black text-[var(--text-heading)] font-mono mt-0.5">
                   ₹{selectedOrder.total}
                 </p>
               </div>
 
               <div
-                className="p-3 border border-gray-200 dark:border-admin-border-dark bg-gray-50/50 dark:bg-admin-surface-darkSubtle/40"
+                className="p-3 border border-[var(--border-main)] bg-[var(--bg-surface-subtle)]"
                 style={{ borderRadius: 0 }}
               >
-                <p className="text-[10px] uppercase font-bold text-gray-400">Status</p>
+                <p className="text-[10px] uppercase font-bold text-[var(--text-dim)]">Status</p>
                 <div className="mt-1">
-                  <Badge variant="default" size="xs">
+                  <Badge
+                    variant={
+                      String(selectedOrder.status || '').toLowerCase().includes('completed') ||
+                      String(selectedOrder.status || '').toLowerCase().includes('delivered')
+                        ? 'success'
+                        : String(selectedOrder.status || '').toLowerCase().includes('cancelled') ||
+                          String(selectedOrder.status || '').toLowerCase().includes('rejected')
+                        ? 'error'
+                        : String(selectedOrder.status || '').toLowerCase().includes('pending') ||
+                          String(selectedOrder.status || '').toLowerCase() === 'placed'
+                        ? 'warning'
+                        : 'info'
+                    }
+                    size="xs"
+                  >
                     {selectedOrder.status}
                   </Badge>
                 </div>
               </div>
 
               <div
-                className="p-3 border border-gray-200 dark:border-admin-border-dark bg-gray-50/50 dark:bg-admin-surface-darkSubtle/40"
+                className="p-3 border border-[var(--border-main)] bg-[var(--bg-surface-subtle)]"
                 style={{ borderRadius: 0 }}
               >
-                <p className="text-[10px] uppercase font-bold text-gray-400">Payment</p>
-                <p className="text-xs font-bold text-gray-800 dark:text-gray-200 mt-1">
-                  {selectedOrder.payment_method === 'COD' ? 'Cash on Delivery' : 'UPI Online'}
-                </p>
+                <p className="text-[10px] uppercase font-bold text-[var(--text-dim)]">Payment</p>
+                <div className="mt-1">
+                  <Badge
+                    variant={selectedOrder.payment_method === 'COD' ? 'gold' : 'cyan'}
+                    size="xs"
+                  >
+                    {selectedOrder.payment_method === 'COD' ? 'Cash on Delivery' : 'UPI Online'}
+                  </Badge>
+                </div>
               </div>
 
               <div
-                className="p-3 border border-gray-200 dark:border-admin-border-dark bg-gray-50/50 dark:bg-admin-surface-darkSubtle/40"
+                className="p-3 border border-[var(--border-main)] bg-[var(--bg-surface-subtle)]"
                 style={{ borderRadius: 0 }}
               >
-                <p className="text-[10px] uppercase font-bold text-gray-400">Admin Share</p>
+                <p className="text-[10px] uppercase font-bold text-[var(--text-dim)]">Admin Share</p>
                 <p className="text-base font-black text-emerald-600 dark:text-emerald-400 font-mono mt-0.5">
                   ₹10
                 </p>
@@ -443,57 +471,57 @@ export function OrdersPage() {
             {/* Customer & Shop Details */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
               <div
-                className="p-3 border border-gray-200 dark:border-admin-border-dark bg-white dark:bg-admin-surface-dark"
+                className="p-3 border border-[var(--border-main)] bg-[var(--bg-surface)]"
                 style={{ borderRadius: 0 }}
               >
-                <p className="font-bold text-gray-900 dark:text-white uppercase tracking-wider text-[11px] mb-2">
+                <p className="font-bold text-[var(--text-heading)] uppercase tracking-wider text-[11px] mb-2">
                   Customer Information
                 </p>
-                <p className="font-semibold text-gray-800 dark:text-gray-200">
+                <p className="font-semibold text-[var(--text-heading)]">
                   {selectedOrder.student_name}
                 </p>
-                <p className="text-gray-500 font-mono mt-0.5">
+                <p className="text-[var(--text-muted)] font-mono mt-0.5">
                   Phone: {selectedOrder.student_phone || '—'}
                 </p>
-                <p className="text-gray-500 mt-1">
+                <p className="text-[var(--text-muted)] mt-1">
                   Delivery Point: {selectedOrder.delivery_location || 'Campus Delivery'}
                 </p>
                 {selectedOrder.delivery_slot && (
-                  <p className="text-gray-500">Slot: {selectedOrder.delivery_slot}</p>
+                  <p className="text-[var(--text-muted)]">Slot: {selectedOrder.delivery_slot}</p>
                 )}
               </div>
 
               <div
-                className="p-3 border border-gray-200 dark:border-admin-border-dark bg-white dark:bg-admin-surface-dark"
+                className="p-3 border border-[var(--border-main)] bg-[var(--bg-surface)]"
                 style={{ borderRadius: 0 }}
               >
-                <p className="font-bold text-gray-900 dark:text-white uppercase tracking-wider text-[11px] mb-2">
+                <p className="font-bold text-[var(--text-heading)] uppercase tracking-wider text-[11px] mb-2">
                   Shop Information
                 </p>
-                <p className="font-semibold text-gray-800 dark:text-gray-200">
+                <p className="font-semibold text-[var(--text-heading)]">
                   {selectedOrder.shop_name}
                 </p>
-                <p className="text-gray-500 font-mono mt-0.5">
+                <p className="text-[var(--text-muted)] font-mono mt-0.5">
                   Vendor Phone: {selectedOrder.shop_phone || '—'}
                 </p>
-                <p className="text-gray-500 mt-1">Order Token: #{selectedOrder.token}</p>
+                <p className="text-[var(--text-muted)] mt-1">Order Token: #{selectedOrder.token}</p>
               </div>
             </div>
 
             {/* Items Breakdown */}
             <div
-              className="p-4 border border-gray-200 dark:border-admin-border-dark bg-white dark:bg-admin-surface-dark"
+              className="p-4 border border-[var(--border-main)] bg-[var(--bg-surface)]"
               style={{ borderRadius: 0 }}
             >
-              <p className="font-bold text-gray-900 dark:text-white uppercase tracking-wider text-[11px] mb-2">
+              <p className="font-bold text-[var(--text-heading)] uppercase tracking-wider text-[11px] mb-2">
                 Order Items
               </p>
-              <div className="divide-y divide-gray-100 dark:divide-admin-border-darkSubtle text-xs">
+              <div className="divide-y divide-[var(--border-subtle)] text-xs">
                 {String(selectedOrder.items || '')
                   .split(',')
                   .map((item, idx) => (
                     <div key={idx} className="py-2 flex items-center justify-between">
-                      <span className="font-medium text-gray-800 dark:text-gray-200">
+                      <span className="font-medium text-[var(--text-heading)]">
                         {item.trim()}
                       </span>
                     </div>

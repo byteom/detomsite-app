@@ -14,6 +14,7 @@ from app.core.store import store as db
 from app.core.security import hash_password, verify_password, create_access_token, create_refresh_token, decode_token
 from app.services.email_service import EmailService, email_delivery_configured
 from app.core.rate_limit import allow as rate_allow, reset as rate_reset, client_ip as rate_ip
+from app.core.db_executor import run_db
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +54,9 @@ async def _find_user_for_reset(identifier: str) -> Optional[dict]:
         return None
     user = None
     if "@" in identifier:
-        user = await asyncio.to_thread(db.get_user_by_email, identifier)
+        user = await run_db(db.get_user_by_email, identifier)
     if not user:
-        user = await asyncio.to_thread(db.get_user_by_username, identifier)
+        user = await run_db(db.get_user_by_username, identifier)
     return user
 
 
@@ -66,7 +67,7 @@ async def _send_reset_otp(user: dict) -> None:
     DEFAULT_SUPER_ADMIN_EMAIL is usually already claimed by another role's
     account, so admin reset codes go straight to DEFAULT_SUPER_ADMIN_EMAIL."""
     otp = _generate_otp()
-    await asyncio.to_thread(db.create_password_reset, user["username"], otp, 1)
+    await run_db(db.create_password_reset, user["username"], otp, 1)
     admin_email = (settings.DEFAULT_SUPER_ADMIN_EMAIL or "").strip()
     to_email = (
         admin_email
@@ -148,7 +149,7 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     # All store methods are synchronous (psycopg2/SQLite). Never run them on
     # FastAPI's event loop: a slow pool checkout or database query otherwise
     # stalls every request handled by that worker.
-    user = await asyncio.to_thread(db.get_user_by_id, int(user_id))
+    user = await run_db(db.get_user_by_id, int(user_id))
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     if user["role"] != "student":
@@ -186,7 +187,7 @@ async def register(data: UserRegisterRequest):
         raise HTTPException(status_code=409, detail="This email is already registered. Try signing in instead.")
     # Record registration for admin notification
     try:
-        await asyncio.to_thread(db.record_registration, user)
+        await run_db(db.record_registration, user)
     except Exception as e:
         logger.warning(f"Could not record registration: {e}")
 
@@ -267,18 +268,18 @@ async def reset_password(data: ResetPasswordRequest):
     if not user:
         raise HTTPException(status_code=400, detail="Invalid code. Please try again.")
 
-    reset = await asyncio.to_thread(db.get_password_reset, user["username"], data.otp.strip(), 1)
+    reset = await run_db(db.get_password_reset, user["username"], data.otp.strip(), 1)
     if not reset:
         # Count the wrong guess — after 5 the code locks out (brute-force guard).
-        await asyncio.to_thread(db.bump_password_reset_attempts, user["username"])
+        await run_db(db.bump_password_reset_attempts, user["username"])
         raise HTTPException(status_code=400, detail="Invalid or expired code. Please request a new one.")
 
     password_hash = await asyncio.to_thread(hash_password, data.new_password)
-    updated = await asyncio.to_thread(db.update_user_password, user["username"], password_hash)
+    updated = await run_db(db.update_user_password, user["username"], password_hash)
     if not updated:
         raise HTTPException(status_code=500, detail="Could not update the password. Please try again.")
 
-    await asyncio.to_thread(db.invalidate_password_resets, user["username"])
+    await run_db(db.invalidate_password_resets, user["username"])
     logger.info(f"Password reset completed for user: {user['username']}")
     return {"message": "Password updated successfully! You can now sign in with your new password."}
 
@@ -302,7 +303,7 @@ async def forgot_username(data: ForgotUsernameRequest):
     a placeholder DB email, so their reminder is routed to
     DEFAULT_SUPER_ADMIN_EMAIL like the password-reset flow."""
     email = (data.email or "").strip()
-    user = await asyncio.to_thread(db.get_user_by_email, email) if email else None
+    user = await run_db(db.get_user_by_email, email) if email else None
     if user:
         admin_email = (settings.DEFAULT_SUPER_ADMIN_EMAIL or "").strip()
         to_email = (
@@ -329,7 +330,7 @@ async def login(data: UserLoginRequest, request: Request):
     if not rate_allow("login", f"{data.username}:{ip}", max_attempts=40, window_sec=300):
         raise HTTPException(status_code=429, detail="Too many sign-in attempts — please wait a few minutes and try again.")
 
-    user = await asyncio.to_thread(db.get_user_by_username, data.username)
+    user = await run_db(db.get_user_by_username, data.username)
     # PENTEST FIX: identical message for "no such user" and "wrong password",
     # and the password is checked BEFORE the role hint — otherwise the distinct
     # 401/403 replies let an attacker enumerate which usernames exist.
@@ -368,7 +369,7 @@ async def login(data: UserLoginRequest, request: Request):
 async def dashboard(current_user: dict = Depends(get_current_user)):
     """Get student dashboard with approved shops and orders."""
     shops, my_orders = await asyncio.gather(
-        asyncio.to_thread(db.list_shops, public_only=True),
+        run_db(db.list_shops, public_only=True),
         asyncio.to_thread(
             db.list_orders_by_user_id,
             str(current_user.get("id", "")),
@@ -394,7 +395,7 @@ async def dashboard(current_user: dict = Depends(get_current_user)):
 @router.get("/shops")
 async def list_shops():
     """List all approved shops visible to students."""
-    return await asyncio.to_thread(db.list_shops, public_only=True)
+    return await run_db(db.list_shops, public_only=True)
 
 
 @router.get("/orders")
@@ -410,7 +411,7 @@ async def student_orders(current_user: dict = Depends(get_current_user)):
 @router.post("/reviews")
 async def create_review(data: ReviewCreate, current_user: dict = Depends(get_current_user)):
     """Create a review for a shop — saved to the reviews table."""
-    review = await asyncio.to_thread(db.create_review, {
+    review = await run_db(db.create_review, {
         "user_id": current_user["id"],
         "username": current_user["username"],
         "student_name": current_user["name"],
@@ -426,7 +427,7 @@ async def create_review(data: ReviewCreate, current_user: dict = Depends(get_cur
 @router.get("/reviews")
 async def list_reviews(current_user: dict = Depends(get_current_user)):
     """Get reviews by this student."""
-    return await asyncio.to_thread(db.list_reviews_by_user, current_user["id"])
+    return await run_db(db.list_reviews_by_user, current_user["id"])
 
 
 @router.get("/profile")

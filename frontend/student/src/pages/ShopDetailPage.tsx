@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react'
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { Shop, Product, CartItem } from '../types'
 import {
@@ -7,11 +7,15 @@ import {
   getCart,
   setItemQty,
   addToCart,
+  replaceCartWith,
+  cartShopConflict,
   getCategoryPhoto,
 } from '../utils/helpers'
 import api from '../services/api'
+import { usePolling } from '../hooks/usePolling'
 import { MenuItemCard } from '../components/food/MenuItemCard'
 import { MenuItemSkeleton } from '../components/ui/Skeleton'
+import { ConfirmDialog } from '../components/ui/ConfirmDialog'
 import { EmptyState } from '../components/ui/EmptyState'
 import {
   Star,
@@ -24,13 +28,27 @@ import {
   ChevronLeft,
 } from '../components/ui/Icons'
 
+const MENU_PAGE = 20
+
 export function ShopDetailPage() {
   const { shopId } = useParams<{ shopId: string }>()
   const [shop, setShop] = useState<Shop | null>(null)
   const [products, setProducts] = useState<Product[]>([])
-  const [loading, setLoading] = useState(true)
+  // Split loading states: the shop header renders as soon as the shop row
+  // arrives; the menu section shows skeletons until the products arrive.
+  // A slow menu fetch must never block the critical header (and vice versa).
+  const [shopLoading, setShopLoading] = useState(true)
+  const [menuLoading, setMenuLoading] = useState(true)
   const [search, setSearch] = useState('')
   const [activeCategory, setActiveCategory] = useState('All')
+  // Infinite scroll: only the first MENU_PAGE dishes render; the sentinel
+  // below grows the budget as the student scrolls. No extra requests — it
+  // slices the already-fetched per-shop menu.
+  const [visibleCount, setVisibleCount] = useState(MENU_PAGE)
+  const sentinelRef = useRef<HTMLDivElement | null>(null)
+  // Guards against a slow response from shop A overwriting shop B after a
+  // fast navigation between two shop pages.
+  const reqId = useRef(0)
 
   // Cart state sync
   const [cart, setCart] = useState<CartItem[]>(() => getCart())
@@ -40,20 +58,55 @@ export function ShopDetailPage() {
     return () => window.removeEventListener('cart-updated', sync)
   }, [])
 
+  // Cross-shop add awaiting user confirm (one kitchen per cart).
+  const [pendingReplace, setPendingReplace] = useState<{ product: Product; qty: number } | null>(null)
+
+  // Reset per-shop state when navigating between shops.
   useEffect(() => {
-    if (!shopId) return
-    setLoading(true)
-    Promise.all([
-      api.get<Shop>(`/local/shops/${shopId}`),
-      api.get<Product[]>('/local/products', { params: { shop_id: shopId } }),
-    ])
-      .then(([s, p]) => {
-        setShop(s.data)
-        setProducts(p.data || [])
-      })
-      .catch(() => {})
-      .finally(() => setLoading(false))
+    setShop(null)
+    setProducts([])
+    setShopLoading(true)
+    setMenuLoading(true)
+    setSearch('')
+    setActiveCategory('All')
+    setVisibleCount(MENU_PAGE)
+    window.scrollTo({ top: 0, left: 0, behavior: 'instant' as ScrollBehavior })
   }, [shopId])
+
+  const load = useCallback(() => {
+    if (!shopId) return
+    const id = ++reqId.current
+    // Independent fetches — neither blocks the other. The menu is scoped to
+    // one shop (index-served); limit 500 is the backend max and covers the
+    // largest real menu (s30: 187 items) in one small (~60KB) fetch. Render
+    // stays cheap via infinite scroll no matter how large the menu gets.
+    api
+      .get<Shop>(`/local/shops/${shopId}`)
+      .then((s) => {
+        if (reqId.current === id) setShop(s.data)
+      })
+      .catch(() => {
+        if (reqId.current === id) setShop(null)
+      })
+      .finally(() => {
+        if (reqId.current === id) setShopLoading(false)
+      })
+    api
+      .get<Product[]>('/local/products', { params: { shop_id: shopId, limit: 500 } })
+      .then((p) => {
+        if (reqId.current === id) setProducts(p.data || [])
+      })
+      .catch(() => {
+        if (reqId.current === id) setProducts([])
+      })
+      .finally(() => {
+        if (reqId.current === id) setMenuLoading(false)
+      })
+  }, [shopId])
+
+  // 15s visibility-aware poll — open/closed flips and availability surface
+  // promptly; background tabs never hammer the API.
+  usePolling(load, 15000, [shopId])
 
   // Extract available categories
   const categories = useMemo(() => {
@@ -90,7 +143,39 @@ export function ShopDetailPage() {
     })
   }, [products, activeCategory, q])
 
-  if (loading) {
+  // Single pass over the (tiny) cart per render instead of one
+  // `cart.find` linear scan per menu row.
+  const cartQtyById = useMemo(() => {
+    const map = new Map<string, number>()
+    for (const item of cart) map.set(item.product_id, item.quantity || 0)
+    return map
+  }, [cart])
+
+  // New filter or new shop → start back at the first page of results.
+  useEffect(() => {
+    setVisibleCount(MENU_PAGE)
+  }, [shopId, search, activeCategory])
+
+  const visibleProducts = filteredProducts.slice(0, visibleCount)
+  const hasMore = filteredProducts.length > visibleCount
+
+  useEffect(() => {
+    if (!hasMore) return
+    const el = sentinelRef.current
+    if (!el) return
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setVisibleCount((c) => (c >= filteredProducts.length ? c : c + MENU_PAGE))
+        }
+      },
+      { rootMargin: '600px' }
+    )
+    io.observe(el)
+    return () => io.disconnect()
+  }, [hasMore, filteredProducts.length])
+
+  if (shopLoading) {
     return (
       <div className="mx-auto max-w-4xl px-4 py-8 space-y-6">
         <div className="h-56 rounded-panel skeleton-shimmer bg-slate-200" />
@@ -126,8 +211,9 @@ export function ShopDetailPage() {
       const existing = cart.find((i) => i.product_id === product.id)
       if (existing) {
         setItemQty(product.id, newQty)
-      } else {
-        addToCart(product, shop, newQty)
+      } else if (addToCart(product, shop, newQty) === 'confirm-required') {
+        // One kitchen per cart: ask before swapping kitchens.
+        setPendingReplace({ product, qty: newQty })
       }
     }
   }
@@ -150,6 +236,8 @@ export function ShopDetailPage() {
           <img
             src={coverPhoto}
             alt={shop.name}
+            decoding="async"
+            fetchPriority="high"
             className="h-full w-full object-cover"
           />
           <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent" />
@@ -267,13 +355,18 @@ export function ShopDetailPage() {
       <div className="space-y-3">
         <div className="flex items-center justify-between pb-1">
           <h2 className="text-lg font-bold text-slate-900">
-            {activeCategory === 'All' ? 'Full Menu' : activeCategory} ({filteredProducts.length})
+            {menuLoading
+              ? 'Full Menu'
+              : `${activeCategory === 'All' ? 'Full Menu' : activeCategory} (${filteredProducts.length})`}
           </h2>
         </div>
 
-        {filteredProducts.map((p) => {
-          const cartEntry = cart.find((i) => i.product_id === p.id)
-          const qty = cartEntry ? cartEntry.quantity || 1 : 0
+        {menuLoading ? (
+          [...Array(3)].map((_, i) => <MenuItemSkeleton key={i} />)
+        ) : (
+          <>
+            {visibleProducts.map((p) => {
+          const qty = cartQtyById.get(p.id) ?? 0
 
           return (
             <MenuItemCard
@@ -299,7 +392,38 @@ export function ShopDetailPage() {
             }}
           />
         )}
+        {hasMore && (
+          <div ref={sentinelRef} className="space-y-3" aria-hidden>
+            {[...Array(3)].map((_, i) => (
+              <MenuItemSkeleton key={i} />
+            ))}
+          </div>
+        )}
+          </>
+        )}
       </div>
+
+      {/* One kitchen per cart: confirm before swapping kitchens. */}
+      <ConfirmDialog
+        open={pendingReplace !== null}
+        title="Replace cart?"
+        message={
+          pendingReplace ? (
+            <span>
+              Your cart has items from <b>{cartShopConflict(shop.id).currentShopName}</b>.
+              Adding from <b>{shop.name}</b> will clear those items first.
+            </span>
+          ) : null
+        }
+        confirmLabel="Replace cart"
+        onConfirm={() => {
+          if (pendingReplace && shop) {
+            replaceCartWith(pendingReplace.product, shop, pendingReplace.qty)
+          }
+          setPendingReplace(null)
+        }}
+        onCancel={() => setPendingReplace(null)}
+      />
     </div>
   )
 }

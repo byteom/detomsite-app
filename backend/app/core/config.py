@@ -118,7 +118,7 @@ class Settings(BaseSettings):
     # through to the real loader. This enforces the rule this module already
     # documents: a cache must never take the portal down, nor be slower than
     # the query it exists to avoid.
-    CACHE_LOOKUP_TIMEOUT_SECONDS: float = 2.0
+    CACHE_LOOKUP_TIMEOUT_SECONDS: float = 0.2
 
     # SMS-forwarder agent auth. The Android app posts bank credit SMS to
     # ``/sms/incoming``; it must send ``X-Agent-Key: <SMS_FORWARD_KEY>`` so a

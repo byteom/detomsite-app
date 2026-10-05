@@ -56,14 +56,14 @@ export function ConfirmDialog({
     >
       <div className="flex items-start gap-4">
         <div
-          className="shrink-0 p-2.5 bg-gray-100 dark:bg-admin-surface-darkSubtle border border-gray-200 dark:border-admin-border-dark"
+          className="shrink-0 p-2.5 bg-[var(--bg-surface-subtle)] border border-[var(--border-main)]"
           style={{ borderRadius: 0 }}
         >
           {icon}
         </div>
         <div className="flex-1">
-          <h4 className="text-sm font-bold text-gray-900 dark:text-white">{title}</h4>
-          <div className="mt-1.5 text-xs text-gray-600 dark:text-gray-400 leading-relaxed">
+          <h4 className="text-sm font-bold text-[var(--text-heading)]">{title}</h4>
+          <div className="mt-1.5 text-xs text-[var(--text-body)] leading-relaxed">
             {description}
           </div>
         </div>

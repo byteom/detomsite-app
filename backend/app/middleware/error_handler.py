@@ -86,6 +86,20 @@ class ErrorHandlingMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
             return response
         except Exception as e:
+            # Client disconnect / aborted request (e.g. user navigated away or closed tab)
+            if isinstance(e, RuntimeError) and "No response returned" in str(e):
+                logger.info(
+                    f"Client closed connection before response - Request ID: {request_id}, "
+                    f"Path: {request.url.path}"
+                )
+                return JSONResponse(
+                    status_code=499,
+                    content={
+                        "detail": "Client closed connection.",
+                        "request_id": request_id,
+                    },
+                )
+
             # PENTEST FIX: a body of {"x": NaN} or {"x": Infinity} is not valid
             # JSON, but Python's json.loads accepts those bare literals as an
             # extension, so the value flowed into the response. Re-serialising a

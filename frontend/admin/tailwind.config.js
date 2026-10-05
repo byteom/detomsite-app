@@ -5,6 +5,41 @@ export default {
   theme: {
     extend: {
       colors: {
+        page: 'var(--bg-page)',
+        surface: {
+          DEFAULT: 'var(--bg-surface)',
+          hover: 'var(--bg-surface-hover)',
+          subtle: 'var(--bg-surface-subtle)',
+        },
+        line: {
+          DEFAULT: 'var(--border-main)',
+          subtle: 'var(--border-subtle)',
+        },
+        txt: {
+          heading: 'var(--text-heading)',
+          body: 'var(--text-body)',
+          muted: 'var(--text-muted)',
+          dim: 'var(--text-dim)',
+        },
+        admin: {
+          bg: {
+            dark: 'var(--bg-page)',
+            light: 'var(--bg-page)',
+          },
+          surface: {
+            dark: 'var(--bg-surface)',
+            darkHover: 'var(--bg-surface-hover)',
+            darkSubtle: 'var(--bg-surface-subtle)',
+            light: 'var(--bg-surface)',
+            lightHover: 'var(--bg-surface-hover)',
+          },
+          border: {
+            dark: 'var(--border-main)',
+            darkSubtle: 'var(--border-subtle)',
+            light: 'var(--border-main)',
+            lightSubtle: 'var(--border-subtle)',
+          },
+        },
         primary: {
           DEFAULT: '#15803D',
           dark: '#166534',
@@ -29,24 +64,6 @@ export default {
           DEFAULT: '#D4A017',
           light: '#FEF3C7',
           dark: '#A16207',
-        },
-        admin: {
-          bg: {
-            dark: '#090D0B',
-            light: '#F5F7F5',
-          },
-          surface: {
-            dark: '#111713',
-            darkHover: '#161F1A',
-            light: '#FFFFFF',
-            lightHover: '#F0F4F1',
-          },
-          border: {
-            dark: '#1E2B22',
-            darkSubtle: '#141E18',
-            light: '#E2E8F0',
-            lightSubtle: '#EDF2EE',
-          },
         },
         status: {
           success: '#16A34A',

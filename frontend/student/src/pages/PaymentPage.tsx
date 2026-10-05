@@ -13,6 +13,7 @@ import {
   safeParse,
 } from '../utils/helpers'
 import api from '../services/api'
+import { Skeleton } from '../components/ui/Skeleton'
 import {
   Store,
   MapPin,
@@ -35,6 +36,9 @@ export function PaymentPage() {
   const [shop, setShop] = useState<Shop | null>(null)
   const [settingsLoaded, setSettingsLoaded] = useState(false)
   const [shopLoaded, setShopLoaded] = useState(false)
+  const [loadError, setLoadError] = useState(false)
+  // Bump to retry the checkout-data fetch after a failure.
+  const [reloadKey, setReloadKey] = useState(0)
 
   // Saved checkout values from localStorage
   const [loc] = useState(MAIN_GATE)
@@ -52,7 +56,10 @@ export function PaymentPage() {
   const [chosen, setChosen] = useState<'qr' | 'cod' | null>(null)
   const [err, setErr] = useState('')
 
-  // Load checkout data (one aggregated cached call)
+  // Load checkout data (one aggregated cached call).
+  // The options grid stays skeleton until BOTH halves resolve — rendering
+  // decided options from half-loaded data is what used to flash a wrong
+  // single option (and stick on it when the fetch failed silently).
   useEffect(() => {
     const shopId = items[0]?.shop_id
     const finish = () => {
@@ -63,6 +70,7 @@ export function PaymentPage() {
       finish()
       return
     }
+    setLoadError(false)
     api
       .get<{
         shops: Shop[]
@@ -74,11 +82,22 @@ export function PaymentPage() {
         const found = list.find((s) => s.id === shopId)
         if (found) setShop(found)
       })
-      .catch(() => {})
+      .catch(() => {
+        setLoadError(true)
+      })
       .finally(finish)
-  }, [items[0]?.shop_id])
+  }, [items[0]?.shop_id, reloadKey])
 
-  // Payment availability resolution
+  // A different kitchen's cart means a different method set — drop the old pick.
+  const cartShopId = items[0]?.shop_id
+  useEffect(() => {
+    setChosen(null)
+  }, [cartShopId])
+
+  // Payment availability resolution.
+  // NOTE: upiAvailable/codAvailable are only meaningful once BOTH halves
+  // have loaded (optionsReady below) — before that shop/ps are null and the
+  // defaults would wrongly resolve to "COD only".
   const shopUpi = shop?.upi_id?.trim() || ''
   const globalUpi = ps?.upi_id?.trim() || ''
   const upiOn = shop ? !!shop.upi_enabled : true
@@ -86,6 +105,7 @@ export function PaymentPage() {
   const upiAvailable = upiOn && (Boolean(shopUpi) || Boolean(ps?.manual_enabled && globalUpi))
   const codAvailable = codOn
   const payOn = upiAvailable || codAvailable
+  const optionsReady = shopLoaded && settingsLoaded
 
   const onlyUpi = upiAvailable && !codAvailable
   const onlyCod = codAvailable && !upiAvailable
@@ -97,6 +117,10 @@ export function PaymentPage() {
     setErr('')
     if (!items.length) {
       setErr('Your cart is empty.')
+      return
+    }
+    if (!optionsReady) {
+      setErr('Payment methods are still loading. Please wait a moment.')
       return
     }
     if (!isValidMobile(phone)) {
@@ -282,13 +306,40 @@ export function PaymentPage() {
             </h2>
 
             <p className="text-xs text-slate-500">
-              {onlyUpi
+              {!optionsReady
+                ? 'Loading payment methods for this kitchen…'
+                : onlyUpi
                 ? 'This kitchen only accepts UPI payments.'
                 : onlyCod
                 ? 'This kitchen currently accepts Cash on Delivery only.'
                 : 'Select your preferred payment method below:'}
             </p>
 
+            {!optionsReady ? (
+              <div className="grid gap-3 sm:grid-cols-2" aria-hidden="true">
+                <Skeleton className="h-28 w-full rounded-card" />
+                <Skeleton className="h-28 w-full rounded-card" />
+              </div>
+            ) : loadError ? (
+              <div className="rounded-btn border border-rose-200 bg-rose-50 p-4 text-center">
+                <p className="text-xs font-bold text-rose-700">
+                  Could not load payment methods. Please check your connection.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setReloadKey((k) => k + 1)}
+                  className="mt-2.5 rounded-btn bg-rose-600 px-4 py-2 text-xs font-bold text-white transition-colors hover:bg-rose-700"
+                >
+                  Retry
+                </button>
+              </div>
+            ) : !payOn ? (
+              <div className="rounded-btn border border-amber-200 bg-amber-50 p-4 text-center">
+                <p className="text-xs font-bold text-amber-900">
+                  This kitchen isn&apos;t accepting payments right now. Please try again later or pick another kitchen.
+                </p>
+              </div>
+            ) : (
             <div className="grid gap-3 sm:grid-cols-2">
               {/* UPI Option */}
               {upiAvailable && (
@@ -346,6 +397,7 @@ export function PaymentPage() {
                 </button>
               )}
             </div>
+            )}
 
             {err && (
               <div className="flex items-center gap-2 rounded-btn bg-red-50 border border-red-200 p-3 text-xs font-bold text-red-700">

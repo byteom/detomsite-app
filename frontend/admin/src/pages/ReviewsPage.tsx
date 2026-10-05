@@ -39,7 +39,7 @@ export function ReviewsPage() {
       header: 'Student Reviewer',
       sortable: true,
       render: (r: any) => (
-        <span className="font-semibold text-gray-900 dark:text-white">
+        <span className="font-semibold text-[var(--text-heading)]">
           {r.student_name || r.username || 'Anonymous'}
         </span>
       ),
@@ -62,7 +62,7 @@ export function ReviewsPage() {
       render: (r: any) => (
         <div className="flex items-center justify-center gap-1 font-mono text-xs font-bold text-amber-500">
           <span>{'★'.repeat(r.rating || 0)}</span>
-          <span className="text-gray-500 text-[11px]">({r.rating}/5)</span>
+          <span className="text-[var(--text-muted)] text-[11px]">({r.rating}/5)</span>
         </div>
       ),
     },
@@ -70,7 +70,7 @@ export function ReviewsPage() {
       key: 'comment',
       header: 'Student Feedback Review',
       render: (r: any) => (
-        <p className="text-xs text-gray-700 dark:text-gray-300 max-w-lg line-clamp-2" title={r.comment}>
+        <p className="text-xs text-[var(--text-body)] max-w-lg line-clamp-2" title={r.comment}>
           {r.comment || '—'}
         </p>
       ),
@@ -80,7 +80,7 @@ export function ReviewsPage() {
       header: 'Submitted',
       sortable: true,
       render: (r: any) => (
-        <span className="text-gray-500 font-mono text-xs whitespace-nowrap">
+        <span className="text-[var(--text-muted)] font-mono text-xs whitespace-nowrap">
           {fmtTime(r.created_at)}
         </span>
       ),
@@ -88,19 +88,19 @@ export function ReviewsPage() {
   ]
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 text-[var(--text-body)]">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-200 dark:border-admin-border-dark pb-4">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[var(--border-main)] pb-4">
         <div>
           <div className="flex items-center gap-2.5">
-            <h1 className="text-2xl font-black text-gray-900 dark:text-white tracking-tight">
+            <h1 className="text-2xl font-black text-[var(--text-heading)] tracking-tight">
               Student Reviews & Ratings
             </h1>
             <Badge variant="default" size="md">
               {reviews.length} Total
             </Badge>
           </div>
-          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+          <p className="text-xs text-[var(--text-muted)] mt-0.5">
             Campus dining experience satisfaction metrics and vendor quality monitoring
           </p>
         </div>

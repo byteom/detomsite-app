@@ -18,6 +18,7 @@ import ApprovalsPage from './pages/ApprovalsPage'
 import { OrdersPage } from './pages/OrdersPage'
 import { VendorsPage } from './pages/VendorsPage'
 import { UsersPage } from './pages/UsersPage'
+import { UserDetailPage } from './pages/UserDetailPage'
 import { PaymentsPage } from './pages/PaymentsPage'
 import { RevenuePage } from './pages/RevenuePage'
 import { WhatsAppCenterPage } from './pages/WhatsAppCenterPage'
@@ -25,6 +26,7 @@ import { SmsLogsPage } from './pages/SmsLogsPage'
 import { FeedbackPage } from './pages/FeedbackPage'
 import { ReviewsPage } from './pages/ReviewsPage'
 import { SettingsPage } from './pages/SettingsPage'
+import { ScrollToTop } from './components/common/ScrollToTop'
 
 /** Auth guard: verifies administrator JWT token before rendering protected routes */
 function RequireAuth({ children }: { children: React.ReactNode }) {
@@ -46,6 +48,7 @@ export default function App() {
     <ThemeProvider>
       <ErrorBoundary>
         <Router>
+          <ScrollToTop />
           <Routes>
             {/* Public Authentication Routes */}
             <Route path="/login" element={<LoginPage />} />
@@ -63,6 +66,7 @@ export default function App() {
                       <Route path="/orders" element={<OrdersPage />} />
                       <Route path="/vendors" element={<VendorsPage />} />
                       <Route path="/users" element={<UsersPage />} />
+                      <Route path="/users/:userId" element={<UserDetailPage />} />
                       <Route path="/payments" element={<PaymentsPage />} />
                       <Route path="/revenue" element={<RevenuePage />} />
                       <Route path="/whatsapp" element={<WhatsAppCenterPage />} />

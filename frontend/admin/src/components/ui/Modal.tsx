@@ -55,22 +55,22 @@ export function Modal({
 
       {/* Modal dialog box */}
       <div
-        className={`relative w-full ${maxWidthStyles[maxWidth]} border border-gray-300 dark:border-admin-border-dark bg-white dark:bg-admin-surface-dark shadow-2xl z-10 overflow-hidden animate-slide-up`}
+        className={`relative w-full ${maxWidthStyles[maxWidth]} border border-[var(--border-main)] bg-[var(--bg-surface)] text-[var(--text-body)] shadow-2xl z-10 overflow-hidden animate-slide-up`}
         style={{ borderRadius: 0 }}
       >
         {/* Header */}
-        <div className="flex items-start justify-between border-b border-gray-200 dark:border-admin-border-dark px-5 py-4 bg-gray-50/70 dark:bg-admin-surface-darkSubtle/40">
+        <div className="flex items-start justify-between border-b border-[var(--border-main)] px-5 py-4 bg-[var(--bg-surface-subtle)]">
           <div>
             {title && (
-              <h3 className="text-base font-bold text-gray-900 dark:text-white">{title}</h3>
+              <h3 className="text-base font-bold text-[var(--text-heading)]">{title}</h3>
             )}
             {description && (
-              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">{description}</p>
+              <p className="mt-1 text-xs text-[var(--text-muted)]">{description}</p>
             )}
           </div>
           <button
             onClick={onClose}
-            className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition-colors p-1"
+            className="text-[var(--text-dim)] hover:text-[var(--text-heading)] transition-colors p-1"
             aria-label="Close dialog"
             style={{ borderRadius: 0 }}
           >
@@ -83,7 +83,7 @@ export function Modal({
 
         {/* Footer */}
         {footer && (
-          <div className="border-t border-gray-200 dark:border-admin-border-dark px-5 py-3.5 bg-gray-50 dark:bg-admin-surface-darkSubtle/40 flex items-center justify-end gap-2.5">
+          <div className="border-t border-[var(--border-main)] px-5 py-3.5 bg-[var(--bg-surface-subtle)] flex items-center justify-end gap-2.5">
             {footer}
           </div>
         )}

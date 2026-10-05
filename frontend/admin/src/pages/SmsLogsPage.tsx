@@ -28,19 +28,19 @@ export function SmsLogsPage() {
   }, [])
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 text-[var(--text-body)]">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-200 dark:border-admin-border-dark pb-4">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[var(--border-main)] pb-4">
         <div>
           <div className="flex items-center gap-2.5">
-            <h1 className="text-2xl font-black text-gray-900 dark:text-white tracking-tight">
+            <h1 className="text-2xl font-black text-[var(--text-heading)] tracking-tight">
               SMS Gateway Telemetry
             </h1>
             <Badge variant="default" size="md">
               {logs.length} Messages
             </Badge>
           </div>
-          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+          <p className="text-xs text-[var(--text-muted)] mt-0.5">
             Outbound customer and shop order notifications paired with incoming YES/NO confirmation replies
           </p>
         </div>
@@ -60,15 +60,15 @@ export function SmsLogsPage() {
 
       {/* Main Stream */}
       {loading ? (
-        <div className="p-12 text-center text-xs text-gray-500">
+        <div className="p-12 text-center text-xs text-[var(--text-muted)]">
           <Clock className="w-8 h-8 mx-auto mb-2 animate-spin text-emerald-600 opacity-60" />
           Loading SMS pipeline...
         </div>
       ) : logs.length === 0 ? (
         <Card className="text-center py-12">
-          <Smartphone className="w-8 h-8 mx-auto mb-2 opacity-30" />
-          <p className="text-sm font-bold text-gray-900 dark:text-white">No SMS Traffic Yet</p>
-          <p className="mt-1 text-xs text-gray-500 max-w-sm mx-auto">
+          <Smartphone className="w-8 h-8 mx-auto mb-2 opacity-30 text-[var(--text-muted)]" />
+          <p className="text-sm font-bold text-[var(--text-heading)]">No SMS Traffic Yet</p>
+          <p className="mt-1 text-xs text-[var(--text-muted)] max-w-sm mx-auto">
             Place an order on the platform to observe live telemetry as SMS messages leave and return
             through the gateway.
           </p>
@@ -81,10 +81,10 @@ export function SmsLogsPage() {
             return (
               <div
                 key={s.id}
-                className="border border-gray-200 dark:border-admin-border-dark bg-white dark:bg-admin-surface-dark p-3.5 transition-colors hover:border-emerald-600/40"
+                className="border border-[var(--border-main)] bg-[var(--bg-surface)] p-3.5 transition-colors hover:border-emerald-600/40"
                 style={{ borderRadius: 0 }}
               >
-                <div className="flex items-center justify-between gap-2 border-b border-gray-100 dark:border-admin-border-darkSubtle pb-2 mb-2">
+                <div className="flex items-center justify-between gap-2 border-b border-[var(--border-subtle)] pb-2 mb-2">
                   <div className="flex items-center gap-2">
                     <Badge variant={isIncoming ? 'success' : 'info'} size="xs">
                       {isIncoming ? (
@@ -99,31 +99,31 @@ export function SmsLogsPage() {
                     </Badge>
 
                     {s.phone && (
-                      <span className="font-mono text-xs text-gray-700 dark:text-gray-300 font-semibold">
+                      <span className="font-mono text-xs text-[var(--text-heading)] font-semibold">
                         {s.phone}
                       </span>
                     )}
 
                     {s.sub_order_id && (
-                      <span className="text-[11px] text-gray-400 font-mono">
+                      <span className="text-[11px] text-[var(--text-muted)] font-mono">
                         · order #{s.sub_order_id}
                       </span>
                     )}
                   </div>
 
-                  <span className="text-[11px] text-gray-400 font-mono">
+                  <span className="text-[11px] text-[var(--text-muted)] font-mono">
                     {fmtTime(s.created_at)}
                   </span>
                 </div>
 
-                <p className="font-mono text-xs text-gray-800 dark:text-gray-200 whitespace-pre-line leading-relaxed">
+                <p className="font-mono text-xs text-[var(--text-body)] whitespace-pre-line leading-relaxed">
                   {s.message}
                 </p>
 
                 {s.status && (
-                  <div className="mt-2 flex items-center gap-2 text-[10px] text-gray-400">
+                  <div className="mt-2 flex items-center gap-2 text-[10px] text-[var(--text-dim)]">
                     <span>Gateway Status:</span>
-                    <span className="font-mono font-bold uppercase text-gray-600 dark:text-gray-300">
+                    <span className="font-mono font-bold uppercase text-[var(--text-muted)]">
                       {s.status}
                     </span>
                   </div>

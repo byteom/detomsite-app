@@ -15,6 +15,7 @@ from app.core.rate_limit import allow as rate_allow, reset as rate_reset, client
 from app.core.store import store as db
 from app.core.security import hash_password, verify_password, create_access_token, create_refresh_token, decode_token
 from app.core import read_cache
+from app.core.db_executor import run_db
 from app.services import push_service
 
 logger = logging.getLogger(__name__)
@@ -24,8 +25,12 @@ router = APIRouter()
 
 # ─── Async wrapper for blocking DB calls ───
 async def _db(fn, *args, **kwargs):
-    """Run a blocking store call in a worker thread to avoid stalling the event loop."""
-    return await asyncio.to_thread(fn, *args, **kwargs)
+    """Run a blocking store call in a worker thread to avoid stalling the event loop.
+
+    Uses the dedicated db pool (app.core.db_executor), never the shared
+    default executor — see the identical note on local.py's ``_db``.
+    """
+    return await run_db(fn, *args, **kwargs)
 
 
 # Asia/Kolkata fixed offset (works even without the tzdata package)
@@ -82,6 +87,19 @@ class VendorItem(BaseModel):
     orders_today: int
     revenue_today: int
     created_at: str = ""
+
+
+class AdminUserUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    role: Optional[str] = None
+    status: Optional[str] = None
+
+
+class AdminUserStatusRequest(BaseModel):
+    status: str = Field(..., pattern="^(active|blocked|suspended)$")
+
 
 
 class ApprovalAction(BaseModel):
@@ -548,9 +566,28 @@ async def list_payments_by_date(admin: dict = Depends(verify_admin), date: str =
 
 
 @router.get("/users")
-async def list_all_users(admin: dict = Depends(verify_admin)):
-    """List all registered users."""
-    return await _db(db.list_users)
+async def list_all_users(
+    role: Optional[str] = Query(None, description="Filter by role: student, shopkeeper, admin"),
+    status: Optional[str] = Query(None, description="Filter by status: active, suspended, blocked"),
+    search: Optional[str] = Query(None, description="Search term for username, name, email, phone"),
+    admin: dict = Depends(verify_admin),
+):
+    """List all registered users with optional role, status, and search filtering."""
+    users = await _db(db.list_users)
+    if role and role.lower() != "all":
+        users = [u for u in users if str(u.get("role", "")).lower() == role.lower()]
+    if status and status.lower() != "all":
+        users = [u for u in users if str(u.get("status", "active")).lower() == status.lower()]
+    if search:
+        s = search.strip().lower()
+        users = [
+            u for u in users
+            if s in str(u.get("username", "")).lower()
+            or s in str(u.get("name", "")).lower()
+            or s in str(u.get("email", "")).lower()
+            or s in str(u.get("phone", "")).lower()
+        ]
+    return users
 
 
 @router.get("/users/students")
@@ -563,6 +600,52 @@ async def list_students(admin: dict = Depends(verify_admin)):
 async def list_shopkeepers(admin: dict = Depends(verify_admin)):
     """List all registered shopkeepers."""
     return await _db(db.list_users_by_role, "shopkeeper")
+
+
+@router.get("/users/{user_id}")
+async def get_user_detail(user_id: int, admin: dict = Depends(verify_admin)):
+    """Get full 360 overview of a specific user: profile, stats, orders, payments, addresses, activity, reviews, feedback."""
+    overview = await _db(db.get_user_overview, user_id)
+    if not overview:
+        raise HTTPException(status_code=404, detail="User not found")
+    return overview
+
+
+@router.put("/users/{user_id}")
+async def update_user(user_id: int, data: AdminUserUpdateRequest, admin: dict = Depends(verify_admin)):
+    """Update user profile and account details."""
+    user = await _db(db.get_user_by_id, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    updates = data.model_dump(exclude_unset=True)
+    if not updates:
+        return {"message": "No changes supplied", "user": user}
+
+    # Protect changing primary admin account
+    if user.get("role") == "admin" and updates.get("role") and updates.get("role") != "admin":
+        if user_id == 1 or user.get("username") == ADMIN_USERNAME:
+            raise HTTPException(status_code=400, detail="The primary administrator account role cannot be changed.")
+
+    if updates.get("status") in ("blocked", "suspended") and (user_id == 1 or user.get("username") == ADMIN_USERNAME):
+        raise HTTPException(status_code=400, detail="The primary administrator account cannot be suspended.")
+
+    updated = await _db(db.update_user_admin, user_id, updates)
+    return {"message": "User updated successfully", "user": updated}
+
+
+@router.post("/users/{user_id}/status")
+async def toggle_user_status(user_id: int, data: AdminUserStatusRequest, admin: dict = Depends(verify_admin)):
+    """Activate or suspend a user account."""
+    user = await _db(db.get_user_by_id, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if data.status in ("blocked", "suspended") and (user_id == 1 or user.get("username") == ADMIN_USERNAME):
+        raise HTTPException(status_code=400, detail="The primary administrator account cannot be suspended.")
+
+    await _db(db.set_user_status, user_id, data.status)
+    return {"message": f"User status set to {data.status}", "status": data.status}
 
 
 @router.get("/registrations")
@@ -999,9 +1082,12 @@ async def broadcast_notification(data: BroadcastRequest, admin: dict = Depends(v
 @router.get("/payments")
 async def list_all_payments(admin: dict = Depends(verify_admin)):
     """List all payments — single orders from the payments table plus multi-shop
-    parent orders (their ONE-bill payment lives on the parent_orders row)."""
-    single = await _db(db.list_payments)
-    parent = await _db(db.list_parent_payments)
+    parent orders (their ONE-bill payment lives on the parent_orders row).
+    Queries are executed concurrently in parallel worker threads."""
+    single, parent = await asyncio.gather(
+        _db(db.list_payments),
+        _db(db.list_parent_payments),
+    )
     return single + parent
 
 
@@ -1235,6 +1321,11 @@ async def delete_feedback(
 @router.delete("/users/{user_id}")
 async def delete_user(user_id: int, admin: dict = Depends(verify_admin)):
     """Permanently delete a user."""
+    target = await _db(db.get_user_by_id, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.get("role") == "admin":
+        raise HTTPException(status_code=400, detail="Administrator accounts cannot be deleted.")
     if not await _db(db.delete_user, user_id):
         raise HTTPException(status_code=404, detail="User not found")
     logger.info(f"Admin deleted user {user_id}")

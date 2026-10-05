@@ -32,13 +32,13 @@ export function LoginPage() {
   }
 
   return (
-    <div className="relative min-h-screen lg:grid lg:grid-cols-2 bg-admin-bg-light dark:bg-admin-bg-dark transition-colors duration-200">
+    <div className="relative min-h-screen lg:grid lg:grid-cols-2 bg-[var(--bg-page)] text-[var(--text-body)] transition-colors duration-200">
       {/* Theme Toggle Top Right */}
       <div className="absolute right-4 top-4 z-20">
         <button
           type="button"
           onClick={toggleTheme}
-          className="p-2 border border-gray-300 dark:border-admin-border-dark bg-white dark:bg-admin-surface-dark text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-admin-surface-darkHover"
+          className="p-2 border border-[var(--border-main)] bg-[var(--bg-surface)] text-[var(--text-heading)] hover:bg-[var(--bg-surface-hover)] transition-colors"
           style={{ borderRadius: 0 }}
           title={isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
         >
@@ -114,22 +114,22 @@ export function LoginPage() {
             >
               D
             </div>
-            <h2 className="text-2xl font-black text-gray-900 dark:text-white">
+            <h2 className="text-2xl font-black text-[var(--text-heading)]">
               Administrator Login
             </h2>
-            <p className="mt-1.5 text-xs text-gray-500 dark:text-gray-400">
+            <p className="mt-1.5 text-xs text-[var(--text-muted)]">
               Enter your credentials to access the operational portal
             </p>
           </div>
 
           {/* Form Container */}
           <div
-            className="border border-gray-200 dark:border-admin-border-dark bg-white dark:bg-admin-surface-dark p-6 sm:p-8 shadow-sm"
+            className="border border-[var(--border-main)] bg-[var(--bg-surface)] p-6 sm:p-8 shadow-sm"
             style={{ borderRadius: 0 }}
           >
             {err && (
               <div
-                className="mb-5 p-3.5 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 text-xs font-semibold text-red-700 dark:text-red-300"
+                className="mb-5 p-3.5 bg-red-500/10 border border-red-500/30 text-xs font-semibold text-red-800 dark:text-red-300"
                 style={{ borderRadius: 0 }}
               >
                 {err}
@@ -180,7 +180,7 @@ export function LoginPage() {
             </form>
           </div>
 
-          <div className="mt-6 text-center text-xs text-gray-400">
+          <div className="mt-6 text-center text-xs text-[var(--text-dim)]">
             Internal Operations Portal · Authorized Personnel Only
           </div>
         </div>

@@ -58,9 +58,9 @@ export function ForgotPasswordPage() {
 
   if (done) {
     return (
-      <div className="min-h-screen flex items-center justify-center p-4 bg-admin-bg-light dark:bg-admin-bg-dark">
+      <div className="min-h-screen flex items-center justify-center p-4 bg-[var(--bg-page)] text-[var(--text-body)]">
         <div
-          className="w-full max-w-md border border-gray-200 dark:border-admin-border-dark bg-white dark:bg-admin-surface-dark p-8 text-center"
+          className="w-full max-w-md border border-[var(--border-main)] bg-[var(--bg-surface)] p-8 text-center"
           style={{ borderRadius: 0 }}
         >
           <div
@@ -69,8 +69,8 @@ export function ForgotPasswordPage() {
           >
             <CheckCircle2 className="w-6 h-6" />
           </div>
-          <h2 className="text-xl font-black text-gray-900 dark:text-white">Password Updated!</h2>
-          <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+          <h2 className="text-xl font-black text-[var(--text-heading)]">Password Updated!</h2>
+          <p className="mt-2 text-xs text-[var(--text-muted)]">
             Your administrator account credentials have been successfully updated.
           </p>
           <Link to="/login" className="mt-6 block">
@@ -84,7 +84,7 @@ export function ForgotPasswordPage() {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-4 bg-admin-bg-light dark:bg-admin-bg-dark">
+    <div className="min-h-screen flex items-center justify-center p-4 bg-[var(--bg-page)] text-[var(--text-body)]">
       <div className="w-full max-w-md">
         <div className="mb-6 text-center">
           <div
@@ -93,8 +93,8 @@ export function ForgotPasswordPage() {
           >
             <KeyRound className="w-5 h-5" />
           </div>
-          <h2 className="text-2xl font-black text-gray-900 dark:text-white">Admin Recovery</h2>
-          <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+          <h2 className="text-2xl font-black text-[var(--text-heading)]">Admin Recovery</h2>
+          <p className="mt-1 text-xs text-[var(--text-muted)]">
             {step === 'request'
               ? 'Step 1 of 2 · Request verification code'
               : 'Step 2 of 2 · Enter code and choose new password'}
@@ -102,12 +102,12 @@ export function ForgotPasswordPage() {
         </div>
 
         <div
-          className="border border-gray-200 dark:border-admin-border-dark bg-white dark:bg-admin-surface-dark p-6 sm:p-8"
+          className="border border-[var(--border-main)] bg-[var(--bg-surface)] p-6 sm:p-8"
           style={{ borderRadius: 0 }}
         >
           {err && (
             <div
-              className="mb-4 p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 text-xs font-semibold text-red-700 dark:text-red-300"
+              className="mb-4 p-3 bg-red-500/10 border border-red-500/30 text-xs font-semibold text-red-800 dark:text-red-300"
               style={{ borderRadius: 0 }}
             >
               {err}
@@ -116,7 +116,7 @@ export function ForgotPasswordPage() {
 
           {info && (
             <div
-              className="mb-4 p-3 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-xs font-semibold text-emerald-700 dark:text-emerald-300"
+              className="mb-4 p-3 bg-emerald-500/10 border border-emerald-500/30 text-xs font-semibold text-emerald-800 dark:text-emerald-300"
               style={{ borderRadius: 0 }}
             >
               {info}
@@ -139,13 +139,13 @@ export function ForgotPasswordPage() {
             </form>
           ) : (
             <form onSubmit={resetPw} className="space-y-4">
-              <p className="text-xs text-gray-600 dark:text-gray-400 leading-relaxed">
+              <p className="text-xs text-[var(--text-body)] leading-relaxed">
                 Enter the <b>6-digit code</b> sent to your registered address along with your new
                 password. Code expires in 15 minutes.
               </p>
 
               <div>
-                <label className="block text-xs font-bold uppercase tracking-wider text-gray-700 dark:text-gray-300 mb-1.5">
+                <label className="block text-xs font-bold uppercase tracking-wider text-[var(--text-heading)] mb-1.5">
                   6-Digit Verification Code
                 </label>
                 <input
@@ -154,7 +154,7 @@ export function ForgotPasswordPage() {
                   value={otp}
                   onChange={e => setOtp(e.target.value.replace(/\D/g, '').slice(0, 6))}
                   placeholder="••••••"
-                  className="w-full text-center text-2xl font-mono font-bold tracking-[0.4em] bg-white dark:bg-admin-surface-dark border border-gray-300 dark:border-admin-border-dark py-2 text-gray-900 dark:text-white outline-none focus:border-emerald-600"
+                  className="w-full text-center text-2xl font-mono font-bold tracking-[0.4em] bg-[var(--bg-surface)] border border-[var(--border-main)] py-2 text-[var(--text-heading)] outline-none focus:border-emerald-600 transition-colors"
                   style={{ borderRadius: 0 }}
                   required
                 />
@@ -198,10 +198,10 @@ export function ForgotPasswordPage() {
             </form>
           )}
 
-          <div className="mt-6 pt-4 border-t border-gray-100 dark:border-admin-border-dark flex items-center justify-center">
+          <div className="mt-6 pt-4 border-t border-[var(--border-subtle)] flex items-center justify-center">
             <Link
               to="/login"
-              className="text-xs font-semibold text-gray-500 hover:text-gray-800 dark:hover:text-gray-200 flex items-center gap-1.5"
+              className="text-xs font-semibold text-[var(--text-muted)] hover:text-[var(--text-heading)] transition-colors flex items-center gap-1.5"
             >
               <ArrowLeft className="w-3.5 h-3.5" /> Back to Sign In
             </Link>

@@ -23,19 +23,19 @@ export function Card({
 
   return (
     <div
-      className={`border bg-white dark:bg-admin-surface-dark border-gray-200 dark:border-admin-border-dark transition-colors duration-150 ${className}`}
+      className={`border bg-[var(--bg-surface)] border-[var(--border-main)] text-[var(--text-body)] transition-colors duration-150 ${className}`}
       style={{ borderRadius: 0 }}
     >
       {hasHeader && (
-        <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3.5 border-b border-gray-200 dark:border-admin-border-dark bg-gray-50/50 dark:bg-admin-surface-darkSubtle/40">
+        <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3.5 border-b border-[var(--border-main)] bg-[var(--bg-surface-subtle)]">
           <div>
             {title && (
-              <h3 className="text-sm font-bold text-gray-900 dark:text-gray-100 flex items-center gap-2">
+              <h3 className="text-sm font-bold text-[var(--text-heading)] flex items-center gap-2">
                 {title}
               </h3>
             )}
             {subtitle && (
-              <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{subtitle}</p>
+              <p className="text-xs text-[var(--text-muted)] mt-0.5">{subtitle}</p>
             )}
           </div>
           {action && <div className="flex items-center gap-2">{action}</div>}
@@ -45,7 +45,7 @@ export function Card({
       <div className={noPadding ? '' : 'p-5'}>{children}</div>
 
       {footer && (
-        <div className="px-5 py-3 border-t border-gray-200 dark:border-admin-border-dark bg-gray-50/40 dark:bg-admin-surface-darkSubtle/30">
+        <div className="px-5 py-3 border-t border-[var(--border-main)] bg-[var(--bg-surface-subtle)]">
           {footer}
         </div>
       )}

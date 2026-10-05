@@ -10,7 +10,8 @@ import {
   shopStatusText,
 } from '../types/localApi'
 import { getLocalSession } from '../utils/session'
-import { addProductToCart } from '../utils/cart'
+import { addProductToCart, cartShopConflict, replaceCartWithProduct } from '../utils/cart'
+import { ConfirmDialog } from '../components/ConfirmDialog'
 import { getShopImage } from '../utils/shopImages'
 
 /* Combo items are free text (one per line, commas also work) — split them for
@@ -38,6 +39,8 @@ export function Home() {
   const [batch, setBatch] = useState<BatchInfo | null>(null)
   const [search, setSearch] = useState('')
   const [activeCategory, setActiveCategory] = useState<string | null>(null)
+  // Cross-shop add awaiting user confirm (one kitchen per cart).
+  const [pendingReplace, setPendingReplace] = useState<{ product: LocalProduct; shop: LocalShop } | null>(null)
 
   // --- Category definitions for Combos & Deals ---
   const CATEGORY_GROUPS = useMemo(() => [
@@ -123,7 +126,10 @@ export function Home() {
   const categoryProducts = activeCategory ? categoryFoods[activeCategory] || [] : []
 
   const handleAdd = (product: LocalProduct, shop: LocalShop) => {
-    addProductToCart(product, shop)
+    if (addProductToCart(product, shop) === 'confirm-required') {
+      // One kitchen per cart: ask before swapping kitchens.
+      setPendingReplace({ product, shop })
+    }
   }
 
   const clearCategoryFilter = () => setActiveCategory(null)
@@ -407,6 +413,26 @@ export function Home() {
           <Link to="/vendor/register" className="mt-3 inline-block rounded-btn bg-gold px-5 py-2.5 text-sm font-bold text-white transition-all hover:bg-gold">Register your shop -&gt;</Link>
         </div>
       </div>
+
+      {/* One kitchen per cart: confirm before swapping kitchens. */}
+      <ConfirmDialog
+        open={pendingReplace !== null}
+        title="Replace cart?"
+        message={
+          pendingReplace ? (
+            <span>
+              Your cart has items from <b>{cartShopConflict(pendingReplace.shop.id).currentShopName}</b>.
+              Adding from <b>{pendingReplace.shop.name}</b> will clear those items first.
+            </span>
+          ) : null
+        }
+        confirmLabel="Replace cart"
+        onConfirm={() => {
+          if (pendingReplace) replaceCartWithProduct(pendingReplace.product, pendingReplace.shop)
+          setPendingReplace(null)
+        }}
+        onCancel={() => setPendingReplace(null)}
+      />
     </div>
   )
 }

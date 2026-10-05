@@ -321,14 +321,14 @@ export function VendorsPage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 text-[var(--text-body)]">
       {/* Top Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-200 dark:border-admin-border-dark pb-4">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[var(--border-main)] pb-4">
         <div>
-          <h1 className="text-2xl font-black text-gray-900 dark:text-white tracking-tight">
+          <h1 className="text-2xl font-black text-[var(--text-heading)] tracking-tight">
             Vendors & Menus Directory
           </h1>
-          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+          <p className="text-xs text-[var(--text-muted)] mt-0.5">
             Manage restaurant verification, operating hours, payment routing, and food item catalogs
           </p>
         </div>
@@ -346,7 +346,7 @@ export function VendorsPage() {
       {/* Messages */}
       {msg && (
         <div
-          className="p-3.5 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-800 text-xs font-semibold text-emerald-800 dark:text-emerald-300"
+          className="p-3.5 bg-emerald-500/10 border border-emerald-500/30 text-xs font-semibold text-emerald-800 dark:text-emerald-300"
           style={{ borderRadius: 0 }}
         >
           {msg}
@@ -355,7 +355,7 @@ export function VendorsPage() {
 
       {err && (
         <div
-          className="p-3.5 bg-red-50 dark:bg-red-950/40 border border-red-300 dark:border-red-800 text-xs font-semibold text-red-800 dark:text-red-300"
+          className="p-3.5 bg-red-500/10 border border-red-500/30 text-xs font-semibold text-red-800 dark:text-red-300"
           style={{ borderRadius: 0 }}
         >
           {err}
@@ -363,7 +363,7 @@ export function VendorsPage() {
       )}
 
       {/* Tabs & Search Filter Bar */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border border-gray-200 dark:border-admin-border-dark bg-white dark:bg-admin-surface-dark p-3">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border border-[var(--border-main)] bg-[var(--bg-surface)] p-3">
         {/* Status Tabs */}
         <div className="flex flex-wrap items-center gap-1.5">
           {(
@@ -380,7 +380,7 @@ export function VendorsPage() {
               className={`px-3 py-1.5 text-xs font-bold transition-colors select-none ${
                 vendorFilter === tab.id
                   ? 'bg-emerald-700 dark:bg-emerald-600 text-white'
-                  : 'bg-gray-100 dark:bg-admin-surface-darkSubtle text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-800'
+                  : 'bg-[var(--bg-surface-subtle)] text-[var(--text-body)] hover:bg-[var(--bg-surface-hover)] border border-[var(--border-main)]'
               }`}
               style={{ borderRadius: 0 }}
             >
@@ -391,13 +391,13 @@ export function VendorsPage() {
 
         {/* Search */}
         <div className="relative min-w-[220px] max-w-xs">
-          <Search className="w-3.5 h-3.5 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+          <Search className="w-3.5 h-3.5 text-[var(--text-dim)] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
           <input
             type="text"
             value={search}
             onChange={e => setSearch(e.target.value)}
             placeholder="Search vendor name, owner, phone..."
-            className="w-full bg-gray-50 dark:bg-admin-surface-darkSubtle border border-gray-300 dark:border-admin-border-dark pl-9 pr-3 py-1.5 text-xs text-gray-900 dark:text-gray-100 outline-none focus:border-emerald-600"
+            className="w-full bg-[var(--bg-surface)] border border-[var(--border-main)] pl-9 pr-3 py-1.5 text-xs text-[var(--text-heading)] placeholder:text-[var(--text-dim)] outline-none focus:border-emerald-600"
             style={{ borderRadius: 0 }}
           />
         </div>
@@ -405,16 +405,16 @@ export function VendorsPage() {
 
       {/* Vendor Cards List */}
       {loading ? (
-        <div className="p-12 text-center text-xs text-gray-500">
+        <div className="p-12 text-center text-xs text-[var(--text-muted)]">
           <Clock className="w-8 h-8 mx-auto mb-2 animate-spin text-emerald-600 opacity-60" />
           Loading vendor data...
         </div>
       ) : filteredVendors.length === 0 ? (
         <div
-          className="border border-gray-200 dark:border-admin-border-dark bg-white dark:bg-admin-surface-dark p-12 text-center text-xs text-gray-500"
+          className="border border-[var(--border-main)] bg-[var(--bg-surface)] p-12 text-center text-xs text-[var(--text-muted)]"
           style={{ borderRadius: 0 }}
         >
-          <Store className="w-8 h-8 mx-auto mb-2 opacity-30" />
+          <Store className="w-8 h-8 mx-auto mb-2 opacity-30 text-[var(--text-dim)]" />
           No vendors found in this view.
         </div>
       ) : (
@@ -422,7 +422,7 @@ export function VendorsPage() {
           {filteredVendors.map((v, idx) => (
             <div
               key={v.id}
-              className="border border-gray-200 dark:border-admin-border-dark bg-white dark:bg-admin-surface-dark p-4 shadow-xs transition-colors hover:border-emerald-600/40"
+              className="border border-[var(--border-main)] bg-[var(--bg-surface)] p-4 shadow-xs transition-colors hover:border-emerald-600/40"
               style={{ borderRadius: 0 }}
             >
               <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-4">
@@ -430,12 +430,12 @@ export function VendorsPage() {
                 <div className="space-y-1.5 flex-1 min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
                     <span
-                      className="px-2 py-0.5 text-xs font-mono font-bold bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300"
+                      className="px-2 py-0.5 text-xs font-mono font-bold bg-[var(--bg-surface-subtle)] text-[var(--text-heading)] border border-[var(--border-main)]"
                       style={{ borderRadius: 0 }}
                     >
                       #{idx + 1}
                     </span>
-                    <h3 className="text-base font-black text-gray-900 dark:text-white">{v.name}</h3>
+                    <h3 className="text-base font-black text-[var(--text-heading)]">{v.name}</h3>
                     <Badge
                       variant={
                         v.approval_status === 'Approved'
@@ -470,23 +470,23 @@ export function VendorsPage() {
                     )}
                   </div>
 
-                  <p className="text-xs text-gray-600 dark:text-gray-400 font-medium">
-                    Owner: <b className="text-gray-900 dark:text-gray-200">{v.shopkeeper_name}</b> ·
+                  <p className="text-xs text-[var(--text-muted)] font-medium">
+                    Owner: <b className="text-[var(--text-heading)]">{v.shopkeeper_name}</b> ·
                     Category: <span className="text-emerald-700 dark:text-emerald-400">{v.category}</span>
                   </p>
 
-                  <p className="text-xs text-gray-500 dark:text-gray-400 font-mono">
+                  <p className="text-xs text-[var(--text-muted)] font-mono">
                     Phone: {v.phone || '—'} {v.shopkeeper_email ? `· ${v.shopkeeper_email}` : ''}
                   </p>
 
                   <div className="flex flex-wrap items-center gap-3 pt-1 text-xs">
-                    <span className="font-semibold text-gray-700 dark:text-gray-300">
+                    <span className="font-semibold text-[var(--text-heading)]">
                       Today's Activity:
                     </span>
-                    <span className="text-gray-600 dark:text-gray-400 font-mono">
+                    <span className="text-[var(--text-muted)] font-mono">
                       {v.orders_today || 0} orders
                     </span>
-                    <span className="text-gray-400">·</span>
+                    <span className="text-[var(--text-dim)]">·</span>
                     <span className="text-emerald-700 dark:text-emerald-400 font-bold font-mono">
                       ₹{v.revenue_today || 0} volume
                     </span>
@@ -502,7 +502,7 @@ export function VendorsPage() {
                           No UPI Configured
                         </Badge>
                       )}
-                      <Badge variant={v.cod_enabled ? 'info' : 'default'} size="xs">
+                      <Badge variant={v.cod_enabled ? 'gold' : 'default'} size="xs">
                         COD: {v.cod_enabled ? 'Enabled' : 'Disabled'}
                       </Badge>
                     </div>
@@ -510,7 +510,7 @@ export function VendorsPage() {
                 </div>
 
                 {/* Operations & Action Buttons */}
-                <div className="flex flex-wrap items-center gap-2 shrink-0 border-t lg:border-t-0 pt-3 lg:pt-0 border-gray-100 dark:border-admin-border-darkSubtle">
+                <div className="flex flex-wrap items-center gap-2 shrink-0 border-t lg:border-t-0 pt-3 lg:pt-0 border-[var(--border-subtle)]">
                   {v.approval_status === 'Pending Approval' && (
                     <>
                       <Button
@@ -657,9 +657,9 @@ export function VendorsPage() {
           }
         >
           {productsLoading ? (
-            <p className="py-8 text-center text-xs text-gray-500">Loading catalog...</p>
+            <p className="py-8 text-center text-xs text-[var(--text-muted)]">Loading catalog...</p>
           ) : products.length === 0 ? (
-            <div className="text-center py-8 text-xs text-gray-500">
+            <div className="text-center py-8 text-xs text-[var(--text-muted)]">
               No products or combos added yet. Click "Add Food Item / Combo" to populate the menu.
             </div>
           ) : (
@@ -667,12 +667,12 @@ export function VendorsPage() {
               {products.map(p => (
                 <div
                   key={p.id}
-                  className="flex items-start justify-between gap-3 p-3 border border-gray-200 dark:border-admin-border-dark bg-gray-50/50 dark:bg-admin-surface-darkSubtle/40"
+                  className="flex items-start justify-between gap-3 p-3 border border-[var(--border-main)] bg-[var(--bg-surface-subtle)]"
                   style={{ borderRadius: 0 }}
                 >
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
-                      <span className="font-bold text-sm text-gray-900 dark:text-white truncate">
+                      <span className="font-bold text-sm text-[var(--text-heading)] truncate">
                         {p.name}
                       </span>
                       {Boolean(p.is_combo) && (
@@ -685,7 +685,7 @@ export function VendorsPage() {
                       </Badge>
                     </div>
 
-                    <p className="text-xs text-gray-600 dark:text-gray-400 mt-0.5">
+                    <p className="text-xs text-[var(--text-muted)] mt-0.5">
                       <span className="font-mono font-bold text-emerald-700 dark:text-emerald-400">
                         ₹{p.price}
                       </span>{' '}
@@ -693,7 +693,7 @@ export function VendorsPage() {
                     </p>
 
                     {p.description && (
-                      <p className="text-xs text-gray-500 line-clamp-1 mt-0.5">{p.description}</p>
+                      <p className="text-xs text-[var(--text-muted)] line-clamp-1 mt-0.5">{p.description}</p>
                     )}
 
                     {Boolean(p.is_combo) && p.combo_items && (
@@ -786,7 +786,7 @@ export function VendorsPage() {
               />
 
               <div>
-                <label className="block text-xs font-bold uppercase tracking-wider text-gray-700 dark:text-gray-300 mb-1.5">
+                <label className="block text-xs font-bold uppercase tracking-wider text-[var(--text-heading)] mb-1.5">
                   Category
                 </label>
                 {productForm.is_combo ? (
@@ -800,11 +800,11 @@ export function VendorsPage() {
                   <select
                     value={productForm.category}
                     onChange={e => setProductForm({ ...productForm, category: e.target.value })}
-                    className="w-full bg-white dark:bg-admin-surface-dark border border-gray-300 dark:border-admin-border-dark px-3 py-2 text-sm text-gray-900 dark:text-white outline-none focus:border-emerald-600"
+                    className="w-full bg-[var(--bg-surface)] border border-[var(--border-main)] px-3 py-2 text-sm text-[var(--text-heading)] outline-none focus:border-emerald-600 transition-colors"
                     style={{ borderRadius: 0 }}
                   >
                     {['Food', 'Drinks', 'Snacks', 'Dessert', 'Other'].map(c => (
-                      <option key={c} value={c}>
+                      <option key={c} value={c} className="bg-[var(--bg-surface)] text-[var(--text-heading)]">
                         {c}
                       </option>
                     ))}
@@ -822,7 +822,7 @@ export function VendorsPage() {
 
             {/* Combo Toggle */}
             <div
-              className="p-3 border border-gray-200 dark:border-admin-border-dark bg-gray-50/50 dark:bg-admin-surface-darkSubtle/30"
+              className="p-3 border border-[var(--border-main)] bg-[var(--bg-surface-subtle)]"
               style={{ borderRadius: 0 }}
             >
               <label className="flex items-start gap-2.5 cursor-pointer">
@@ -840,10 +840,10 @@ export function VendorsPage() {
                   style={{ borderRadius: 0 }}
                 />
                 <div>
-                  <span className="block text-xs font-bold text-gray-900 dark:text-white">
+                  <span className="block text-xs font-bold text-[var(--text-heading)]">
                     This is a combo bundle (One price, multiple items)
                   </span>
-                  <span className="block text-[11px] text-gray-500">
+                  <span className="block text-[11px] text-[var(--text-muted)]">
                     Students will see all individual included items displayed on the menu.
                   </span>
                 </div>
@@ -851,7 +851,7 @@ export function VendorsPage() {
 
               {productForm.is_combo && (
                 <div className="mt-3">
-                  <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 mb-1">
+                  <label className="block text-xs font-bold text-[var(--text-heading)] mb-1">
                     Items Included in this Combo (One per line)
                   </label>
                   <textarea
@@ -861,7 +861,7 @@ export function VendorsPage() {
                       setProductForm({ ...productForm, combo_items: e.target.value })
                     }
                     placeholder={'1x Veg Biryani\n1x Soft Drink (250ml)\n1x Gulab Jamun'}
-                    className="w-full bg-white dark:bg-admin-surface-dark border border-gray-300 dark:border-admin-border-dark p-2 text-xs text-gray-900 dark:text-white outline-none focus:border-emerald-600"
+                    className="w-full bg-[var(--bg-surface)] border border-[var(--border-main)] p-2 text-xs text-[var(--text-heading)] placeholder:text-[var(--text-dim)] outline-none focus:border-emerald-600"
                     style={{ borderRadius: 0 }}
                   />
                 </div>
@@ -877,7 +877,7 @@ export function VendorsPage() {
                 className="h-4 w-4 accent-emerald-600"
                 style={{ borderRadius: 0 }}
               />
-              <span className="text-xs font-bold text-gray-800 dark:text-gray-200">
+              <span className="text-xs font-bold text-[var(--text-heading)]">
                 Item is available for ordering immediately
               </span>
             </label>
@@ -952,7 +952,7 @@ export function VendorsPage() {
                   className="h-4 w-4 accent-emerald-600"
                   style={{ borderRadius: 0 }}
                 />
-                <span className="text-xs font-bold text-gray-800 dark:text-gray-200">
+                <span className="text-xs font-bold text-[var(--text-heading)]">
                   Enable UPI Payments for this shop
                 </span>
               </label>
@@ -967,7 +967,7 @@ export function VendorsPage() {
                   className="h-4 w-4 accent-emerald-600"
                   style={{ borderRadius: 0 }}
                 />
-                <span className="text-xs font-bold text-gray-800 dark:text-gray-200">
+                <span className="text-xs font-bold text-[var(--text-heading)]">
                   Enable Cash on Delivery (COD)
                 </span>
               </label>
@@ -991,15 +991,15 @@ export function VendorsPage() {
           }
         >
           {todayLoading ? (
-            <p className="py-8 text-center text-xs text-gray-500">Loading today's orders...</p>
+            <p className="py-8 text-center text-xs text-[var(--text-muted)]">Loading today's orders...</p>
           ) : todayOrders.length === 0 ? (
-            <p className="py-8 text-center text-xs text-gray-500">
+            <p className="py-8 text-center text-xs text-[var(--text-muted)]">
               No orders placed for this shop yet today.
             </p>
           ) : (
             <div className="space-y-2 max-h-[60vh] overflow-y-auto">
               <table className="w-full text-xs text-left">
-                <thead className="bg-gray-100 dark:bg-admin-surface-darkSubtle border-b border-gray-200 dark:border-admin-border-dark font-bold text-gray-600 dark:text-gray-400">
+                <thead className="bg-[var(--bg-surface-subtle)] border-b border-[var(--border-main)] font-bold text-[var(--text-muted)]">
                   <tr>
                     <th className="p-2">Token</th>
                     <th className="p-2">Customer</th>
@@ -1009,21 +1009,21 @@ export function VendorsPage() {
                     <th className="p-2">Placed</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-gray-100 dark:divide-admin-border-darkSubtle">
+                <tbody className="divide-y divide-[var(--border-subtle)] text-[var(--text-body)]">
                   {todayOrders.map(o => (
                     <tr key={o.id}>
-                      <td className="p-2 font-mono font-bold">#{o.token}</td>
-                      <td className="p-2">{o.student_name}</td>
+                      <td className="p-2 font-mono font-bold text-[var(--text-heading)]">#{o.token}</td>
+                      <td className="p-2 text-[var(--text-heading)]">{o.student_name}</td>
                       <td className="p-2">
                         <OrderItemsCell items={o.items} />
                       </td>
-                      <td className="p-2 text-right font-mono font-bold">₹{o.total}</td>
+                      <td className="p-2 text-right font-mono font-bold text-[var(--text-heading)]">₹{o.total}</td>
                       <td className="p-2">
                         <Badge variant="default" size="xs">
                           {o.status}
                         </Badge>
                       </td>
-                      <td className="p-2 text-gray-500">{fmtTime(o.created_at)}</td>
+                      <td className="p-2 text-[var(--text-muted)]">{fmtTime(o.created_at)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -1048,27 +1048,27 @@ export function VendorsPage() {
           }
         >
           {logsLoading ? (
-            <p className="py-8 text-center text-xs text-gray-500">Loading shop logs...</p>
+            <p className="py-8 text-center text-xs text-[var(--text-muted)]">Loading shop logs...</p>
           ) : !logsData ? (
-            <p className="py-8 text-center text-xs text-gray-500">No logs available for this shop.</p>
+            <p className="py-8 text-center text-xs text-[var(--text-muted)]">No logs available for this shop.</p>
           ) : (
-            <div className="space-y-4">
+            <div className="space-y-4 text-[var(--text-body)]">
               <div className="grid grid-cols-3 gap-3">
                 <div
-                  className="p-3 border border-gray-200 dark:border-admin-border-dark bg-gray-50 dark:bg-admin-surface-darkSubtle"
+                  className="p-3 border border-[var(--border-main)] bg-[var(--bg-surface-subtle)]"
                   style={{ borderRadius: 0 }}
                 >
-                  <p className="text-[10px] uppercase font-bold text-gray-500">Total Volume</p>
-                  <p className="text-lg font-black text-gray-900 dark:text-white font-mono mt-0.5">
+                  <p className="text-[10px] uppercase font-bold text-[var(--text-muted)]">Total Volume</p>
+                  <p className="text-lg font-black text-[var(--text-heading)] font-mono mt-0.5">
                     ₹{(logsData.summary?.total_revenue || 0).toLocaleString('en-IN')}
                   </p>
                 </div>
                 <div
-                  className="p-3 border border-gray-200 dark:border-admin-border-dark bg-gray-50 dark:bg-admin-surface-darkSubtle"
+                  className="p-3 border border-[var(--border-main)] bg-[var(--bg-surface-subtle)]"
                   style={{ borderRadius: 0 }}
                 >
-                  <p className="text-[10px] uppercase font-bold text-gray-500">Total Orders</p>
-                  <p className="text-lg font-black text-gray-900 dark:text-white font-mono mt-0.5">
+                  <p className="text-[10px] uppercase font-bold text-[var(--text-muted)]">Total Orders</p>
+                  <p className="text-lg font-black text-[var(--text-heading)] font-mono mt-0.5">
                     {logsData.summary?.total_orders || 0}
                   </p>
                 </div>
@@ -1086,27 +1086,27 @@ export function VendorsPage() {
               </div>
 
               {logsData.daily && logsData.daily.length > 0 && (
-                <div className="border border-gray-200 dark:border-admin-border-dark overflow-x-auto">
+                <div className="border border-[var(--border-main)] overflow-x-auto">
                   <table className="w-full text-xs text-left">
-                    <thead className="bg-gray-100 dark:bg-admin-surface-darkSubtle font-bold">
+                    <thead className="bg-[var(--bg-surface-subtle)] border-b border-[var(--border-main)] font-bold text-[var(--text-muted)]">
                       <tr>
                         <th className="p-2.5">Date</th>
                         <th className="p-2.5">Orders</th>
                         <th className="p-2.5">Volume</th>
-                        <th className="p-2.5 text-amber-600">Admin Share</th>
-                        <th className="p-2.5 text-emerald-600">Vendor Keeps</th>
+                        <th className="p-2.5 text-amber-600 dark:text-amber-400">Admin Share</th>
+                        <th className="p-2.5 text-emerald-600 dark:text-emerald-400">Vendor Keeps</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-gray-100 dark:divide-admin-border-darkSubtle">
+                    <tbody className="divide-y divide-[var(--border-subtle)] text-[var(--text-body)]">
                       {logsData.daily.map((d: any) => (
                         <tr key={d.created_at}>
-                          <td className="p-2.5 font-mono">{d.created_at}</td>
-                          <td className="p-2.5">{d.count}</td>
-                          <td className="p-2.5 font-mono font-bold">₹{d.revenue || 0}</td>
-                          <td className="p-2.5 font-mono font-bold text-amber-600">
+                          <td className="p-2.5 font-mono text-[var(--text-heading)]">{d.created_at}</td>
+                          <td className="p-2.5 text-[var(--text-heading)]">{d.count}</td>
+                          <td className="p-2.5 font-mono font-bold text-[var(--text-heading)]">₹{d.revenue || 0}</td>
+                          <td className="p-2.5 font-mono font-bold text-amber-600 dark:text-amber-400">
                             ₹{d.admin_fee || 0}
                           </td>
-                          <td className="p-2.5 font-mono font-bold text-emerald-600">
+                          <td className="p-2.5 font-mono font-bold text-emerald-600 dark:text-emerald-400">
                             ₹{Math.max(0, (d.revenue || 0) - (d.admin_fee || 0))}
                           </td>
                         </tr>

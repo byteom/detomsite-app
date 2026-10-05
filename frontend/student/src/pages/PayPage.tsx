@@ -36,6 +36,25 @@ import {
 
 const DRAFT_ATTEMPTS = 4
 const ORDER_WRITE_TIMEOUT_MS = 60000
+// Explicit HTTP timeout for the order POST. Writes are never retried, and a
+// client_ref makes them idempotent — so a slow-but-successful order must not
+// be reported as failed (that is what used to create "paid but no order"
+// panic). 30 s bounds the hang while surviving cold-start slowness.
+const ORDER_HTTP_TIMEOUT_MS = 30000
+
+interface CheckoutData {
+  shops: Shop[]
+  products: Record<string, Product[]>
+  payment_settings: PaymentSettings
+}
+
+// Short module-level cache for checkout-data, keyed by cart contents.
+// Remounts (back-navigation, auth re-checks) within 30 s reuse the quote
+// instead of re-paying a full checkout-data read. The backend re-prices
+// authoritatively at submit, so a seconds-old quote can never mis-charge —
+// and any cart change busts the key and refetches.
+const checkoutCache = new Map<string, { t: number; data: CheckoutData }>()
+const CHECKOUT_TTL_MS = 30000
 
 export function PayPage() {
   const navigate = useNavigate()
@@ -67,48 +86,56 @@ export function PayPage() {
 
   const cartKey = items.map((i) => i.product_id).join(',')
 
-  // Load live prices & shop payment details in one call
+  // Load live prices & shop payment details in one call.
+  // Served from the short cart-scoped cache on remounts (see above).
   useEffect(() => {
     if (!items.length) {
       setLoading(false)
       return
     }
-    const shopIds = Array.from(new Set(items.map((i) => i.shop_id)))
-    api
-      .get<{
-        shops: Shop[]
-        products: Record<string, Product[]>
-        payment_settings: PaymentSettings
-      }>('/local/checkout-data', { params: { shop_ids: shopIds.join(',') } })
-      .then(({ data }) => {
-        setPs(data?.payment_settings || null)
-        const list = Array.isArray(data?.shops) ? data.shops : []
-        const byId =
-          data?.products && typeof data.products === 'object' ? data.products : {}
-        const results = shopIds.map((id) => ({
-          id,
-          products: Array.isArray(byId[id]) ? byId[id] : [],
-          shop: list.find((s) => s.id === id) as Shop,
-        }))
+    const apply = (data: CheckoutData) => {
+      setPs(data?.payment_settings || null)
+      const list = Array.isArray(data?.shops) ? data.shops : []
+      const byId =
+        data?.products && typeof data.products === 'object' ? data.products : {}
+      const results = shopIds.map((id) => ({
+        id,
+        products: Array.isArray(byId[id]) ? byId[id] : [],
+        shop: list.find((s) => s.id === id) as Shop,
+      }))
 
-        const prices: Record<string, number> = {}
-        let anyMissing = false
-        for (const item of items) {
-          const group = results.find((r) => r.id === item.shop_id)
-          const product = group?.products.find((p) => p.id === item.product_id)
-          if (!product || !product.available) {
-            anyMissing = true
-            continue
-          }
-          prices[item.product_id] = Number(product.price) * (item.quantity || 1)
+      const prices: Record<string, number> = {}
+      let anyMissing = false
+      for (const item of items) {
+        const group = results.find((r) => r.id === item.shop_id)
+        const product = group?.products.find((p) => p.id === item.product_id)
+        if (!product || !product.available) {
+          anyMissing = true
+          continue
         }
-        if (anyMissing) {
-          setErr(
-            'An item in your cart is no longer available. Please return to your cart and remove it.'
-          )
-        }
-        setLive(prices)
-        setShop(results[0]?.shop ?? null)
+        prices[item.product_id] = Number(product.price) * (item.quantity || 1)
+      }
+      if (anyMissing) {
+        setErr(
+          'An item in your cart is no longer available. Please return to your cart and remove it.'
+        )
+      }
+      setLive(prices)
+      setShop(results[0]?.shop ?? null)
+    }
+
+    const shopIds = Array.from(new Set(items.map((i) => i.shop_id)))
+    const hit = checkoutCache.get(cartKey)
+    if (hit && Date.now() - hit.t < CHECKOUT_TTL_MS) {
+      apply(hit.data)
+      setLoading(false)
+      return
+    }
+    api
+      .get<CheckoutData>('/local/checkout-data', { params: { shop_ids: shopIds.join(',') } })
+      .then(({ data }) => {
+        checkoutCache.set(cartKey, { t: Date.now(), data })
+        apply(data)
       })
       .catch(() =>
         setErr(
@@ -165,30 +192,47 @@ export function PayPage() {
       if (!shopGroups[item.shop_id]) shopGroups[item.shop_id] = []
       shopGroups[item.shop_id].push(item)
     }
-    const created: Order[] = []
-    for (const [shopId, shopItems] of Object.entries(shopGroups)) {
+    // One POST per shop, all in flight together. The old sequential
+    // for-await multiplied a multi-shop submit by N server round trips.
+    // Parallel is safe: every group carries its own client_ref, so the
+    // server's idempotency guard still dedupes per-shop retries.
+    const postOne = async ([shopId, shopItems]: [string, CartItem[]]) => {
       const shopTotal = shopItems.reduce(
         (a, i) => a + (live?.[i.product_id] ?? i.price * (i.quantity || 1)),
         0
       )
-      const order = await api.post<Order>('/local/orders', {
-        shop_id: shopId,
-        items: shopItems.map((i) => ({
-          product_id: i.product_id,
-          quantity: i.quantity || 1,
-        })),
-        student_name: user.name || 'Student',
-        student_phone: toE164(phone),
-        delivery_location: loc,
-        delivery_slot: slot,
-        payment_method: method === 'cod' ? 'COD' : 'UPI',
-        total: shopTotal,
-        client_ref: checkoutRef(shopItems, method),
-        timeout: ORDER_WRITE_TIMEOUT_MS,
-      })
-      created.push(order.data)
+      const order = await api.post<Order>(
+        '/local/orders',
+        {
+          shop_id: shopId,
+          items: shopItems.map((i) => ({
+            product_id: i.product_id,
+            quantity: i.quantity || 1,
+          })),
+          student_name: user.name || 'Student',
+          student_phone: toE164(phone),
+          delivery_location: loc,
+          delivery_slot: slot,
+          payment_method: method === 'cod' ? 'COD' : 'UPI',
+          total: shopTotal,
+          client_ref: checkoutRef(shopItems, method),
+          timeout: ORDER_WRITE_TIMEOUT_MS,
+        },
+        { timeout: ORDER_HTTP_TIMEOUT_MS }
+      )
+      return { shopId, order: order.data }
     }
-    return created
+    const settled = await Promise.all(
+      Object.entries(shopGroups).map(postOne)
+    )
+    // Keep the original deterministic order (first shop group first) so the
+    // post-submit navigation lands on the same order as before.
+    settled.sort(
+      (a, b) =>
+        Object.keys(shopGroups).indexOf(a.shopId) -
+        Object.keys(shopGroups).indexOf(b.shopId)
+    )
+    return settled.map((s) => s.order)
   }
 
   // Create UPI draft order up-front

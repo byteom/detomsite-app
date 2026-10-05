@@ -21,6 +21,8 @@ import asyncio
 import logging
 from typing import Any, Callable
 
+from app.core.db_executor import run_db
+
 logger = logging.getLogger(__name__)
 
 # International SMS length cap (160 ASCII chars). Longer messages are split by
@@ -209,7 +211,7 @@ async def send_sms_async(
     if not phone or not phone.strip():
         return False
     try:
-        await asyncio.to_thread(log_fn, sub_order_id, phone, message, "Sent")
+        await run_db(log_fn, sub_order_id, phone, message, "Sent")
         logger.info(f"SMS → {phone}: {message.splitlines()[0]}")
         return True
     except Exception as e:
@@ -257,7 +259,7 @@ async def send_whatsapp_confirmed(
         # Persist FIRST so the message is queued even if the gateway call below
         # fails or the process is frozen right after the response — nothing is
         # ever silently lost.
-        created = await asyncio.to_thread(
+        created = await run_db(
             db.log_whatsapp,
             sub_order_id=order["id"],
             phone=phone,
@@ -272,7 +274,7 @@ async def send_whatsapp_confirmed(
                 whatsapp_service.send_whatsapp, phone, message, None, order["id"]
             )
             if sent:
-                await asyncio.to_thread(db.mark_whatsapp_sent, row_id)
+                await run_db(db.mark_whatsapp_sent, row_id)
                 logger.info(f"Order {order['id']}: confirmation WhatsApp auto-sent to {phone}")
                 return True
         logger.info(f"Order {order['id']}: confirmation WhatsApp queued for {phone}")

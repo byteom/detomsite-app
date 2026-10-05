@@ -528,7 +528,7 @@ export function ProfilePage() {
               {favoriteShopList.length > 0 ? (
                 <div className="grid gap-4 sm:grid-cols-2">
                   {favoriteShopList.map((shop) => (
-                    <ShopCard key={shop.id} shop={shop} />
+                    <ShopCard key={shop.id} shop={shop} favorite />
                   ))}
                 </div>
               ) : (

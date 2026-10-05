@@ -1,5 +1,6 @@
 import { BrowserRouter as Router, Routes, Route, Link } from 'react-router-dom'
 import { lazy, Suspense } from 'react'
+import { ScrollToTop } from './components/ScrollToTop'
 import './App.css'
 
 const Home = lazy(() => import('./pages/Home').then(m => ({ default: m.Home })))
@@ -124,6 +125,7 @@ function NotFound() {
 function App() {
   return (
     <Router>
+      <ScrollToTop />
       <Suspense fallback={<PageSpinner />}>
         <Routes>
           {/* Portal landing selector - no auth needed */}

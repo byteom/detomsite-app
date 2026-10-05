@@ -72,3 +72,21 @@ export function fmtCurrency(amount: number | string | undefined | null): string 
   const num = Number(amount) || 0
   return `₹${num.toLocaleString('en-IN')}`
 }
+
+export function fmtRelativeTime(createdAt?: string): string {
+  const raw = String(createdAt || '').trim()
+  if (!raw) return '—'
+  let iso = raw
+  if (!/T/.test(raw) && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(raw)) {
+    iso = raw.replace(' ', 'T') + '+05:30'
+  }
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return fmtTime(raw)
+  const diffSec = Math.floor((Date.now() - d.getTime()) / 1000)
+  if (diffSec < 60) return 'Just now'
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`
+  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`
+  if (diffSec < 86400 * 30) return `${Math.floor(diffSec / 86400)}d ago`
+  return fmtDateOnly(raw)
+}
+

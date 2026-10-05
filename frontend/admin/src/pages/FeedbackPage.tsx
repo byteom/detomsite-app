@@ -1,14 +1,14 @@
 import React, { useState, useEffect } from 'react'
 import {
   MessageCircleQuestion,
-  Bug,
-  Lightbulb,
-  Sparkles,
-  MessageSquare,
+  Search,
+  Filter,
   Trash2,
   CheckCircle,
+  Clock,
+  AlertTriangle,
   RefreshCw,
-  Search,
+  ExternalLink,
 } from 'lucide-react'
 import api from '../services/api'
 import { apiError, fmtTime } from '../utils/formatters'
@@ -18,37 +18,10 @@ import { StatCard } from '../components/ui/StatCard'
 import { DataTable, Column } from '../components/ui/DataTable'
 import { ConfirmDialog } from '../components/ui/ConfirmDialog'
 
-const FEEDBACK_STATUSES = ['Open', 'In Review', 'Fixed', "Won't Fix"] as const
-
-const FEEDBACK_CATEGORIES: Record<
-  string,
-  { label: string; icon: React.ReactNode; variant: BadgeVariant }
-> = {
-  Bug: {
-    label: 'Bug',
-    icon: <Bug className="w-3 h-3" />,
-    variant: 'error',
-  },
-  Improvement: {
-    label: 'Improvement',
-    icon: <Lightbulb className="w-3 h-3" />,
-    variant: 'gold',
-  },
-  Suggestion: {
-    label: 'Suggestion',
-    icon: <Sparkles className="w-3 h-3" />,
-    variant: 'success',
-  },
-  Other: {
-    label: 'Other',
-    icon: <MessageSquare className="w-3 h-3" />,
-    variant: 'info',
-  },
-}
+const FEEDBACK_STATUSES = ['Open', 'In Review', 'Fixed', 'Dismissed']
 
 export function FeedbackPage() {
   const [items, setItems] = useState<any[]>([])
-  const [atsCount, setAtsCount] = useState(0)
   const [loading, setLoading] = useState(true)
   const [statusFilter, setStatusFilter] = useState('all')
   const [msg, setMsg] = useState('')
@@ -56,103 +29,99 @@ export function FeedbackPage() {
   const [showClearAtsConfirm, setShowClearAtsConfirm] = useState(false)
   const [clearingAts, setClearingAts] = useState(false)
 
-  const loadData = async () => {
+  const loadData = () => {
     setLoading(true)
-    try {
-      const [userRes, atsRes] = await Promise.all([
-        api.get('/admin/feedback', { params: { source: 'User' } }),
-        api.get('/admin/feedback', { params: { source: 'ATS' } }),
-      ])
-      setItems(userRes.data || [])
-      setAtsCount(atsRes.data?.length || 0)
-    } catch (e: any) {
-      setErr(apiError(e, 'Could not fetch student feedback'))
-    } finally {
-      setLoading(false)
-    }
+    api
+      .get('/admin/feedback')
+      .then(r => setItems(r.data || []))
+      .catch(e => setErr(apiError(e, 'Could not load feedback submissions')))
+      .finally(() => setLoading(false))
   }
 
   useEffect(() => {
     loadData()
   }, [])
 
-  const handleClearAts = async () => {
-    setClearingAts(true)
-    try {
-      await api.delete('/admin/feedback', { params: { source: 'ATS' } })
-      setMsg('Purged automated test tickets. Only authentic student submissions remain.')
-      setAtsCount(0)
-    } catch (e: any) {
-      setErr(apiError(e, 'Could not clear test entries'))
-    } finally {
-      setClearingAts(false)
-      setShowClearAtsConfirm(false)
-    }
-  }
-
   const handleUpdateStatus = async (id: string, newStatus: string) => {
+    setMsg('')
+    setErr('')
     try {
       await api.patch(`/admin/feedback/${id}`, { status: newStatus })
       setMsg(`Ticket updated to "${newStatus}".`)
-      setItems(prev => prev.map(x => (x.id === id ? { ...x, status: newStatus } : x)))
+      setItems(prev => prev.map(f => (f.id === id ? { ...f, status: newStatus } : f)))
     } catch (e: any) {
       setErr(apiError(e, 'Failed to update ticket status'))
     }
   }
 
-  const counts = FEEDBACK_STATUSES.reduce<Record<string, number>>((acc, s) => {
-    acc[s] = items.filter(i => i.status === s).length
-    return acc
-  }, {})
+  const handleClearAts = async () => {
+    setClearingAts(true)
+    setMsg('')
+    setErr('')
+    try {
+      const r = await api.delete('/admin/feedback/clear-ats')
+      setMsg(r.data?.message || 'ATS feedback records cleared.')
+      setShowClearAtsConfirm(false)
+      loadData()
+    } catch (e: any) {
+      setErr(apiError(e, 'Failed to clear ATS feedback'))
+    } finally {
+      setClearingAts(false)
+    }
+  }
 
-  const filteredItems = items.filter(i => {
-    if (statusFilter !== 'all' && i.status !== statusFilter) return false
+  const filteredItems = items.filter(f => {
+    if (statusFilter !== 'all' && f.status !== statusFilter) return false
     return true
   })
+
+  const atsCount = items.filter(
+    f =>
+      String(f.subject || '').includes('[ATS]') ||
+      String(f.name || '').includes('Test') ||
+      String(f.username || '').includes('ats')
+  ).length
+
+  const openCount = items.filter(f => f.status === 'Open' || !f.status).length
+  const inReviewCount = items.filter(f => f.status === 'In Review').length
+  const fixedCount = items.filter(f => f.status === 'Fixed').length
 
   const columns: Column<any>[] = [
     {
       key: 'reporter',
-      header: 'Submitted By',
+      header: 'Reporter',
       sortable: true,
       render: (f: any) => (
         <div>
-          <p className="font-semibold text-gray-900 dark:text-white">
+          <p className="font-semibold text-[var(--text-heading)]">
             {f.name || f.username || 'Anonymous'}
           </p>
-          <p className="text-[11px] text-gray-500 font-mono">@{f.username || 'student'}</p>
-          {f.email && <p className="text-[11px] text-gray-400 font-mono">{f.email}</p>}
+          {f.email && <p className="text-[11px] text-[var(--text-muted)]">{f.email}</p>}
         </div>
       ),
     },
     {
-      key: 'category',
-      header: 'Category',
+      key: 'type',
+      header: 'Type',
       sortable: true,
-      align: 'center',
       render: (f: any) => {
-        const cat = FEEDBACK_CATEGORIES[f.category] || FEEDBACK_CATEGORIES.Other
+        const isBug = String(f.type || f.subject || '').toLowerCase().includes('bug')
         return (
-          <Badge variant={cat.variant} size="xs">
-            <span className="flex items-center gap-1">
-              {cat.icon}
-              {cat.label}
-            </span>
+          <Badge variant={isBug ? 'error' : 'info'} size="xs">
+            {f.type || (isBug ? 'Bug' : 'Feedback')}
           </Badge>
         )
       },
     },
     {
       key: 'subject',
-      header: 'Subject & Description',
+      header: 'Subject & Details',
       render: (f: any) => (
         <div className="max-w-md">
-          <p className="font-bold text-gray-900 dark:text-white text-xs">{f.subject}</p>
-          <p className="mt-1 text-xs text-gray-600 dark:text-gray-400 line-clamp-2" title={f.message}>
-            {f.message}
-          </p>
+          <p className="font-bold text-[var(--text-heading)] text-xs">{f.subject}</p>
+          <p className="text-xs text-[var(--text-muted)] line-clamp-2 mt-0.5">{f.message}</p>
           {f.page && (
-            <span className="inline-block mt-1 text-[10px] text-gray-400 font-mono">
+            <span className="inline-block mt-1 text-[10px] text-[var(--text-dim)] font-mono">
               Page: {f.page}
             </span>
           )}
@@ -161,12 +130,11 @@ export function FeedbackPage() {
     },
     {
       key: 'status',
-      header: 'Triage Status',
+      header: 'Status',
       sortable: true,
-      align: 'center',
       render: (f: any) => {
-        const s = f.status
-        const variant =
+        const s = f.status || 'Open'
+        const variant: BadgeVariant =
           s === 'Fixed' ? 'success' : s === 'In Review' ? 'info' : s === 'Open' ? 'gold' : 'default'
         return <Badge variant={variant} size="xs">{s}</Badge>
       },
@@ -176,7 +144,7 @@ export function FeedbackPage() {
       header: 'Received',
       sortable: true,
       render: (f: any) => (
-        <span className="text-gray-500 font-mono text-xs whitespace-nowrap">
+        <span className="text-[var(--text-muted)] font-mono text-xs whitespace-nowrap">
           {fmtTime(f.created_at)}
         </span>
       ),
@@ -203,24 +171,24 @@ export function FeedbackPage() {
   ]
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 text-[var(--text-body)]">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-200 dark:border-admin-border-dark pb-4">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[var(--border-main)] pb-4">
         <div>
           <div className="flex items-center gap-2.5">
-            <h1 className="text-2xl font-black text-gray-900 dark:text-white tracking-tight">
+            <h1 className="text-2xl font-black text-[var(--text-heading)] tracking-tight">
               Feedback & Bug Reports
             </h1>
             <Badge variant="default" size="md">
               {items.length} Reports
             </Badge>
           </div>
-          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+          <p className="text-xs text-[var(--text-muted)] mt-0.5">
             Student bug disclosures, UI improvement submissions, and feature suggestions
           </p>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex items-center gap-2">
           {atsCount > 0 && (
             <Button
               variant="danger"
@@ -228,7 +196,7 @@ export function FeedbackPage() {
               onClick={() => setShowClearAtsConfirm(true)}
               icon={<Trash2 className="w-3.5 h-3.5" />}
             >
-              Clear Test Data ({atsCount})
+              Clear ATS ({atsCount})
             </Button>
           )}
 
@@ -246,44 +214,43 @@ export function FeedbackPage() {
       {/* Messages */}
       {msg && (
         <div
-          className="p-3.5 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-800 text-xs font-semibold text-emerald-800 dark:text-emerald-300"
+          className="p-3 bg-emerald-500/10 border border-emerald-500/30 text-xs font-semibold text-emerald-800 dark:text-emerald-300"
           style={{ borderRadius: 0 }}
         >
           {msg}
         </div>
       )}
-
       {err && (
         <div
-          className="p-3.5 bg-red-50 dark:bg-red-950/40 border border-red-300 dark:border-red-800 text-xs font-semibold text-red-800 dark:text-red-300"
+          className="p-3 bg-red-500/10 border border-red-500/30 text-xs font-semibold text-red-800 dark:text-red-300"
           style={{ borderRadius: 0 }}
         >
           {err}
         </div>
       )}
 
-      {/* KPI Status Strip */}
+      {/* KPI Cards */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3.5">
         <StatCard
           title="Open Tickets"
-          value={counts['Open'] || 0}
-          subtitle="Awaiting administrative review"
-          icon={<Bug className="w-5 h-5" />}
+          value={openCount}
+          subtitle="Awaiting review"
+          icon={<AlertTriangle className="w-5 h-5" />}
           variant="gold"
         />
 
         <StatCard
           title="In Review"
-          value={counts['In Review'] || 0}
-          subtitle="Currently being investigated"
-          icon={<Lightbulb className="w-5 h-5" />}
+          value={inReviewCount}
+          subtitle="Currently triaged"
+          icon={<Clock className="w-5 h-5" />}
           variant="info"
         />
 
         <StatCard
-          title="Resolved & Fixed"
-          value={counts['Fixed'] || 0}
-          subtitle="Applied to production releases"
+          title="Resolved"
+          value={fixedCount}
+          subtitle="Fixes released"
           icon={<CheckCircle className="w-5 h-5" />}
           variant="emerald"
         />
@@ -308,12 +275,12 @@ export function FeedbackPage() {
           <select
             value={statusFilter}
             onChange={e => setStatusFilter(e.target.value)}
-            className="bg-white dark:bg-admin-surface-dark border border-gray-300 dark:border-admin-border-dark px-2.5 py-1.5 text-xs text-gray-800 dark:text-gray-200 outline-none focus:border-emerald-600"
+            className="bg-[var(--bg-surface)] text-[var(--text-heading)] border border-[var(--border-main)] px-2.5 py-1.5 text-xs outline-none focus:border-emerald-600 transition-colors"
             style={{ borderRadius: 0 }}
           >
-            <option value="all">All Ticket Statuses</option>
+            <option value="all" className="bg-[var(--bg-surface)] text-[var(--text-heading)]">All Ticket Statuses</option>
             {FEEDBACK_STATUSES.map(s => (
-              <option key={s} value={s}>
+              <option key={s} value={s} className="bg-[var(--bg-surface)] text-[var(--text-heading)]">
                 {s}
               </option>
             ))}

@@ -51,7 +51,7 @@ export function RevenuePage() {
       header: 'Reporting Date',
       sortable: true,
       render: (d: any) => (
-        <span className="font-mono font-bold text-gray-900 dark:text-white">{d.created_at}</span>
+        <span className="font-mono font-bold text-[var(--text-heading)]">{d.created_at}</span>
       ),
     },
     {
@@ -60,7 +60,7 @@ export function RevenuePage() {
       sortable: true,
       align: 'center',
       render: (d: any) => (
-        <span className="font-mono text-gray-800 dark:text-gray-200">{d.count} orders</span>
+        <span className="font-mono font-medium text-[var(--text-body)]">{d.count} orders</span>
       ),
     },
     {
@@ -69,7 +69,7 @@ export function RevenuePage() {
       sortable: true,
       align: 'right',
       render: (d: any) => (
-        <span className="font-mono font-bold text-gray-900 dark:text-white">
+        <span className="font-mono font-bold text-[var(--text-heading)]">
           ₹{(d.revenue || 0).toLocaleString('en-IN')}
         </span>
       ),
@@ -99,14 +99,14 @@ export function RevenuePage() {
   ]
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 text-[var(--text-body)]">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-200 dark:border-admin-border-dark pb-4">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[var(--border-main)] pb-4">
         <div>
-          <h1 className="text-2xl font-black text-gray-900 dark:text-white tracking-tight">
+          <h1 className="text-2xl font-black text-[var(--text-heading)] tracking-tight">
             Revenue Analytics & Daily Logs
           </h1>
-          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+          <p className="text-xs text-[var(--text-muted)] mt-0.5">
             Historical transaction turnover, platform fee collections, and vendor payout ledgers
           </p>
         </div>
@@ -157,8 +157,8 @@ export function RevenuePage() {
         searchableKeys={['created_at']}
         filterSlot={
           <div className="flex items-center gap-2">
-            <div className="flex items-center gap-1.5 bg-white dark:bg-admin-surface-dark border border-gray-300 dark:border-admin-border-dark px-2 py-1">
-              <Calendar className="w-3.5 h-3.5 text-gray-400" />
+            <div className="flex items-center gap-1.5 bg-[var(--bg-surface)] border border-[var(--border-main)] px-2 py-1">
+              <Calendar className="w-3.5 h-3.5 text-[var(--text-dim)] shrink-0" />
               <input
                 type="date"
                 value={filterDate}
@@ -166,7 +166,7 @@ export function RevenuePage() {
                   setFilterDate(e.target.value)
                   loadData(e.target.value || undefined)
                 }}
-                className="bg-transparent text-xs text-gray-800 dark:text-gray-200 outline-none"
+                className="bg-transparent text-xs text-[var(--text-heading)] outline-none"
               />
             </div>
 

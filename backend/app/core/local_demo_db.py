@@ -497,6 +497,8 @@ def init_local_demo_db() -> None:
                 email TEXT DEFAULT '',
                 phone TEXT DEFAULT '',
                 role TEXT NOT NULL CHECK(role IN ('student','shopkeeper','admin')),
+                status TEXT NOT NULL DEFAULT 'active',
+                avatar_url TEXT DEFAULT '',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -827,6 +829,10 @@ def init_local_demo_db() -> None:
             connection.execute("ALTER TABLE users ADD COLUMN email TEXT DEFAULT ''")
         if not _column_exists(connection, "users", "phone"):
             connection.execute("ALTER TABLE users ADD COLUMN phone TEXT DEFAULT ''")
+        if not _column_exists(connection, "users", "status"):
+            connection.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+        if not _column_exists(connection, "users", "avatar_url"):
+            connection.execute("ALTER TABLE users ADD COLUMN avatar_url TEXT NOT NULL DEFAULT ''")
         if not _column_exists(connection, "shops", "upi_id"):
             connection.execute("ALTER TABLE shops ADD COLUMN upi_id TEXT DEFAULT ''")
         if not _column_exists(connection, "shops", "upi_enabled"):
@@ -1095,21 +1101,37 @@ def save_session(email: str, name: str, role: str) -> dict[str, Any]:
         return dict(row)
 
 
-def list_shops(public_only: bool = False, search: str | None = None) -> list[dict[str, Any]]:
+def list_shops(public_only: bool = False, search: str | None = None, limit: int | None = None, offset: int | None = None) -> list[dict[str, Any]]:
     with _connect() as connection:
         query = "SELECT * FROM shops"
         params = []
+        conditions = []
+        if public_only:
+            conditions.append("approval_status = 'Approved'")
         if search and search.strip():
             s = f"%{search.strip().lower()}%"
-            query += " WHERE (LOWER(name) LIKE ? OR LOWER(category) LIKE ? OR LOWER(description) LIKE ?)"
+            conditions.append("(LOWER(name) LIKE ? OR LOWER(category) LIKE ? OR LOWER(description) LIKE ?)")
             params.extend([s, s, s])
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY rating DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(1, min(int(limit), 500)))
+            if offset:
+                query += " OFFSET ?"
+                params.append(max(0, int(offset)))
+        elif offset:
+            query += " LIMIT -1 OFFSET ?"
+            params.append(max(0, int(offset)))
         rows = connection.execute(query, params).fetchall()
         shops = _rows_to_dicts(rows)
         if public_only:
             # Students see every APPROVED shop (open or closed) so they can browse
             # menus and see opening hours. Ordering is still blocked server-side
-            # for shops that are closed / not accepting orders.
+            # for shops that are closed / not accepting orders. The SQL above
+            # already filters approval_status; keep the Python guard (plus the
+            # is_removed check, which has no SQL equivalent here) as a backstop.
             return [shop for shop in shops if shop.get("approval_status") == "Approved" and shop.get("is_removed", 0) != 1]
         return shops
 
@@ -1333,7 +1355,7 @@ def update_share_payment_status(payment_id: str, status: str) -> dict[str, Any] 
         return dict(row) if row else None
 
 
-def list_products(shop_id: str | None = None, search: str | None = None) -> list[dict[str, Any]]:
+def list_products(shop_id: str | None = None, search: str | None = None, limit: int | None = None, offset: int | None = None) -> list[dict[str, Any]]:
     with _connect() as connection:
         query = "SELECT * FROM products"
         params = []
@@ -1348,8 +1370,56 @@ def list_products(shop_id: str | None = None, search: str | None = None) -> list
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY category, name"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(max(1, min(int(limit), 500)))
+            if offset:
+                query += " OFFSET ?"
+                params.append(max(0, int(offset)))
+        elif offset:
+            query += " LIMIT -1 OFFSET ?"
+            params.append(max(0, int(offset)))
         rows = connection.execute(query, params).fetchall()
         return _rows_to_dicts(rows)
+
+
+def menu_summary(keywords: list[str] | None = None) -> dict[str, Any]:
+    """Per-shop menu flags for the storefront browse page (test-store mirror)."""
+    kws = [k.strip().lower() for k in (keywords or []) if k and k.strip()][:5]
+    kws = [k[:30] for k in kws]
+    with _connect() as connection:
+        if kws:
+            conds = " OR ".join(["LOWER(name) LIKE ?"] * len(kws))
+            params = [f"%{k}%" for k in kws]
+            rows = connection.execute(
+                f"""
+                SELECT shop_id,
+                       COUNT(*) AS dishes,
+                       MAX(is_combo) AS has_combo,
+                       SUM(CASE WHEN {conds} THEN 1 ELSE 0 END) AS matched
+                FROM products
+                GROUP BY shop_id
+                """,
+                params,
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT shop_id,
+                       COUNT(*) AS dishes,
+                       MAX(is_combo) AS has_combo
+                FROM products
+                GROUP BY shop_id
+                """
+            ).fetchall()
+        shops = {}
+        for r in rows:
+            entry = {"dishes": r["dishes"], "has_combo": bool(r["has_combo"])}
+            if kws:
+                entry["matched"] = int(r["matched"] or 0)
+            shops[r["shop_id"]] = entry
+        total = connection.execute("SELECT COUNT(*) AS c FROM products").fetchone()["c"]
+        return {"shops": shops, "total_dishes": total}
 
 
 def create_product(values: dict[str, Any]) -> dict[str, Any]:
@@ -2707,6 +2777,38 @@ def get_payment_by_order_id(order_id: str) -> dict[str, Any] | None:
         return dict(row) if row else None
 
 
+def get_payments_map_by_order_ids(order_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Batch fetch latest payments for order IDs in a single query."""
+    if not order_ids:
+        return {}
+    clean_ids = list({str(oid).strip() for oid in order_ids if oid})
+    if not clean_ids:
+        return {}
+    placeholders = ",".join("?" for _ in clean_ids)
+    with _connect() as connection:
+        rows = connection.execute(
+            f"""
+            SELECT p.*
+            FROM payments p
+            JOIN (
+                SELECT order_id, MAX(rowid) as max_rowid
+                FROM payments
+                WHERE order_id IN ({placeholders})
+                GROUP BY order_id
+            ) latest ON p.rowid = latest.max_rowid
+            """,
+            clean_ids,
+        ).fetchall()
+        result: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            d = dict(r)
+            if d.get("order_id"):
+                result[d["order_id"]] = d
+            if d.get("parent_order_id"):
+                result[d["parent_order_id"]] = d
+        return result
+
+
 def set_payment_utr(order_id: str, utr_number: str) -> dict[str, Any] | None:
     """Stamp the student-provided UTR on the latest payment for an order."""
     with _connect() as connection:
@@ -2961,6 +3063,33 @@ def list_tickets() -> list[dict[str, Any]]:
         return _rows_to_dicts(rows)
 
 
+def list_tickets_for_user(email: str = "", name: str = "", phone: str = "") -> list[dict[str, Any]]:
+    clean_email = email.strip().lower()
+    clean_name = name.strip().lower()
+    clean_phone = "".join(ch for ch in phone if ch.isdigit())
+    phone_pattern = f"%{clean_phone[-10:]}" if len(clean_phone) >= 10 else f"%{clean_phone}" if clean_phone else ""
+
+    with _connect() as connection:
+        if clean_email:
+            rows = connection.execute(
+                "SELECT * FROM tickets WHERE LOWER(email) = ? ORDER BY created_at DESC LIMIT 100",
+                (clean_email,)
+            ).fetchall()
+        elif clean_name and phone_pattern:
+            rows = connection.execute(
+                "SELECT * FROM tickets WHERE LOWER(name) = ? AND phone_number LIKE ? ORDER BY created_at DESC LIMIT 100",
+                (clean_name, phone_pattern)
+            ).fetchall()
+        elif clean_name:
+            rows = connection.execute(
+                "SELECT * FROM tickets WHERE LOWER(name) = ? ORDER BY created_at DESC LIMIT 100",
+                (clean_name,)
+            ).fetchall()
+        else:
+            return []
+        return _rows_to_dicts(rows)
+
+
 def create_notification(
     title: str,
     message: str,
@@ -3021,6 +3150,39 @@ def list_notifications(role: str | None = None) -> list[dict[str, Any]]:
                 f"SELECT * FROM notifications {pending_first} LIMIT ?",
                 (NOTIFICATION_LIST_LIMIT,),
             ).fetchall()
+        return _rows_to_dicts(rows)
+
+
+def list_student_notifications(user_id: int) -> list[dict[str, Any]]:
+    """List notifications addressed to student role and owned by user_id in ONE query."""
+    uid_str = str(user_id)
+    with _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT n.*
+            FROM notifications n
+            WHERE n.target_role = 'student'
+              AND (
+                n.order_id IS NULL
+                OR EXISTS (
+                  SELECT 1 FROM orders o
+                  WHERE o.id = n.order_id AND (o.owner_user_id = ? OR o.owner_user_id = '' OR o.owner_user_id IS NULL)
+                )
+                OR EXISTS (
+                  SELECT 1 FROM parent_orders po
+                  WHERE po.id = n.order_id AND po.owner_user_id = ?
+                )
+                OR EXISTS (
+                  SELECT 1 FROM shop_sub_orders sso
+                  JOIN parent_orders po2 ON po2.id = sso.parent_order_id
+                  WHERE sso.id = n.order_id AND po2.owner_user_id = ?
+                )
+              )
+            ORDER BY n.rowid DESC
+            LIMIT 50
+            """,
+            (uid_str, uid_str, uid_str),
+        ).fetchall()
         return _rows_to_dicts(rows)
 
 
@@ -3106,19 +3268,246 @@ def remove_push_subscription(shop_id: str, endpoint: str) -> bool:
 
 
 def list_users() -> list[dict[str, Any]]:
-    """List all registered users (without password_hash)."""
+    """List all registered users (without password_hash) with summary order/spend metrics."""
     with _connect() as connection:
         rows = connection.execute(
-            "SELECT id, username, name, email, phone, role, created_at FROM users ORDER BY created_at DESC"
+            """
+            SELECT 
+                u.id, 
+                u.username, 
+                u.name, 
+                u.email, 
+                u.phone, 
+                u.role, 
+                COALESCE(u.status, 'active') as status,
+                COALESCE(u.avatar_url, '') as avatar_url,
+                u.created_at,
+                (SELECT COUNT(*) FROM orders o WHERE o.owner_user_id = CAST(u.id AS TEXT) OR (o.owner_user_id = '' AND LOWER(o.student_name) = LOWER(u.name))) as orders_count,
+                (SELECT COALESCE(SUM(total), 0) FROM orders o WHERE (o.owner_user_id = CAST(u.id AS TEXT) OR (o.owner_user_id = '' AND LOWER(o.student_name) = LOWER(u.name))) AND o.status IN ('Completed', 'Delivered')) as total_spent,
+                (SELECT MAX(created_at) FROM sessions s WHERE LOWER(s.email) = LOWER(u.email)) as last_login
+            FROM users u
+            ORDER BY u.created_at DESC
+            """
         ).fetchall()
         return _rows_to_dicts(rows)
+
+
+def get_user_overview(user_id: int) -> dict[str, Any] | None:
+    """Retrieve full 360 overview of a user: profile, stats, orders, payments, addresses, reviews, feedback, activity."""
+    with _connect() as connection:
+        user_row = connection.execute(
+            "SELECT id, username, name, email, phone, role, COALESCE(status, 'active') as status, COALESCE(avatar_url, '') as avatar_url, created_at FROM users WHERE id = ?",
+            (user_id,)
+        ).fetchone()
+        if not user_row:
+            return None
+        user = dict(user_row)
+
+        sess_row = connection.execute(
+            "SELECT created_at FROM sessions WHERE LOWER(email) = LOWER(?) ORDER BY created_at DESC LIMIT 1",
+            (user.get("email", ""),)
+        ).fetchone()
+        user["last_login"] = sess_row["created_at"] if sess_row else None
+
+        uid_str = str(user_id)
+        orders_rows = connection.execute(
+            """
+            SELECT id, token, student_name, student_phone, shop_id, shop_name, items,
+                   subtotal, service_fee, tax, delivery_fee, total,
+                   delivery_location, delivery_slot, status, payment_method, created_at
+            FROM orders
+            WHERE owner_user_id = ?
+               OR (owner_user_id = '' AND LOWER(student_name) = LOWER(?))
+               OR (student_phone != '' AND student_phone = ?)
+            ORDER BY created_at DESC
+            """,
+            (uid_str, user.get("name", ""), user.get("phone", ""))
+        ).fetchall()
+        orders = _rows_to_dicts(orders_rows)
+
+        order_ids = [o["id"] for o in orders]
+        payments = []
+        if order_ids:
+            placeholders = ",".join("?" for _ in order_ids)
+            p_rows = connection.execute(
+                f"SELECT id, order_id, amount, method, status, utr_number, created_at FROM payments WHERE order_id IN ({placeholders}) ORDER BY created_at DESC",
+                tuple(order_ids)
+            ).fetchall()
+            payments = _rows_to_dicts(p_rows)
+
+        r_rows = connection.execute(
+            "SELECT id, shop_id, shop_name, rating, comment, created_at FROM reviews WHERE user_id = ? OR LOWER(username) = LOWER(?) ORDER BY created_at DESC",
+            (user_id, user.get("username", ""))
+        ).fetchall()
+        reviews = _rows_to_dicts(r_rows)
+
+        f_rows = connection.execute(
+            "SELECT id, category, subject, message, page, status, source, created_at FROM site_feedback WHERE user_id = ? OR LOWER(username) = LOWER(?) OR (email != '' AND LOWER(email) = LOWER(?)) ORDER BY created_at DESC",
+            (user_id, user.get("username", ""), user.get("email", ""))
+        ).fetchall()
+        feedback = _rows_to_dicts(f_rows)
+
+        addresses_map = {}
+        for o in orders:
+            loc = (o.get("delivery_location") or "").strip()
+            if not loc:
+                continue
+            slot = (o.get("delivery_slot") or "").strip()
+            key = f"{loc}::{slot}".lower()
+            if key not in addresses_map:
+                addresses_map[key] = {
+                    "location": loc,
+                    "slot": slot,
+                    "order_count": 1,
+                    "last_used": o.get("created_at"),
+                }
+            else:
+                addresses_map[key]["order_count"] += 1
+        addresses = sorted(addresses_map.values(), key=lambda a: a["order_count"], reverse=True)
+
+        shop = None
+        if user.get("role") == "shopkeeper":
+            s_row = connection.execute(
+                "SELECT id, name, category, description, rating, status, approval_status, orders_today, revenue_today, upi_id, cod_enabled, admin_dues_balance, phone FROM shops WHERE LOWER(shopkeeper_email) = LOWER(?) OR (phone != '' AND phone = ?) LIMIT 1",
+                (user.get("email", ""), user.get("phone", ""))
+            ).fetchone()
+            if s_row:
+                shop = dict(s_row)
+
+        total_orders = len(orders)
+        completed_orders = sum(1 for o in orders if o.get("status") in ("Completed", "Delivered"))
+        cancelled_orders = sum(1 for o in orders if o.get("status") in ("Cancelled", "Rejected", "Failed"))
+        pending_orders = sum(1 for o in orders if o.get("status") in ("Pending Acceptance", "Pending Payment", "Accepted", "Preparing", "Ready", "Placed"))
+        total_spent = sum(o.get("total", 0) for o in orders if o.get("status") in ("Completed", "Delivered"))
+
+        ref_row = connection.execute(
+            "SELECT COUNT(*) as cnt FROM refunds WHERE LOWER(student_name) = LOWER(?)",
+            (user.get("name", ""),)
+        ).fetchone()
+        refunds_count = ref_row["cnt"] if ref_row else 0
+
+        stats = {
+            "total_orders": total_orders,
+            "total_spent": total_spent,
+            "completed_orders": completed_orders,
+            "cancelled_orders": cancelled_orders,
+            "pending_orders": pending_orders,
+            "refunds_count": refunds_count,
+            "reviews_count": len(reviews),
+            "feedback_count": len(feedback),
+        }
+
+        activity_events = []
+        if user.get("created_at"):
+            activity_events.append({
+                "id": f"reg-{user_id}",
+                "type": "registration",
+                "title": "Account Registered",
+                "description": f"Created {user.get('role', 'student')} account as @{user.get('username')}",
+                "timestamp": user["created_at"],
+            })
+
+        sess_rows = connection.execute(
+            "SELECT created_at FROM sessions WHERE LOWER(email) = LOWER(?) ORDER BY created_at DESC LIMIT 5",
+            (user.get("email", ""),)
+        ).fetchall()
+        for idx, s in enumerate(sess_rows):
+            activity_events.append({
+                "id": f"sess-{idx}",
+                "type": "login",
+                "title": "Account Sign-in",
+                "description": "Authenticated session started",
+                "timestamp": s["created_at"],
+            })
+
+        for o in orders[:25]:
+            activity_events.append({
+                "id": f"ord-{o['id']}",
+                "type": "order",
+                "title": f"Placed Order #{o.get('token') or o['id']}",
+                "description": f"Order total ₹{o.get('total', 0)} ({o.get('status')}) at {o.get('shop_name', 'Campus Kitchen')}",
+                "timestamp": o["created_at"],
+                "status": o.get("status"),
+            })
+
+        for r in reviews[:15]:
+            activity_events.append({
+                "id": f"rev-{r['id']}",
+                "type": "review",
+                "title": f"Reviewed {r.get('shop_name', 'Shop')}",
+                "description": f"{r.get('rating')}★: \"{r.get('comment', '')[:80]}\"",
+                "timestamp": r["created_at"],
+            })
+
+        for f in feedback[:15]:
+            activity_events.append({
+                "id": f"fb-{f['id']}",
+                "type": "feedback",
+                "title": f"Submitted {f.get('category', 'Feedback')}",
+                "description": f.get("subject", ""),
+                "timestamp": f["created_at"],
+                "status": f.get("status"),
+            })
+
+        activity_events.sort(key=lambda x: str(x.get("timestamp") or ""), reverse=True)
+
+        return {
+            "user": user,
+            "stats": stats,
+            "orders": orders,
+            "payments": payments,
+            "addresses": addresses,
+            "reviews": reviews,
+            "feedback": feedback,
+            "activity": activity_events[:50],
+            "shop": shop,
+        }
+
+
+def update_user_admin(user_id: int, updates: dict[str, Any]) -> dict[str, Any] | None:
+    """Admin update user fields in SQLite."""
+    allowed = {"name", "email", "phone", "role", "status"}
+    filtered = {k: v for k, v in updates.items() if k in allowed and v is not None}
+    if not filtered:
+        return get_user_by_id(user_id)
+    set_clauses = [f"{k} = ?" for k in filtered.keys()]
+    params = [str(v).strip() for v in filtered.values()]
+    params.append(user_id)
+    with _connect() as connection:
+        connection.execute(f"UPDATE users SET {', '.join(set_clauses)} WHERE id = ?", tuple(params))
+        row = connection.execute("SELECT id, username, name, email, phone, role, status, created_at FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def set_user_status(user_id: int, status: str) -> bool:
+    """Set status ('active' | 'blocked') in SQLite."""
+    with _connect() as connection:
+        cursor = connection.execute("UPDATE users SET status = ? WHERE id = ?", (status, user_id))
+        return cursor.rowcount > 0
 
 
 def list_users_by_role(role: str) -> list[dict[str, Any]]:
     """List users filtered by role."""
     with _connect() as connection:
         rows = connection.execute(
-            "SELECT id, username, name, email, phone, role, created_at FROM users WHERE role = ? ORDER BY created_at DESC",
+            """
+            SELECT 
+                u.id, 
+                u.username, 
+                u.name, 
+                u.email, 
+                u.phone, 
+                u.role, 
+                COALESCE(u.status, 'active') as status,
+                COALESCE(u.avatar_url, '') as avatar_url,
+                u.created_at,
+                (SELECT COUNT(*) FROM orders o WHERE o.owner_user_id = CAST(u.id AS TEXT) OR (o.owner_user_id = '' AND LOWER(o.student_name) = LOWER(u.name))) as orders_count,
+                (SELECT COALESCE(SUM(total), 0) FROM orders o WHERE (o.owner_user_id = CAST(u.id AS TEXT) OR (o.owner_user_id = '' AND LOWER(o.student_name) = LOWER(u.name))) AND o.status IN ('Completed', 'Delivered')) as total_spent,
+                (SELECT MAX(created_at) FROM sessions s WHERE LOWER(s.email) = LOWER(u.email)) as last_login
+            FROM users u
+            WHERE u.role = ?
+            ORDER BY u.created_at DESC
+            """,
             (role,),
         ).fetchall()
         return _rows_to_dicts(rows)

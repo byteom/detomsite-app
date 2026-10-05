@@ -19,6 +19,7 @@ import ApprovalsPage from '../src/pages/ApprovalsPage'
 import { OrdersPage } from '../src/pages/OrdersPage'
 import { VendorsPage } from '../src/pages/VendorsPage'
 import { UsersPage } from '../src/pages/UsersPage'
+import { UserDetailPage } from '../src/pages/UserDetailPage'
 import { PaymentsPage } from '../src/pages/PaymentsPage'
 import { RevenuePage } from '../src/pages/RevenuePage'
 import { WhatsAppCenterPage } from '../src/pages/WhatsAppCenterPage'
@@ -120,6 +121,7 @@ export function runComponentSmokeTests(): { passed: number; results: string[] } 
     ['OrdersPage', <OrdersPage />],
     ['VendorsPage', <VendorsPage />],
     ['UsersPage', <UsersPage />],
+    ['UserDetailPage', <UserDetailPage />],
     ['PaymentsPage', <PaymentsPage />],
     ['RevenuePage', <RevenuePage />],
     ['WhatsAppCenterPage', <WhatsAppCenterPage />],

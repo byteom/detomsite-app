@@ -2,26 +2,24 @@ import { useEffect, useMemo, useState, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 import { apiCached } from '../services/api'
 import { canOrderFromShop, LocalProduct, LocalShop, shopStatusText } from '../types/localApi'
-import { addProductToCart } from '../utils/cart'
+import { addProductToCart, cartShopConflict, replaceCartWithProduct } from '../utils/cart'
+import { ConfirmDialog } from '../components/ConfirmDialog'
 import { usePolling } from '../hooks/usePolling'
 import { same } from '../utils/same'
 import { getShopImage } from '../utils/shopImages'
 
 export function Shops() {
   const [shops, setShops] = useState<LocalShop[]>([])
-  const [products, setProducts] = useState<LocalProduct[]>([])
   const [filter, setFilter] = useState('all')
   const [search, setSearch] = useState('')
   const [sort, setSort] = useState('rating')
   const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(true)
-
-  useEffect(() => {
-    // Products/menu change rarely; cache so navigating back doesn't refetch.
-    apiCached.get<LocalProduct[]>('/local/products', undefined, 30000)
-      .then(res => setProducts(cur => same(cur, res || []) ? cur : (res || [])))
-      .catch(() => setProducts([]))
-  }, [])
+  // Dish matches come from the server (bounded to 8 rows) — the page never
+  // downloads the full products catalog anymore.
+  const [dishResults, setDishResults] = useState<LocalProduct[]>([])
+  // Cross-shop add awaiting user confirm (one kitchen per cart).
+  const [pendingReplace, setPendingReplace] = useState<{ product: LocalProduct; shop: LocalShop } | null>(null)
 
   const loadShops = useCallback(() => {
     // 15s TTL covers the 15s poll below — steady-state ticks never hit the DB.
@@ -31,22 +29,27 @@ export function Shops() {
       .finally(() => setLoading(false))
   }, [])
 
-  // Re-poll every 15s while visible (was 8s — the 7s TTL meant nearly every
-  // tick re-hit the DB); background tabs stop hammering the API and refresh
-  // instantly when you switch back.
+  // Re-poll every 15s while visible; background tabs stop hammering the API
+  // and refresh instantly when you switch back.
   usePolling(loadShops, 15000, [loadShops])
 
   const query = search.trim().toLowerCase()
 
-  const productsByShop = useMemo(() => {
-    const grouped = new Map<string, LocalProduct[]>()
-    for (const product of products) {
-      const current = grouped.get(product.shop_id)
-      if (current) current.push(product)
-      else grouped.set(product.shop_id, [product])
+  // Server-side dish search, debounced: one small bounded request per pause in
+  // typing instead of one full-catalog download per mount. `limit: 8` bounds
+  // the payload no matter how large the catalog grows.
+  useEffect(() => {
+    if (!query) {
+      setDishResults([])
+      return
     }
-    return grouped
-  }, [products])
+    const t = setTimeout(() => {
+      apiCached.get<LocalProduct[]>('/local/products', { search: query, limit: 8 }, 15000)
+        .then(res => setDishResults(cur => same(cur, res || []) ? cur : (res || [])))
+        .catch(() => setDishResults([]))
+    }, 300)
+    return () => clearTimeout(t)
+  }, [query])
 
   const categories = useMemo(() => ['all', ...new Set(shops.map(s => s.category))], [shops])
   const filtered = shops
@@ -56,9 +59,7 @@ export function Shops() {
     .filter(s => filter === 'all' || s.category === filter)
     .filter(s => {
       if (!query) return true
-      const shopMatch = `${s.name} ${s.category}`.toLowerCase().includes(query)
-      const foodMatch = (productsByShop.get(s.id) || []).some(p => p.name.toLowerCase().includes(query))
-      return shopMatch || foodMatch
+      return `${s.name} ${s.category}`.toLowerCase().includes(query)
     })
     .sort((a, b) => {
       if (sort === 'name') return a.name.localeCompare(b.name)
@@ -66,13 +67,13 @@ export function Shops() {
       return b.rating - a.rating
     })
 
-  // Food results: matching AVAILABLE dishes from OPEN shops only — a search must
-  // never surface food that cannot be ordered (unavailable item or closed shop).
+  // Dish results: only AVAILABLE dishes from OPEN shops — a search must never
+  // surface food that cannot be ordered (unavailable item or closed shop).
   const openShopIds = useMemo(() => new Set(shops.filter(s => canOrderFromShop(s)).map(s => s.id)), [shops])
   const foodResults = useMemo(() => {
     if (!query) return []
-    return products.filter(p => p.name.toLowerCase().includes(query) && p.available && openShopIds.has(p.shop_id))
-  }, [products, query, openShopIds])
+    return dishResults.filter(p => p.available && openShopIds.has(p.shop_id))
+  }, [dishResults, query, openShopIds])
 
   const perPage = 8
   const pages = Math.max(1, Math.ceil(filtered.length / perPage))
@@ -80,7 +81,12 @@ export function Shops() {
 
   const handleAdd = (product: LocalProduct) => {
     const shop = shops.find(s => s.id === product.shop_id)
-    if (shop) addProductToCart(product, shop)
+    if (shop) {
+      if (addProductToCart(product, shop) === 'confirm-required') {
+        // One kitchen per cart: ask before swapping kitchens.
+        setPendingReplace({ product, shop })
+      }
+    }
   }
 
   return (
@@ -111,7 +117,7 @@ export function Shops() {
           </select>
         </div>
 
-        {/* Dish search results across all shops */}
+        {/* Dish search results across all shops (server-side, bounded) */}
         {foodResults.length > 0 && (
           <div className="mb-6">
             <h2 className="mb-3 text-sm font-bold uppercase tracking-wide text-slate-500">Dishes found for "{search.trim()}"</h2>
@@ -158,7 +164,7 @@ export function Shops() {
             {visible.map(shop => (
               <Link key={shop.id} to={`/shop/${shop.id}`}
                 className="group overflow-hidden rounded-[24px] border border-primary-light/30 bg-white/90 shadow-[0_10px_35px_rgba(15,118,110,0.08)] transition-all hover:-translate-y-1 hover:shadow-[0_16px_45px_rgba(15,118,110,0.16)]">
-                <img loading="lazy" decoding="async" src={shop.shop_image || getShopImage(shop.category)} alt={`${shop.name} food`} className="h-32 w-full object-cover" onError={event => { event.currentTarget.src = getShopImage() }} />
+                <img loading="lazy" decoding="async" width={400} height={128} src={shop.shop_image || getShopImage(shop.category)} alt={`${shop.name} food`} className="h-32 w-full bg-emerald-50 object-cover" onError={event => { event.currentTarget.src = getShopImage() }} />
                 <div className="p-4">
                   <div className="flex items-start justify-between gap-2">
                     <div><h3 className="font-bold text-primary-dark">{shop.name}</h3><p className="text-sm font-medium text-slate-500">{shop.category}</p></div>
@@ -184,6 +190,26 @@ export function Shops() {
               className="rounded-pill border border-primary-light/30 bg-white px-4 py-2 text-sm font-semibold text-slate-600 transition-colors hover:bg-primary-light/30 disabled:opacity-40">Next →</button>
           </div>
         )}
+
+        {/* One kitchen per cart: confirm before swapping kitchens. */}
+        <ConfirmDialog
+          open={pendingReplace !== null}
+          title="Replace cart?"
+          message={
+            pendingReplace ? (
+              <span>
+                Your cart has items from <b>{cartShopConflict(pendingReplace.shop.id).currentShopName}</b>.
+                Adding from <b>{pendingReplace.shop.name}</b> will clear those items first.
+              </span>
+            ) : null
+          }
+          confirmLabel="Replace cart"
+          onConfirm={() => {
+            if (pendingReplace) replaceCartWithProduct(pendingReplace.product, pendingReplace.shop)
+            setPendingReplace(null)
+          }}
+          onCancel={() => setPendingReplace(null)}
+        />
       </div>
     </div>
   )

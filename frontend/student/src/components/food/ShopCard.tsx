@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React from 'react'
 import { Link } from 'react-router-dom'
 import { Shop } from '../../types'
 import { isShopOrderable, getCategoryPhoto } from '../../utils/helpers'
@@ -7,18 +7,11 @@ import { Star, Clock, MapPin, Heart, ChevronRight, Sparkles } from '../ui/Icons'
 interface ShopCardProps {
   shop: Shop
   featured?: boolean
+  // Owned by the parent page (read once per grid mount, not once per card).
+  favorite: boolean
 }
 
-export function ShopCard({ shop, featured = false }: ShopCardProps) {
-  const [favorite, setFavorite] = useState(() => {
-    try {
-      const favs = JSON.parse(localStorage.getItem('detomsite_fav_shops') || '[]')
-      return favs.includes(shop.id)
-    } catch {
-      return false
-    }
-  })
-
+export function ShopCard({ shop, featured = false, favorite }: ShopCardProps) {
   const toggleFavorite = (e: React.MouseEvent) => {
     e.preventDefault()
     e.stopPropagation()
@@ -29,10 +22,9 @@ export function ShopCard({ shop, featured = false }: ShopCardProps) {
         ? favs.filter((id) => id !== shop.id)
         : [...favs, shop.id]
       localStorage.setItem('detomsite_fav_shops', JSON.stringify(next))
-      setFavorite(!favorite)
       window.dispatchEvent(new Event('favorites-updated'))
     } catch {
-      setFavorite(!favorite)
+      /* private mode — favorite simply won't persist */
     }
   }
 
@@ -50,6 +42,7 @@ export function ShopCard({ shop, featured = false }: ShopCardProps) {
           src={photo}
           alt={shop.name}
           loading="lazy"
+          decoding="async"
           className="h-full w-full object-cover transition-transform duration-500 group-hover:scale-105"
           onError={(e) => {
             e.currentTarget.src =
@@ -69,11 +62,11 @@ export function ShopCard({ shop, featured = false }: ShopCardProps) {
                 : 'bg-slate-900/80 text-slate-300 border border-slate-700/50'
             }`}
           >
-            <span
-              className={`h-1.5 w-1.5 rounded-full ${
-                orderable ? 'bg-emerald-400 animate-pulse' : 'bg-slate-400'
-              }`}
-            />
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  orderable ? 'bg-emerald-400' : 'bg-slate-400'
+                }`}
+              />
             <span>{orderable ? 'Open Now' : 'Closed'}</span>
           </span>
 

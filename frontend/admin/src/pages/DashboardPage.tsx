@@ -77,7 +77,7 @@ export function DashboardPage() {
       sortable: true,
       width: '100px',
       render: (o: any) => (
-        <span className="font-mono font-black text-xs text-gray-900 dark:text-white">
+        <span className="font-mono font-black text-xs text-[var(--text-heading)]">
           #{o.token}
         </span>
       ),
@@ -87,7 +87,7 @@ export function DashboardPage() {
       header: 'Shop',
       sortable: true,
       render: (o: any) => (
-        <span className="font-semibold text-gray-800 dark:text-gray-200">{o.shop_name}</span>
+        <span className="font-semibold text-[var(--text-body)]">{o.shop_name}</span>
       ),
     },
     {
@@ -96,9 +96,9 @@ export function DashboardPage() {
       sortable: true,
       render: (o: any) => (
         <div>
-          <p className="font-medium text-gray-900 dark:text-gray-100">{o.student_name}</p>
+          <p className="font-medium text-[var(--text-heading)]">{o.student_name}</p>
           {o.student_phone && (
-            <p className="text-[11px] text-gray-400 font-mono">{o.student_phone}</p>
+            <p className="text-[11px] text-[var(--text-muted)] font-mono">{o.student_phone}</p>
           )}
         </div>
       ),
@@ -114,7 +114,7 @@ export function DashboardPage() {
       sortable: true,
       align: 'right',
       render: (o: any) => (
-        <span className="font-mono font-bold text-gray-900 dark:text-white">
+        <span className="font-mono font-bold text-[var(--text-heading)]">
           ₹{o.total}
         </span>
       ),
@@ -124,15 +124,20 @@ export function DashboardPage() {
       header: 'Status',
       sortable: true,
       render: (o: any) => {
-        const s = o.status
-        const variant =
-          s === 'Completed' || s === 'Delivered'
-            ? 'success'
-            : s === 'Cancelled'
-            ? 'error'
-            : s === 'Pending Payment' || s === 'Placed'
-            ? 'warning'
-            : 'info'
+        const s = o.status || 'Placed'
+        const sLower = s.toLowerCase()
+        let variant: 'success' | 'warning' | 'error' | 'info' | 'purple' = 'info'
+        if (sLower === 'completed' || sLower === 'delivered') {
+          variant = 'success'
+        } else if (sLower === 'cancelled' || sLower === 'rejected' || sLower === 'failed') {
+          variant = 'error'
+        } else if (sLower.includes('pending') || sLower === 'placed') {
+          variant = 'warning'
+        } else if (sLower === 'ready' || sLower.includes('delivery') || sLower.includes('out')) {
+          variant = 'purple'
+        } else {
+          variant = 'info'
+        }
         return <Badge variant={variant}>{s}</Badge>
       },
     },
@@ -141,7 +146,7 @@ export function DashboardPage() {
       header: 'Placed',
       sortable: true,
       render: (o: any) => (
-        <span className="text-gray-500 dark:text-gray-400 whitespace-nowrap">
+        <span className="text-[var(--text-muted)] whitespace-nowrap">
           {fmtTime(o.created_at)}
         </span>
       ),
@@ -149,14 +154,14 @@ export function DashboardPage() {
   ]
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 text-[var(--text-body)]">
       {/* Top Banner / Operational Status */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-200 dark:border-admin-border-dark pb-4">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[var(--border-main)] pb-4">
         <div>
-          <h1 className="text-2xl font-black text-gray-900 dark:text-white tracking-tight flex items-center gap-2.5">
+          <h1 className="text-2xl font-black text-[var(--text-heading)] tracking-tight flex items-center gap-2.5">
             Operations Command Center
           </h1>
-          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+          <p className="text-xs text-[var(--text-muted)] mt-0.5">
             Real-time campus order flow, store statuses, and platform share reconciliation
           </p>
         </div>
@@ -249,58 +254,58 @@ export function DashboardPage() {
           <div className="space-y-2.5">
             <Link
               to="/approvals"
-              className="flex items-center justify-between p-3 border border-gray-200 dark:border-admin-border-dark bg-gray-50/50 dark:bg-admin-surface-darkSubtle/30 hover:border-emerald-600 transition-colors"
+              className="flex items-center justify-between p-3 border border-[var(--border-main)] bg-[var(--bg-surface-subtle)] hover:bg-[var(--bg-surface-hover)] hover:border-emerald-600 transition-colors"
               style={{ borderRadius: 0 }}
             >
               <div className="flex items-center gap-2.5">
                 <CheckSquare className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-                <span className="text-xs font-semibold text-gray-800 dark:text-gray-200">
+                <span className="text-xs font-semibold text-[var(--text-heading)]">
                   Pending Order Approvals
                 </span>
               </div>
-              <ArrowRight className="w-3.5 h-3.5 text-gray-400" />
+              <ArrowRight className="w-3.5 h-3.5 text-[var(--text-dim)]" />
             </Link>
 
             <Link
               to="/whatsapp"
-              className="flex items-center justify-between p-3 border border-gray-200 dark:border-admin-border-dark bg-gray-50/50 dark:bg-admin-surface-darkSubtle/30 hover:border-emerald-600 transition-colors"
+              className="flex items-center justify-between p-3 border border-[var(--border-main)] bg-[var(--bg-surface-subtle)] hover:bg-[var(--bg-surface-hover)] hover:border-emerald-600 transition-colors"
               style={{ borderRadius: 0 }}
             >
               <div className="flex items-center gap-2.5">
                 <Store className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-                <span className="text-xs font-semibold text-gray-800 dark:text-gray-200">
+                <span className="text-xs font-semibold text-[var(--text-heading)]">
                   WhatsApp Dispatch Center
                 </span>
               </div>
-              <ArrowRight className="w-3.5 h-3.5 text-gray-400" />
+              <ArrowRight className="w-3.5 h-3.5 text-[var(--text-dim)]" />
             </Link>
 
             <Link
               to="/payments"
-              className="flex items-center justify-between p-3 border border-gray-200 dark:border-admin-border-dark bg-gray-50/50 dark:bg-admin-surface-darkSubtle/30 hover:border-emerald-600 transition-colors"
+              className="flex items-center justify-between p-3 border border-[var(--border-main)] bg-[var(--bg-surface-subtle)] hover:bg-[var(--bg-surface-hover)] hover:border-emerald-600 transition-colors"
               style={{ borderRadius: 0 }}
             >
               <div className="flex items-center gap-2.5">
                 <CreditCard className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-                <span className="text-xs font-semibold text-gray-800 dark:text-gray-200">
+                <span className="text-xs font-semibold text-[var(--text-heading)]">
                   Vendor ₹10 Share Settlement
                 </span>
               </div>
-              <ArrowRight className="w-3.5 h-3.5 text-gray-400" />
+              <ArrowRight className="w-3.5 h-3.5 text-[var(--text-dim)]" />
             </Link>
 
             <Link
               to="/settings"
-              className="flex items-center justify-between p-3 border border-gray-200 dark:border-admin-border-dark bg-gray-50/50 dark:bg-admin-surface-darkSubtle/30 hover:border-emerald-600 transition-colors"
+              className="flex items-center justify-between p-3 border border-[var(--border-main)] bg-[var(--bg-surface-subtle)] hover:bg-[var(--bg-surface-hover)] hover:border-emerald-600 transition-colors"
               style={{ borderRadius: 0 }}
             >
               <div className="flex items-center gap-2.5">
                 <ShieldCheck className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-                <span className="text-xs font-semibold text-gray-800 dark:text-gray-200">
+                <span className="text-xs font-semibold text-[var(--text-heading)]">
                   Campus Notice Banner
                 </span>
               </div>
-              <ArrowRight className="w-3.5 h-3.5 text-gray-400" />
+              <ArrowRight className="w-3.5 h-3.5 text-[var(--text-dim)]" />
             </Link>
           </div>
         </Card>

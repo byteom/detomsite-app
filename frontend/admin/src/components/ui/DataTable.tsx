@@ -28,6 +28,7 @@ interface DataTableProps<T> {
   className?: string
   stickyHeader?: boolean
   rowClassName?: (item: T, index: number) => string
+  onRowClick?: (item: T, index: number) => void
 }
 
 export function DataTable<T extends Record<string, any>>({
@@ -46,6 +47,7 @@ export function DataTable<T extends Record<string, any>>({
   className = '',
   stickyHeader = true,
   rowClassName,
+  onRowClick,
 }: DataTableProps<T>) {
   const [search, setSearch] = useState('')
   const [sortKey, setSortKey] = useState<string | null>(null)
@@ -64,7 +66,6 @@ export function DataTable<T extends Record<string, any>>({
           return String(val ?? '').toLowerCase().includes(query)
         })
       }
-      // Fallback: search all primitive values in the object
       return Object.values(item).some(v =>
         typeof v === 'string' || typeof v === 'number'
           ? String(v).toLowerCase().includes(query)
@@ -122,16 +123,16 @@ export function DataTable<T extends Record<string, any>>({
 
   return (
     <div
-      className={`border bg-white dark:bg-admin-surface-dark border-gray-200 dark:border-admin-border-dark ${className}`}
+      className={`border bg-[var(--bg-surface)] border-[var(--border-main)] text-[var(--text-body)] ${className}`}
       style={{ borderRadius: 0 }}
     >
       {/* Table Toolbar */}
       {(searchPlaceholder || filterSlot || actionSlot) && (
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 p-3.5 border-b border-gray-200 dark:border-admin-border-dark bg-gray-50/60 dark:bg-admin-surface-darkSubtle/30">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 p-3.5 border-b border-[var(--border-main)] bg-[var(--bg-surface-subtle)]">
           <div className="flex flex-wrap items-center gap-2.5 flex-1">
             {searchPlaceholder && (
               <div className="relative min-w-[200px] sm:min-w-[260px] flex-1 max-w-sm">
-                <Search className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <Search className="w-4 h-4 text-[var(--text-dim)] absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                 <input
                   type="text"
                   value={search}
@@ -140,13 +141,13 @@ export function DataTable<T extends Record<string, any>>({
                     setCurrentPage(1)
                   }}
                   placeholder={searchPlaceholder}
-                  className="w-full bg-white dark:bg-admin-surface-dark border border-gray-300 dark:border-admin-border-dark pl-9 pr-8 py-1.5 text-xs text-gray-900 dark:text-gray-100 placeholder-gray-400 outline-none focus:border-emerald-600 transition-colors"
+                  className="w-full bg-[var(--bg-surface)] border border-[var(--border-main)] pl-9 pr-8 py-1.5 text-xs text-[var(--text-heading)] placeholder:text-[var(--text-dim)] outline-none focus:border-emerald-600 transition-colors"
                   style={{ borderRadius: 0 }}
                 />
                 {search && (
                   <button
                     onClick={() => setSearch('')}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[var(--text-dim)] hover:text-[var(--text-heading)]"
                   >
                     <X className="w-3.5 h-3.5" />
                   </button>
@@ -166,7 +167,7 @@ export function DataTable<T extends Record<string, any>>({
           <thead
             className={`${
               stickyHeader ? 'sticky top-0 z-10' : ''
-            } bg-gray-100/90 dark:bg-admin-surface-darkSubtle border-b border-gray-200 dark:border-admin-border-dark uppercase tracking-wider text-gray-500 dark:text-gray-400 font-bold`}
+            } bg-[var(--bg-surface-subtle)] border-b border-[var(--border-main)] uppercase tracking-wider text-[var(--text-muted)] font-bold`}
           >
             <tr>
               {columns.map(col => {
@@ -184,7 +185,7 @@ export function DataTable<T extends Record<string, any>>({
                     onClick={() => handleSort(col.key, col.sortable)}
                     style={{ width: col.width }}
                     className={`px-4 py-3 select-none ${alignClass} ${
-                      col.sortable ? 'cursor-pointer hover:text-gray-900 dark:hover:text-white' : ''
+                      col.sortable ? 'cursor-pointer hover:text-[var(--text-heading)]' : ''
                     } ${col.className || ''}`}
                   >
                     <div
@@ -194,7 +195,7 @@ export function DataTable<T extends Record<string, any>>({
                     >
                       <span>{col.header}</span>
                       {col.sortable && (
-                        <span className="text-gray-400">
+                        <span className="text-[var(--text-dim)]">
                           {isSorted ? (
                             sortOrder === 'asc' ? (
                               <ArrowUp className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
@@ -213,14 +214,14 @@ export function DataTable<T extends Record<string, any>>({
             </tr>
           </thead>
 
-          <tbody className="divide-y divide-gray-100 dark:divide-admin-border-darkSubtle text-gray-800 dark:text-gray-200">
+          <tbody className="divide-y divide-[var(--border-subtle)] text-[var(--text-body)]">
             {loading ? (
               // Loading Skeleton
               Array.from({ length: 5 }).map((_, rIdx) => (
                 <tr key={rIdx} className="animate-pulse">
                   {columns.map((c, cIdx) => (
                     <td key={cIdx} className="px-4 py-3.5">
-                      <div className="h-3.5 bg-gray-200 dark:bg-gray-800/80 w-3/4" />
+                      <div className="h-3.5 bg-[var(--bg-surface-hover)] w-3/4" />
                     </td>
                   ))}
                 </tr>
@@ -231,15 +232,15 @@ export function DataTable<T extends Record<string, any>>({
                 <td colSpan={columns.length} className="px-4 py-12 text-center">
                   <div className="flex flex-col items-center justify-center max-w-sm mx-auto">
                     <div
-                      className="p-3 bg-gray-100 dark:bg-admin-surface-darkSubtle border border-gray-200 dark:border-admin-border-dark text-gray-400 mb-3"
+                      className="p-3 bg-[var(--bg-surface-subtle)] border border-[var(--border-main)] text-[var(--text-dim)] mb-3"
                       style={{ borderRadius: 0 }}
                     >
                       <Inbox className="w-8 h-8" />
                     </div>
-                    <h4 className="text-sm font-bold text-gray-900 dark:text-white">
+                    <h4 className="text-sm font-bold text-[var(--text-heading)]">
                       {emptyTitle}
                     </h4>
-                    <p className="mt-1 text-xs text-gray-500 dark:text-gray-400 leading-relaxed">
+                    <p className="mt-1 text-xs text-[var(--text-muted)] leading-relaxed">
                       {emptyDescription}
                     </p>
                     {emptyAction && <div className="mt-4">{emptyAction}</div>}
@@ -255,7 +256,8 @@ export function DataTable<T extends Record<string, any>>({
                 return (
                   <tr
                     key={key}
-                    className={`hover:bg-gray-50/80 dark:hover:bg-admin-surface-darkHover/80 transition-colors ${customRow}`}
+                    onClick={() => onRowClick && onRowClick(item, index)}
+                    className={`hover:bg-[var(--bg-surface-hover)] transition-colors ${onRowClick ? 'cursor-pointer' : ''} ${customRow}`}
                   >
                     {columns.map(col => {
                       const alignClass =
@@ -284,11 +286,11 @@ export function DataTable<T extends Record<string, any>>({
 
       {/* Pagination Footer */}
       {!loading && sortedData.length > 0 && (
-        <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 border-t border-gray-200 dark:border-admin-border-dark bg-gray-50/60 dark:bg-admin-surface-darkSubtle/30 text-xs text-gray-500 dark:text-gray-400">
+        <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 border-t border-[var(--border-main)] bg-[var(--bg-surface-subtle)] text-xs text-[var(--text-muted)]">
           <div>
-            Showing <span className="font-semibold text-gray-900 dark:text-white">{startRecord}</span> to{' '}
-            <span className="font-semibold text-gray-900 dark:text-white">{endRecord}</span> of{' '}
-            <span className="font-semibold text-gray-900 dark:text-white">{sortedData.length}</span> entries
+            Showing <span className="font-semibold text-[var(--text-heading)]">{startRecord}</span> to{' '}
+            <span className="font-semibold text-[var(--text-heading)]">{endRecord}</span> of{' '}
+            <span className="font-semibold text-[var(--text-heading)]">{sortedData.length}</span> entries
           </div>
 
           {totalPages > 1 && (
@@ -297,7 +299,7 @@ export function DataTable<T extends Record<string, any>>({
                 type="button"
                 onClick={() => setCurrentPage(1)}
                 disabled={currentPage === 1}
-                className="p-1 border border-gray-300 dark:border-admin-border-dark hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-30 disabled:cursor-not-allowed"
+                className="p-1 border border-[var(--border-main)] text-[var(--text-heading)] hover:bg-[var(--bg-surface-hover)] disabled:opacity-30 disabled:cursor-not-allowed"
                 title="First Page"
               >
                 <ChevronsLeft className="w-3.5 h-3.5" />
@@ -306,13 +308,13 @@ export function DataTable<T extends Record<string, any>>({
                 type="button"
                 onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
                 disabled={currentPage === 1}
-                className="p-1 border border-gray-300 dark:border-admin-border-dark hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-30 disabled:cursor-not-allowed"
+                className="p-1 border border-[var(--border-main)] text-[var(--text-heading)] hover:bg-[var(--bg-surface-hover)] disabled:opacity-30 disabled:cursor-not-allowed"
                 title="Previous Page"
               >
                 <ChevronLeft className="w-3.5 h-3.5" />
               </button>
 
-              <span className="px-2 font-medium text-gray-700 dark:text-gray-300">
+              <span className="px-2 font-medium text-[var(--text-heading)]">
                 {currentPage} / {totalPages}
               </span>
 
@@ -320,7 +322,7 @@ export function DataTable<T extends Record<string, any>>({
                 type="button"
                 onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
                 disabled={currentPage === totalPages}
-                className="p-1 border border-gray-300 dark:border-admin-border-dark hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-30 disabled:cursor-not-allowed"
+                className="p-1 border border-[var(--border-main)] text-[var(--text-heading)] hover:bg-[var(--bg-surface-hover)] disabled:opacity-30 disabled:cursor-not-allowed"
                 title="Next Page"
               >
                 <ChevronRight className="w-3.5 h-3.5" />
@@ -329,7 +331,7 @@ export function DataTable<T extends Record<string, any>>({
                 type="button"
                 onClick={() => setCurrentPage(totalPages)}
                 disabled={currentPage === totalPages}
-                className="p-1 border border-gray-300 dark:border-admin-border-dark hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-30 disabled:cursor-not-allowed"
+                className="p-1 border border-[var(--border-main)] text-[var(--text-heading)] hover:bg-[var(--bg-surface-hover)] disabled:opacity-30 disabled:cursor-not-allowed"
                 title="Last Page"
               >
                 <ChevronsRight className="w-3.5 h-3.5" />

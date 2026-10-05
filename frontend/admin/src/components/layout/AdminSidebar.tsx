@@ -99,31 +99,31 @@ export function AdminSidebar({
 
   return (
     <aside
-      className={`h-full flex flex-col justify-between border-r border-gray-200 dark:border-admin-border-dark bg-white dark:bg-admin-surface-dark transition-all duration-200 select-none ${
+      className={`h-full flex flex-col justify-between border-r border-[var(--border-main)] bg-[var(--bg-surface)] text-[var(--text-body)] transition-all duration-200 select-none ${
         collapsed ? 'w-16' : 'w-64'
       }`}
       style={{ borderRadius: 0 }}
     >
       {/* Brand Header */}
       <div>
-        <div className="h-14 flex items-center justify-between px-3.5 border-b border-gray-200 dark:border-admin-border-dark bg-gray-50/60 dark:bg-admin-surface-darkSubtle/30">
+        <div className="h-14 flex items-center justify-between px-3.5 border-b border-[var(--border-main)] bg-[var(--bg-surface-subtle)]">
           <Link
             to="/dashboard"
             onClick={onCloseMobile}
             className="flex items-center gap-2.5 overflow-hidden"
           >
             <div
-              className="flex h-8 w-8 shrink-0 items-center justify-center bg-emerald-700 dark:bg-emerald-600 text-white font-black text-sm tracking-wider"
+              className="flex h-8 w-8 shrink-0 items-center justify-center bg-emerald-700 text-white font-black text-sm tracking-wider shadow-xs"
               style={{ borderRadius: 0 }}
             >
               D
             </div>
             {!collapsed && (
               <div className="flex flex-col">
-                <span className="font-black text-xs uppercase tracking-widest text-gray-900 dark:text-white flex items-center gap-1.5">
-                  DETOMSITE <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                <span className="font-black text-xs uppercase tracking-widest text-[var(--text-heading)] flex items-center gap-1.5">
+                  DETOMSITE <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
                 </span>
-                <span className="text-[10px] text-gray-400 font-medium tracking-tight">
+                <span className="text-[10px] text-[var(--text-muted)] font-medium tracking-tight">
                   Admin Platform
                 </span>
               </div>
@@ -134,7 +134,7 @@ export function AdminSidebar({
           <button
             type="button"
             onClick={onToggleCollapse}
-            className="hidden md:flex p-1.5 text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-admin-surface-darkHover"
+            className="hidden md:flex p-1.5 text-[var(--text-muted)] hover:text-[var(--text-heading)] hover:bg-[var(--bg-surface-hover)]"
             style={{ borderRadius: 0 }}
             title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
           >
@@ -147,7 +147,7 @@ export function AdminSidebar({
           {navigationGroups.map(group => (
             <div key={group.group}>
               {!collapsed && (
-                <p className="px-3 pb-1.5 text-[10px] font-bold uppercase tracking-wider text-gray-400 dark:text-gray-500">
+                <p className="px-3 pb-1.5 text-[10px] font-bold uppercase tracking-wider text-[var(--text-dim)]">
                   {group.group}
                 </p>
               )}
@@ -164,12 +164,12 @@ export function AdminSidebar({
                       title={collapsed ? item.label : undefined}
                       className={`flex items-center gap-3 px-3 py-2 text-xs font-semibold transition-colors duration-150 relative ${
                         active
-                          ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border-l-2 border-emerald-600 dark:border-emerald-500'
-                          : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 hover:bg-gray-50 dark:hover:bg-admin-surface-darkHover'
+                          ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-l-2 border-emerald-600'
+                          : 'text-[var(--text-muted)] hover:text-[var(--text-heading)] hover:bg-[var(--bg-surface-hover)]'
                       }`}
                       style={{ borderRadius: 0 }}
                     >
-                      <Icon className={`w-4 h-4 shrink-0 ${active ? 'text-emerald-600 dark:text-emerald-400' : 'text-gray-400'}`} />
+                      <Icon className={`w-4 h-4 shrink-0 ${active ? 'text-emerald-600 dark:text-emerald-400' : 'text-[var(--text-dim)]'}`} />
 
                       {!collapsed && (
                         <div className="flex items-center justify-between flex-1 truncate">
@@ -194,7 +194,7 @@ export function AdminSidebar({
       </div>
 
       {/* Footer app download */}
-      <div className="p-2 border-t border-gray-200 dark:border-admin-border-dark bg-gray-50/50 dark:bg-admin-surface-darkSubtle/20">
+      <div className="p-2 border-t border-[var(--border-main)] bg-[var(--bg-surface-subtle)]">
         <a
           href={`${window.location.origin}/Detomsite-Admin.apk`}
           target="_blank"

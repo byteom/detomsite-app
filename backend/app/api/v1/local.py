@@ -10,6 +10,7 @@ import secrets
 
 from app.core.config import settings
 from app.core import read_cache
+from app.core.db_executor import db_executor, run_db
 from app.core.rate_limit import allow as rate_allow, reset as rate_reset, client_ip as rate_ip
 from app.core.store import store as db
 from app.core.user_store import persist_user_profile
@@ -118,8 +119,13 @@ async def _db(fn, *args, **kwargs):
     directly inside an ``async def`` handler stalls FastAPI's event loop and
     serializes every concurrent request — which is exactly the latency users
     feel in production. Running the call in a thread keeps the loop free.
+
+    Runs on the DEDICATED db pool (see app.core.db_executor), never the
+    process-wide default executor: every portal read sharing 12 default
+    threads with sweeps and fan-outs is what queued unrelated endpoints
+    behind each other into identical multi-second stalls.
     """
-    return await asyncio.to_thread(fn, *args, **kwargs)
+    return await run_db(fn, *args, **kwargs)
 
 
 def _push_admin(title: str, message: str, tag: str = "admin-alert") -> None:
@@ -156,6 +162,10 @@ def _process_due_auto_confirm():
     loop already runs it. On serverless hosts (Vercel) there is no background
     loop, so the lazy sweep triggered on the most-polled endpoint keeps the
     spec's auto-complete behaviour working. Never raises.
+
+    Runs on the dedicated db pool, never the default executor: the sweep
+    holds a worker for seconds (WAN scan + per-row writes) and used to sit
+    in the same 12-thread queue as every portal read.
     """
     import time
     global _last_auto_confirm_run
@@ -165,7 +175,7 @@ def _process_due_auto_confirm():
     try:
         def _run():
             return db.auto_complete_expired_deliveries()
-        asyncio.get_event_loop().run_in_executor(None, _run)
+        asyncio.get_running_loop().run_in_executor(db_executor(), _run)
     except Exception:
         pass
 
@@ -1041,11 +1051,19 @@ def _is_staff(user: Optional[dict]) -> bool:
 async def shops(
     public_only: bool = False,
     search: Optional[str] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     user: Optional[dict] = Depends(_optional_user),
 ):
-    """List shops with optional database-backed name/category/description search."""
-    cache_key = f"shops:{public_only}:{search or ''}"
-    rows = await _cached_read(10, cache_key, db.list_shops, public_only=public_only, search=search)
+    """List shops with optional database-backed name/category/description search.
+
+    ``public_only`` is filtered in SQL (indexed) rather than in Python;
+    ``limit``/``offset`` bound the payload as the catalogue grows (omitted =
+    return everything, the historical behaviour the portals rely on for
+    client-side filtering).
+    """
+    cache_key = f"shops:{public_only}:{search or ''}:{limit}:{offset}"
+    rows = await _cached_read(120, cache_key, db.list_shops, public_only=public_only, search=search, limit=limit, offset=offset)
     if _is_staff(user):
         return rows
     return [_public_shop(s) for s in rows]
@@ -1066,7 +1084,10 @@ async def patch_shop(shop_id: str, data: LocalShopUpdate, _admin: dict = Depends
 
 @router.get("/shops/{shop_id}")
 async def shop(shop_id: str, user: Optional[dict] = Depends(_optional_user)):
-    result = await _db(db.get_shop, shop_id)
+    # Served through the layered read cache (memory → Redis → Postgres) like
+    # the list endpoints, so deep links and multi-instance hosts don't re-hit
+    # Postgres per instance.
+    result = await _cached_read(60, f"shop:{shop_id}", db.get_shop, shop_id)
     if not result:
         raise HTTPException(status_code=404, detail="Shop not found")
     # Same redaction as the list endpoint: this one is public too (the student
@@ -1077,10 +1098,36 @@ async def shop(shop_id: str, user: Optional[dict] = Depends(_optional_user)):
 
 
 @router.get("/products")
-async def products(shop_id: str | None = None, search: Optional[str] = Query(None)):
-    """List products with optional database-backed search and shop filtering."""
-    cache_key = f"products:{shop_id or ''}:{search or ''}"
-    return await _cached_read(10, cache_key, db.list_products, shop_id=shop_id, search=search)
+async def products(
+    shop_id: str | None = None,
+    search: Optional[str] = Query(None),
+    limit: Optional[int] = Query(None, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """List products with optional database-backed search and shop filtering.
+
+    ``limit``/``offset`` bound the payload (omitted = everything, the historical
+    behaviour); the ``shop_id`` path is index-served.
+    """
+    cache_key = f"products:{shop_id or ''}:{search or ''}:{limit}:{offset}"
+    return await _cached_read(60, cache_key, db.list_products, shop_id=shop_id, search=search, limit=limit, offset=offset)
+
+
+@router.get("/menu-summary")
+async def menu_summary(match: Optional[str] = Query(None, max_length=200)):
+    """Per-shop menu flags (dish count, has-combo) plus per-shop match counts
+    for caller-supplied keywords.
+
+    The /shops browse page used to download the entire products catalogue on
+    every mount just to power two tag filters — tens of MB at production
+    scale. It now reads this (~1 small row per shop) and uses /local/search
+    for actual dish queries. ``match`` is a comma-separated keyword list
+    (e.g. ``biryani,rice``) defined by the client's tag vocabulary; nothing
+    tag-specific is hardcoded server-side.
+    """
+    keywords = [k.strip() for k in (match or "").split(",") if k.strip()][:5]
+    cache_key = f"menu-summary:{','.join(keywords)}"
+    return await _cached_read(120, cache_key, db.menu_summary, keywords=keywords)
 
 
 @router.get("/search")
@@ -1256,19 +1303,37 @@ async def add_order(data: LocalOrderCreate, current_user: dict = Depends(get_cur
     # Only orders still AWAITING PAYMENT are reused. If that original order was
     # already paid (or cancelled) the ref is spent, and a fresh basket must get
     # a fresh order rather than silently reopening settled money.
+    #
+    # The ref lookup and the shop read are independent — run them together so
+    # one slow round trip doesn't serialize the other (~10 sequential pool
+    # checkouts is what made order submit take seconds).
+    shop = None
     if payload.get("client_ref"):
         try:
-            existing = await _db(
-                db.find_order_by_client_ref, payload["client_ref"], payload["owner_user_id"]
+            found, shop_row = await asyncio.gather(
+                _db(db.find_order_by_client_ref, payload["client_ref"], payload["owner_user_id"]),
+                _db(db.get_shop, payload["shop_id"]),
+                return_exceptions=True,
             )
+            if isinstance(found, Exception):
+                logger.warning(f"client_ref lookup failed: {found}")
+                found = None
+            if isinstance(shop_row, Exception):
+                raise shop_row
+            shop = shop_row
         except Exception as e:
             # A missing client_ref column must not block checkout — the
             # auto-migration will add it, and the worst case is the old
             # duplicate-order behaviour for this one request.
             logger.warning(f"client_ref lookup failed: {e}")
             existing = None
+            shop = await _db(db.get_shop, payload["shop_id"])
+        else:
+            existing = found
         if existing and str(existing.get("status") or "") in _AWAITING_PAYMENT_STATUSES:
             return existing
+    else:
+        shop = await _db(db.get_shop, payload["shop_id"])
 
     # PENTEST FIX — bound how fast one ACCOUNT can place orders.
     #
@@ -1301,7 +1366,8 @@ async def add_order(data: LocalOrderCreate, current_user: dict = Depends(get_cur
     # cryptic "not approved, present, open, or orderable" message — the
     # usual cause is the vendor having NOT pressed Start yet, even though
     # the admin has approved the shop.
-    shop = await _db(db.get_shop, payload["shop_id"])
+    # NOTE: `shop` was already read above (alongside the idempotency check)
+    # — no second round trip here.
     if not shop:
         raise HTTPException(status_code=400, detail="We couldn't find that shop — it may have been removed by the admin.")
     if shop.get("approval_status") != "Approved":
@@ -1339,42 +1405,40 @@ async def add_order(data: LocalOrderCreate, current_user: dict = Depends(get_cur
     #
     # The shop's own Start/Stop toggle is still the gate on whether an order can
     # be placed at all, so a stopped shop still refuses orders as before.
-    try:
-        if str(order.get("payment_method") or "").upper() == "COD" and order.get("status") == "Pending Acceptance":
-            accepted = await _db(db.update_order_status, order["id"], "Accepted")
-            if accepted:
-                order = accepted
-    except Exception as e:
-        logger.warning(f"Could not mark order {order.get('id')} as placed: {e}")
-
-    # ── Open the payment intent in the SAME request ──
-    # This used to be a second call from the browser (POST /local/payments).
-    # Measured in production that call takes 12-27 s on its own — the serverless
-    # host pays a cold start per request, and a second request paid it AGAIN.
-    # The client gave up at 20 s and reported "the server is taking too long"
-    # for an order that had in fact been created, which is the worst possible
-    # outcome: the student is told it failed, and retries.
     #
-    # The payment row is what tier-2 bank matching needs to recognise the credit
-    # (it only settles an order that has an OPEN payment), so it must exist
-    # before the student can pay. Creating it here costs one extra statement on
-    # a connection we already hold, instead of a whole extra request.
-    try:
-        if str(order.get("payment_method") or "").upper() == "COD":
-            await _db(db.create_payment, order["id"], int(round(float(order.get("total") or 0))), "COD", None)
-        else:
-            await _db(
-                db.create_payment,
-                order["id"],
-                int(round(float(order.get("total") or 0))),
-                "Manual UTR",
-                None,
-            )
-    except Exception as e:
-        # Never fail the order over its payment intent: the student's "Already
-        # paid? Confirm it here" box creates this row on demand, and the admin
-        # can too. A missing row is recoverable; a lost order is not.
-        logger.warning(f"Could not open the payment intent for {order.get('id')}: {e}")
+    # ── The payment intent opens in THIS request, not a second browser call
+    # (a second request paid its own 12–27 s serverless cold start; the client
+    # gave up at 20 s on an order that had in fact been created). Tier-2 bank
+    # matching only settles an order with an OPEN payment, so the row must
+    # exist before the student can pay.
+    #
+    # The accept-flip and the payment-intent insert are independent writes —
+    # run them together instead of serializing two pool checkouts. Neither may
+    # fail the order (both recover on demand), so per-task failures are logged
+    # exactly as before.
+    _pay_method = str(order.get("payment_method") or "").upper()
+    _accept_needed = _pay_method == "COD" and order.get("status") == "Pending Acceptance"
+    _pay_total = int(round(float(order.get("total") or 0)))
+    _pay_kind = "COD" if _pay_method == "COD" else "Manual UTR"
+    _finalize_tasks = []
+    if _accept_needed:
+        _finalize_tasks.append(("accept", _db(db.update_order_status, order["id"], "Accepted")))
+    _finalize_tasks.append(("payment", _db(db.create_payment, order["id"], _pay_total, _pay_kind, None)))
+    for _name, _res in zip(
+        [n for n, _ in _finalize_tasks],
+        await asyncio.gather(*[c for _, c in _finalize_tasks], return_exceptions=True),
+    ):
+        if isinstance(_res, Exception):
+            if _name == "accept":
+                logger.warning(f"Could not mark order {order.get('id')} as placed: {_res}")
+            else:
+                # Never fail the order over its payment intent: the student's
+                # "Already paid? Confirm it here" box creates this row on
+                # demand, and the admin can too. A missing row is recoverable;
+                # a lost order is not.
+                logger.warning(f"Could not open the payment intent for {order.get('id')}: {_res}")
+        elif _name == "accept" and _res:
+            order = _res
 
     # Fire the vendor's phone notification without blocking the student's
     # response — the web push runs in a worker thread (fire-and-forget).
@@ -1400,35 +1464,35 @@ async def add_order(data: LocalOrderCreate, current_user: dict = Depends(get_cur
             logger.warning(f"Could not schedule order push notification: {e}")
 
     # SMS the shopkeeper (and a copy to the admin) + queue the shopkeeper's
-    # WhatsApp. This MUST be awaited, not fired-and-forgotten: on the serverless
-    # platform the request's background tasks are killed the moment the response
-    # returns, so a create_task here would silently drop the order's WhatsApp
-    # notification (which the phone bot then never receives). Awaiting keeps
-    # the ordering latency at ~SMS-log cost and guarantees the notification.
+    # WhatsApp + file the admin's confirmation — all independent, all awaited
+    # together. They MUST be awaited, not fired-and-forgotten: on the
+    # serverless platform the request's background tasks are killed the moment
+    # the response returns, so a create_task here would silently drop the
+    # order's notifications. (The web push inside stays fire-and-forget on its
+    # own thread.) Awaiting keeps the ordering latency at ~SMS-log cost and
+    # guarantees the notifications.
     if is_cash_on_delivery:
-        try:
-            await _notify_order_via_sms(order)
-        except Exception as e:
-            logger.warning(f"Could not send order notifications: {e}")
+        # The shop row was already read above: re-reading it here cost one
+        # more pool checkout + WAN round trip on every single order.
+        # return_exceptions: neither callee may fail the order (both log
+        # internally), so an unexpected raise is logged, never propagated.
+        for _res in await asyncio.gather(
+            _notify_order_via_sms(order, shop),
+            _notify_admin_of_new_order(order),
+            return_exceptions=True,
+        ):
+            if isinstance(_res, Exception):
+                logger.warning(f"Order notification task failed for {order.get('id')}: {_res}")
     else:
         logger.info(
             f"Order {order.get('id')} ({order.get('token')}) is prepaid — holding it back "
             f"from the shop until payment is confirmed."
         )
-
-    # The admin's confirmation queue. Awaited for the same serverless reason as
-    # the WhatsApp above — a fire-and-forget notification here is exactly how an
-    # order ends up placed but never confirmed.
-    #
-    # The admin still sees UNPAID prepaid orders on purpose: they are the safety
-    # net. If a bank credit is never matched (SMS agent not installed, key
-    # wrong, no SMS), the shop deliberately never hears about the order, so the
-    # admin is the only person who can see it and release it by hand. Without
-    # this a stranded payment would be invisible and simply lost.
-    try:
+        # The admin still sees UNPAID prepaid orders on purpose: the safety
+        # net for stranded payments (no SMS agent, wrong key, no match) — the
+        # shop never hears about them, so the admin is the only one who can
+        # release them by hand.
         await _notify_admin_of_new_order(order)
-    except Exception as e:
-        logger.warning(f"Could not queue the admin confirmation for {order.get('id')}: {e}")
 
     return order
 
@@ -1577,7 +1641,7 @@ async def cancel_own_order(order_id: str, current_user: dict = Depends(get_curre
     }
 
 
-async def _notify_order_via_sms(order: dict) -> None:
+async def _notify_order_via_sms(order: dict, shop: dict | None = None) -> None:
     """Send the new-order SMS to the shopkeeper's phone and a copy to the admin.
 
     The message ends with "REPLY: YES <token> = CONFIRM | NO <token> = REJECT".
@@ -1593,8 +1657,8 @@ async def _notify_order_via_sms(order: dict) -> None:
         if not order or not order.get("id"):
             return
         message = sms_service.compose_order_sms(order)
-        shop = None
-        shop = await _db(db.get_shop, order["shop_id"])
+        if shop is None:
+            shop = await _db(db.get_shop, order["shop_id"])
         shop_phone = str((shop or {}).get("phone") or "").strip()
         # Admin copy — the first registered admin's phone.
         admins = await _db(db.list_users_by_role, "admin")
@@ -2952,9 +3016,9 @@ async def student_notice():
     Returns ``{"enabled": bool, "text": str}`` — the student app only renders a
     green banner when ``enabled`` is true AND the text is non-empty, so the
     admin can switch it off (or clear the text) and students immediately stop
-    seeing it. Cached 30 s; any admin write clears the read cache.
+    seeing it. Cached 120 s; any admin write clears the read cache.
     """
-    return await _cached_read(30, "student-notice", db.get_student_notice)
+    return await _cached_read(120, "student-notice", db.get_student_notice)
 
 
 @router.patch("/student-notice")
@@ -2994,10 +3058,14 @@ async def tickets(current_user: dict = Depends(get_current_local_user)):
     matching is used solely for legacy phone-onboarded accounts that have no
     email address; it is never an OR fallback for email accounts (common names
     like "Student" would otherwise leak tickets across users)."""
-    all_tickets = await _db(db.list_tickets)
     if current_user.get("role") == "admin":
-        return all_tickets
+        return await _db(db.list_tickets)
     email = str(current_user.get("email") or "").strip().lower()
+    name = str(current_user.get("name") or "").strip().lower()
+    phone = str(current_user.get("phone") or "").strip()
+    if hasattr(db, "list_tickets_for_user"):
+        return await _db(db.list_tickets_for_user, email, name, phone)
+    all_tickets = await _db(db.list_tickets)
     if email:
         # Email accounts: strict email match only. Never fall back to name —
         # two different students can share the same display name.
@@ -3005,21 +3073,20 @@ async def tickets(current_user: dict = Depends(get_current_local_user)):
             t for t in all_tickets
             if str(t.get("email") or "").strip().lower() == email
         ]
-    name = str(current_user.get("name") or "").strip().lower()
     if not name:
         return []
     # No-email (phone-onboarded) legacy accounts: match on name AND phone so two
     # accounts sharing the generic "Student" display name never see each
     # other's tickets. (Email accounts never reach here — strict email match.)
-    phone = "".join(ch for ch in str(current_user.get("phone") or "") if ch.isdigit())
+    phone_digits = "".join(ch for ch in phone if ch.isdigit())
     out = []
     for t in all_tickets:
         if str(t.get("name") or "").strip().lower() != name:
             continue
-        if phone:
+        if phone_digits:
             t_phone = "".join(ch for ch in str(t.get("phone_number") or "") if ch.isdigit())
             # Compare last-10 digits so +91/0 formatting never hides own ticket.
-            if t_phone[-10:] != phone[-10:]:
+            if t_phone[-10:] != phone_digits[-10:]:
                 continue
         out.append(t)
     return out
@@ -3053,16 +3120,20 @@ async def add_ticket(data: LocalTicketCreate, current_user: dict = Depends(get_c
 @router.get("/notifications")
 async def notifications(role: str | None = None, current_user: dict = Depends(get_current_local_user)):
     """Return only notifications the authenticated account may read."""
-    if current_user.get("role") == "admin":
-        return await _db(db.list_notifications, role=role)
-    if current_user.get("role") != "student":
+    role_user = current_user.get("role")
+    user_id = current_user.get("id")
+    if role_user == "admin":
+        return await _cached_read(10, f"notifications:admin:{role or ''}", db.list_notifications, role=role)
+    if role_user != "student" or not user_id:
         return []
+    if hasattr(db, "list_student_notifications"):
+        return await _cached_read(10, f"notifications:student:{user_id}", db.list_student_notifications, int(user_id))
     rows = await _db(db.list_notifications, role="student")
     visible = []
     for row in rows:
         order_id = row.get("order_id")
         if not order_id:
-            continue  # Unaddressed legacy events cannot safely identify a recipient.
+            continue
         order = await _db(db.get_order, order_id)
         if not order:
             order = await _db(db.get_parent_order, order_id)
@@ -3158,7 +3229,7 @@ def _load_current_batch() -> dict:
 @router.get("/batch")
 async def current_batch():
     """Which delivery batch is accepting orders right now + stock info."""
-    return await _cached_read(30, "batch", _load_current_batch)
+    return await _cached_read(60, "batch", _load_current_batch)
 
 
 def _load_home_feed() -> dict:
@@ -3191,7 +3262,7 @@ def _load_home_feed() -> dict:
 @router.get("/home-feed")
 async def home_feed():
     """Aggregated storefront payload for the Home page (1 request, not 5)."""
-    return await _cached_read(30, "home-feed", _load_home_feed)
+    return await _cached_read(60, "home-feed", _load_home_feed)
 
 
 def _load_products_with_stock() -> list[dict]:
@@ -3230,24 +3301,39 @@ async def checkout_data(shop_ids: str = Query("", max_length=600)):
     wanted = [s.strip() for s in (shop_ids or "").split(",") if s.strip()][:20]
 
     async def _load():
-        # The expensive part — the whole product catalogue — is read through its
-        # OWN longer-lived cache entry and then filtered per shop in Python.
-        #
-        # It used to run `list_products()` inline under a 3-second TTL, so every
-        # distinct cart re-scanned the entire products table several times a
-        # minute. That is exactly the kind of load that makes EVERY portal feel
-        # slow, and it grew worse the more students were checking out.
+        # Per-shop indexed reads, up to 5 at once so one big cart can't hold
+        # the whole pool. This used to scan the ENTIRE products catalogue
+        # (37k rows over WAN + Python dicts + JSON, 4–6 s) and filter in
+        # Python — that full scan on every cache miss is what left /pay stuck
+        # on "Loading order totals…". Same response shape, ~0.2 s cold.
         products_by_shop: dict[str, list] = {}
-        if wanted:
-            catalogue = await _cached_read(60, "checkout:catalogue", db.list_products) or []
-            grouped: dict[str, list] = {}
-            for p in catalogue:
-                if p.get("available"):
-                    grouped.setdefault(str(p.get("shop_id")), []).append(p)
-            products_by_shop = grouped
+        sem = asyncio.Semaphore(5)
 
-        # Shops are primary-key lookups; run them concurrently in ONE worker hop
-        # (the old sequential ``await`` chain cost N pool checkouts in series).
+        async def _one(sid: str) -> tuple[str, list]:
+            async with sem:
+                rows = await _db(db.list_products, shop_id=sid, limit=500) or []
+            return sid, [p for p in rows if p.get("available")]
+
+        # Shops are primary-key lookups served through the store's own cache;
+        # run them concurrently in ONE worker hop (the old sequential ``await``
+        # chain cost N pool checkouts in series).
+        def _load_shops(sids: list[str]) -> list[dict]:
+            return [s for s in (db.get_shop(sid) for sid in sids) if s]
+
+        async def _shops() -> list[dict]:
+            return await _db(_load_shops, wanted) if wanted else []
+
+        # Products, shops and settings are independent — one gather instead of
+        # three serial round trips. (gather() with no children returns [], so
+        # the empty-cart path needs no special case.)
+        prod_pairs, shop_rows, settings = await asyncio.gather(
+            asyncio.gather(*[_one(s) for s in wanted]),
+            _shops(),
+            _db(db.get_payment_settings),
+        )
+        for sid, rows in prod_pairs:
+            products_by_shop[sid] = rows
+
         # PENTEST FIX (data exposure). This returned ``db.get_shop()`` raw. This
         # route has NO auth dependency — a student must see live prices before
         # logging in — so every field came straight off the shops table:
@@ -3258,12 +3344,7 @@ async def checkout_data(shop_ids: str = Query("", max_length=600)):
         # /shops routes already funnel through _public_shop() for exactly this
         # reason; this one was added later and missed it. Verified live: an
         # anonymous GET returned all of them.
-        def _load_shops(sids: list[str]) -> list[dict]:
-            return [s for s in (db.get_shop(sid) for sid in sids) if s]
-
-        shop_rows = await _db(_load_shops, wanted) if wanted else []
         shops = [_public_shop(shop) for shop in shop_rows]
-        settings = await _db(db.get_payment_settings)
         return {
             "shops": shops,
             "products": {s["id"]: products_by_shop.get(str(s["id"]), []) for s in shops},

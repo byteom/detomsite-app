@@ -2,11 +2,14 @@ import React, { useState, useEffect } from 'react'
 import {
   CreditCard,
   CheckCircle,
-  XCircle,
   AlertCircle,
+  Clock,
+  ExternalLink,
   DollarSign,
   TrendingUp,
   RefreshCw,
+  Search,
+  XCircle,
 } from 'lucide-react'
 import api from '../services/api'
 import { apiError, fmtTime, fmtCurrency } from '../utils/formatters'
@@ -14,32 +17,41 @@ import { Button } from '../components/ui/Button'
 import { Badge } from '../components/ui/Badge'
 import { StatCard } from '../components/ui/StatCard'
 import { DataTable, Column } from '../components/ui/DataTable'
-import { Card } from '../components/ui/Card'
+
+function monthLabel(dateStr?: string) {
+  if (!dateStr) return 'Current Month'
+  const d = new Date(dateStr)
+  if (isNaN(d.getTime())) return dateStr
+  return d.toLocaleDateString('en-IN', { month: 'short', year: 'numeric' })
+}
 
 export function PaymentsPage() {
+  const [shares, setShares] = useState<any>({ vendors: [], summary: {} })
   const [payments, setPayments] = useState<any[]>([])
-  const [shares, setShares] = useState<any>(null)
+  const [sharePayments, setSharePayments] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
-  const [msg, setMsg] = useState('')
-  const [shareErr, setShareErr] = useState('')
   const [activeTab, setActiveTab] = useState<'shares' | 'records' | 'orders'>('shares')
+  const [shareErr, setShareErr] = useState('')
+  const [msg, setMsg] = useState('')
 
   const loadData = async (silent = false) => {
     if (!silent) setLoading(true)
     else setRefreshing(true)
+    setShareErr('')
 
     try {
-      const [sharesRes, paymentsRes] = await Promise.all([
-        api.get('/admin/shares').catch(() => ({ data: null })),
+      const [sharesRes, paymentsRes, sharePayRes] = await Promise.all([
+        api.get('/admin/payments/monthly-shares').catch(() => ({ data: { vendors: [], summary: {} } })),
         api.get('/admin/payments').catch(() => ({ data: [] })),
+        api.get('/admin/payments/share-records').catch(() => ({ data: [] })),
       ])
 
-      setShares(sharesRes.data || null)
+      setShares(sharesRes.data || { vendors: [], summary: {} })
       setPayments(paymentsRes.data || [])
-      setShareErr('')
+      setSharePayments(sharePayRes.data || [])
     } catch (e: any) {
-      if (!silent) setShareErr('Could not load payment records')
+      setShareErr(apiError(e, 'Could not load payment records'))
     } finally {
       setLoading(false)
       setRefreshing(false)
@@ -48,16 +60,14 @@ export function PaymentsPage() {
 
   useEffect(() => {
     loadData()
-    const t = setInterval(() => {
-      if (document.visibilityState === 'visible') loadData(true)
-    }, 30000)
-    return () => clearInterval(t)
   }, [])
 
   const markReceived = async (id: string) => {
+    setMsg('')
+    setShareErr('')
     try {
-      await api.patch(`/admin/shares/${id}`, { status: 'Completed' })
-      setMsg('Share payment marked as Received and collected.')
+      await api.patch(`/admin/payments/shares/${id}/received`)
+      setMsg('Share payment marked as Received and verified!')
       loadData(true)
     } catch (err: any) {
       setShareErr(apiError(err, 'Failed to update share payment status'))
@@ -65,8 +75,10 @@ export function PaymentsPage() {
   }
 
   const markRejected = async (id: string) => {
+    setMsg('')
+    setShareErr('')
     try {
-      await api.patch(`/admin/shares/${id}`, { status: 'Rejected' })
+      await api.patch(`/admin/payments/shares/${id}/reject`)
       setMsg('Share payment marked as Rejected.')
       loadData(true)
     } catch (err: any) {
@@ -75,29 +87,7 @@ export function PaymentsPage() {
   }
 
   const summary = shares?.summary || {}
-  const vendorList: any[] = shares?.vendors || []
-  const sharePayments: any[] = shares?.payments || []
-
-  const monthLabel = (s: any) => {
-    const m = String(s || '').slice(0, 7)
-    if (m.length !== 7) return '—'
-    const [y, mo] = m.split('-')
-    const names = [
-      'Jan',
-      'Feb',
-      'Mar',
-      'Apr',
-      'May',
-      'Jun',
-      'Jul',
-      'Aug',
-      'Sep',
-      'Oct',
-      'Nov',
-      'Dec',
-    ]
-    return `${names[Number(mo) - 1] || mo} ${y}`
-  }
+  const vendorList = shares?.vendors || []
 
   // Vendor Share Status Columns
   const vendorColumns: Column<any>[] = [
@@ -107,8 +97,8 @@ export function PaymentsPage() {
       sortable: true,
       render: (v: any) => (
         <div>
-          <p className="font-bold text-gray-900 dark:text-white">{v.shop_name}</p>
-          <p className="text-[11px] text-gray-500">{v.shopkeeper_name}</p>
+          <p className="font-bold text-[var(--text-heading)]">{v.shop_name}</p>
+          <p className="text-[11px] text-[var(--text-muted)]">{v.shopkeeper_name}</p>
         </div>
       ),
     },
@@ -118,7 +108,7 @@ export function PaymentsPage() {
       sortable: true,
       align: 'center',
       render: (v: any) => (
-        <span className="font-mono font-bold text-gray-800 dark:text-gray-200">
+        <span className="font-mono font-bold text-[var(--text-body)]">
           {v.month_orders}
         </span>
       ),
@@ -129,7 +119,7 @@ export function PaymentsPage() {
       sortable: true,
       align: 'right',
       render: (v: any) => (
-        <span className="font-mono font-bold text-gray-900 dark:text-white">
+        <span className="font-mono font-bold text-[var(--text-heading)]">
           ₹{v.month_revenue}
         </span>
       ),
@@ -161,7 +151,7 @@ export function PaymentsPage() {
       header: 'Last Settled',
       sortable: true,
       render: (v: any) => (
-        <span className="text-gray-500 font-mono text-xs">
+        <span className="text-[var(--text-muted)] font-mono text-xs">
           {v.last_paid_at ? String(v.last_paid_at).slice(0, 16) : '—'}
         </span>
       ),
@@ -175,7 +165,7 @@ export function PaymentsPage() {
       header: 'Vendor Name',
       sortable: true,
       render: (p: any) => (
-        <span className="font-semibold text-gray-900 dark:text-white">{p.shop_name}</span>
+        <span className="font-semibold text-[var(--text-heading)]">{p.shop_name}</span>
       ),
     },
     {
@@ -203,7 +193,7 @@ export function PaymentsPage() {
       header: 'Initiated At',
       sortable: true,
       render: (p: any) => (
-        <span className="text-gray-500 font-mono text-xs">{fmtTime(p.created_at)}</span>
+        <span className="text-[var(--text-muted)] font-mono text-xs">{fmtTime(p.created_at)}</span>
       ),
     },
     {
@@ -247,7 +237,7 @@ export function PaymentsPage() {
               </Button>
             </div>
           ) : (
-            <span className="text-gray-400 text-xs italic">Settled</span>
+            <span className="text-[var(--text-dim)] text-xs italic">Settled</span>
           )}
         </div>
       ),
@@ -261,7 +251,7 @@ export function PaymentsPage() {
       header: 'Order Reference',
       sortable: true,
       render: (p: any) => (
-        <span className="font-mono font-bold text-gray-900 dark:text-white">#{p.order_id}</span>
+        <span className="font-mono font-bold text-[var(--text-heading)]">#{p.order_id}</span>
       ),
     },
     {
@@ -270,7 +260,7 @@ export function PaymentsPage() {
       sortable: true,
       align: 'right',
       render: (p: any) => (
-        <span className="font-mono font-bold text-gray-900 dark:text-white">₹{p.amount}</span>
+        <span className="font-mono font-bold text-[var(--text-heading)]">₹{p.amount}</span>
       ),
     },
     {
@@ -279,22 +269,25 @@ export function PaymentsPage() {
       sortable: true,
       align: 'center',
       render: (p: any) => (
-        <Badge variant={p.method === 'COD' ? 'gold' : 'info'} size="xs">
+        <Badge variant={p.method === 'COD' ? 'gold' : 'cyan'} size="xs">
           {p.method}
         </Badge>
       ),
     },
     {
       key: 'utr_number',
-      header: 'UTR / Transaction ID',
+      header: 'UTR / Txn Ref',
       render: (p: any) => (
-        <span className="font-mono text-gray-500 text-xs">{p.utr_number || '—'}</span>
+        <span className="font-mono text-xs text-[var(--text-body)]">
+          {p.utr_number || '—'}
+        </span>
       ),
     },
     {
       key: 'status',
-      header: 'Confirmation Status',
+      header: 'Payment Status',
       sortable: true,
+      align: 'center',
       render: (p: any) => {
         const s = p.status
         const variant =
@@ -306,24 +299,24 @@ export function PaymentsPage() {
       key: 'created_at',
       header: 'Timestamp',
       sortable: true,
-      render: (p: any) => <span className="text-gray-500 text-xs">{fmtTime(p.created_at)}</span>,
+      render: (p: any) => <span className="text-[var(--text-muted)] text-xs">{fmtTime(p.created_at)}</span>,
     },
   ]
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 text-[var(--text-body)]">
       {/* Top Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-gray-200 dark:border-admin-border-dark pb-4">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[var(--border-main)] pb-4">
         <div>
           <div className="flex items-center gap-2.5">
-            <h1 className="text-2xl font-black text-gray-900 dark:text-white tracking-tight">
+            <h1 className="text-2xl font-black text-[var(--text-heading)] tracking-tight">
               Payments & Vendor Settlements
             </h1>
             <Badge variant="success" size="sm" dot>
               Live Monitor
             </Badge>
           </div>
-          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+          <p className="text-xs text-[var(--text-muted)] mt-0.5">
             Track student order payments and verify vendor monthly ₹10-per-order platform share
           </p>
         </div>
@@ -342,7 +335,7 @@ export function PaymentsPage() {
       {/* Messages */}
       {msg && (
         <div
-          className="p-3.5 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-800 text-xs font-semibold text-emerald-800 dark:text-emerald-300"
+          className="p-3.5 bg-emerald-500/10 border border-emerald-500/30 text-xs font-semibold text-emerald-800 dark:text-emerald-300"
           style={{ borderRadius: 0 }}
         >
           {msg}
@@ -351,7 +344,7 @@ export function PaymentsPage() {
 
       {shareErr && (
         <div
-          className="p-3.5 bg-red-50 dark:bg-red-950/40 border border-red-300 dark:border-red-800 text-xs font-semibold text-red-800 dark:text-red-300"
+          className="p-3.5 bg-red-500/10 border border-red-500/30 text-xs font-semibold text-red-800 dark:text-red-300"
           style={{ borderRadius: 0 }}
         >
           {shareErr}
@@ -397,13 +390,13 @@ export function PaymentsPage() {
       </div>
 
       {/* View Switcher Tabs */}
-      <div className="flex items-center gap-1 border-b border-gray-200 dark:border-admin-border-dark pb-2">
+      <div className="flex flex-wrap items-center gap-1.5 border-b border-[var(--border-main)] pb-2">
         <button
           onClick={() => setActiveTab('shares')}
           className={`px-3 py-1.5 text-xs font-bold transition-colors ${
             activeTab === 'shares'
               ? 'bg-emerald-700 dark:bg-emerald-600 text-white'
-              : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'
+              : 'bg-[var(--bg-surface-subtle)] text-[var(--text-body)] hover:bg-[var(--bg-surface-hover)] border border-[var(--border-main)]'
           }`}
           style={{ borderRadius: 0 }}
         >
@@ -415,7 +408,7 @@ export function PaymentsPage() {
           className={`px-3 py-1.5 text-xs font-bold transition-colors ${
             activeTab === 'records'
               ? 'bg-emerald-700 dark:bg-emerald-600 text-white'
-              : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'
+              : 'bg-[var(--bg-surface-subtle)] text-[var(--text-body)] hover:bg-[var(--bg-surface-hover)] border border-[var(--border-main)]'
           }`}
           style={{ borderRadius: 0 }}
         >
@@ -427,7 +420,7 @@ export function PaymentsPage() {
           className={`px-3 py-1.5 text-xs font-bold transition-colors ${
             activeTab === 'orders'
               ? 'bg-emerald-700 dark:bg-emerald-600 text-white'
-              : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'
+              : 'bg-[var(--bg-surface-subtle)] text-[var(--text-body)] hover:bg-[var(--bg-surface-hover)] border border-[var(--border-main)]'
           }`}
           style={{ borderRadius: 0 }}
         >
