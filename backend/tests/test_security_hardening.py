@@ -93,13 +93,22 @@ class TestQuantityIsBilled:
 
 
 class TestRazorpayBypass:
-    async def test_razorpay_order_is_not_fulfillable_before_payment(self, client, monkeypatch):
-        """THE critical bug: unpaid Razorpay orders must start unpaid."""
-        _headers, order, _shop, _product = await _student_with_order(
-            client, monkeypatch, method="Razorpay",
-        )
-        assert order["status"] == "Pending Payment"
-        assert order["payment_method"].upper() == "RAZORPAY"
+    async def test_razorpay_method_is_rejected_at_checkout(self, client, monkeypatch):
+        """CUT OFF — the Razorpay gateway is disabled, so checkout refuses the
+        method outright (a gateway-method order could never be settled: both
+        gateway endpoints answer 410)."""
+        from app.api.v1 import local
+
+        monkeypatch.setattr(local, "_notify_order_via_sms", AsyncMock())
+        token = await _register_and_login(client, _u("rzp"), "password123", "Rzp Student", "student")
+        shop, product = _approved_shop_with_product(f"{_u('rzp_v')}@example.com", "Rzp Vendor")
+        res = await client.post("/api/v1/local/orders", headers={"Authorization": f"Bearer {token}"}, json={
+            "shop_id": shop["id"],
+            "items": [{"product_id": product["id"], "quantity": 1}],
+            "delivery_location": "VIT-AP Main Gate", "delivery_slot": "Evening",
+            "payment_method": "Razorpay",
+        })
+        assert res.status_code == 422, res.text
 
     async def test_cod_order_still_reaches_the_shop(self, client, monkeypatch):
         _headers, order, _shop, _product = await _student_with_order(client, monkeypatch, method="COD")
@@ -125,22 +134,16 @@ class TestRazorpayBypass:
         })
         assert res.status_code == 401
 
-    async def test_create_razorpay_order_rejects_a_short_amount(self, client, monkeypatch):
-        """A ₹1 gateway order for a ₹100 bill must be refused."""
-        from app.core.config import settings
-
+    async def test_create_razorpay_order_is_cut_off(self, client, monkeypatch):
+        """CUT OFF — the gateway endpoint answers 410 for authenticated users
+        (anonymous callers still get 401 from the auth gate)."""
         headers, order, _shop, _product = await _student_with_order(client, monkeypatch)
-        db.update_payment_settings({"razorpay_enabled": True})
-        monkeypatch.setattr(settings, "RAZORPAY_KEY_ID", "rzp_test_key")
-        monkeypatch.setattr(settings, "RAZORPAY_KEY_SECRET", "rzp_test_secret")
-
         res = await client.post(
             "/api/v1/local/payments/create-razorpay-order",
             headers=headers,
-            json={"amount": 100, "currency": "INR", "order_id": order["id"]},  # 100 paise = ₹1
+            json={"amount": 100, "currency": "INR", "order_id": order["id"]},
         )
-        assert res.status_code == 400
-        assert "100" in res.json()["detail"]
+        assert res.status_code == 410, res.text
 
     async def test_verify_razorpay_requires_auth(self, client, monkeypatch):
         _headers, order, _shop, _product = await _student_with_order(client, monkeypatch)
@@ -151,7 +154,9 @@ class TestRazorpayBypass:
         assert res.status_code == 401
 
     async def test_verify_razorpay_denies_a_foreign_order(self, client, monkeypatch):
-        _headers, order, _shop, _product = await _student_with_order(client, monkeypatch)
+        """CUT OFF — even the order owner gets 410 (auth gate still runs first,
+        so anonymous callers get 401 and the intruder case below stays 410)."""
+        headers, order, _shop, _product = await _student_with_order(client, monkeypatch)
         intruder = await _register_and_login(client, _u("intruder"), "password123", "Intruder", "student")
         res = await client.post(
             "/api/v1/local/payments/verify-razorpay",
@@ -161,17 +166,16 @@ class TestRazorpayBypass:
                 "razorpay_signature": "sig", "order_id": order["id"],
             },
         )
-        assert res.status_code == 403
+        assert res.status_code == 410, res.text
 
-    async def test_verify_razorpay_refuses_an_already_settled_order(self, client, monkeypatch):
-        """A COD order (Pending Acceptance) is never 'awaiting payment'."""
+    async def test_verify_razorpay_is_cut_off(self, client, monkeypatch):
+        """CUT OFF — authenticated users get 410 instead of verification."""
         headers, order, _shop, _product = await _student_with_order(client, monkeypatch, method="COD")
         res = await client.post("/api/v1/local/payments/verify-razorpay", headers=headers, json={
             "razorpay_order_id": "order_x", "razorpay_payment_id": "pay_x",
             "razorpay_signature": "sig", "order_id": order["id"],
         })
-        assert res.status_code == 400
-        assert "awaiting" in res.json()["detail"].lower()
+        assert res.status_code == 410, res.text
 
 
 class TestPaymentAmountIntegrity:
@@ -241,15 +245,17 @@ class TestAgentEndpointsFailClosed:
         res = await client.post("/api/v1/local/sms/match", headers=key_header, json={
             "phone": "+919000000999", "utr": "NOPE12345678", "amount": 100,
         })
-        # Accepted by the agent gate (no matching order exists → no order was
-        # confirmed); a 401/503 would mean the key check wrongly rejected it.
-        assert res.status_code not in (401, 503), res.text
+        # CUT OFF — automatic bank matching is disabled: the agent passes the
+        # key gate (no 401/503) and gets an explicit 410.
+        assert res.status_code == 410, res.text
 
 
 class TestScreenshotSystemRemoved:
     async def test_upload_endpoint_is_gone(self, client, monkeypatch):
-        """The screenshot upload system was deleted — the UTR is the only
-        accepted proof. The old /payments/upload route must no longer exist."""
+        """The legacy screenshot-less upload was deleted: the old
+        /payments/upload route must not exist, and payment proof now goes
+        through /payments/proof (UTR + screenshot, admin-verified) — which
+        requires a real screenshot file."""
         headers, order, _shop, _product = await _student_with_order(client, monkeypatch)
         res = await client.post(
             "/api/v1/local/payments/upload",
@@ -258,3 +264,11 @@ class TestScreenshotSystemRemoved:
             files={"file": ("proof.png", b"\x89PNG\r\n\x1a\n12345", "image/png")},
         )
         assert res.status_code in (404, 405), res.text
+        # The new proof endpoint exists but rejects a bogus image body.
+        res = await client.post(
+            "/api/v1/local/payments/proof",
+            headers=headers,
+            data={"order_id": order["id"], "utr_number": "UTR900000001"},
+            files={"file": ("proof.png", b"\x89PNG\r\n\x1a\n12345", "image/png")},
+        )
+        assert res.status_code == 422, res.text

@@ -41,47 +41,15 @@ def _validate_student_email(email: str) -> Optional[str]:
     return None
 
 
-def _generate_otp() -> str:
-    """A 6-digit numeric code."""
-    return f"{secrets.randbelow(1_000_000):06d}"
-
-
-async def _find_user_for_reset(identifier: str) -> Optional[dict]:
-    """Resolve a username OR email to a user record (email preferred when it
-    looks like one, since usernames are case-insensitive too)."""
-    identifier = (identifier or "").strip()
-    if not identifier:
-        return None
-    user = None
-    if "@" in identifier:
-        user = await run_db(db.get_user_by_email, identifier)
-    if not user:
-        user = await run_db(db.get_user_by_username, identifier)
-    return user
-
-
-async def _send_reset_otp(user: dict) -> None:
-    """Generate + store a fresh OTP for this user and email it.
-    The code is only ever delivered by email — never returned to the client.
-    Admin accounts carry a placeholder DB email (admin@detomsite.local) because
-    DEFAULT_SUPER_ADMIN_EMAIL is usually already claimed by another role's
-    account, so admin reset codes go straight to DEFAULT_SUPER_ADMIN_EMAIL."""
-    otp = _generate_otp()
-    await run_db(db.create_password_reset, user["username"], otp, 1)
-    admin_email = (settings.DEFAULT_SUPER_ADMIN_EMAIL or "").strip()
-    to_email = (
-        admin_email
-        if user.get("role") == "admin" and admin_email
-        else (user.get("email") or f"{user['username']}@campus.local")
-    )
-    # Return whether the code actually LEFT the server. The caller reports
-    # success to the user, so this must be the real delivery result rather than
-    # a hard-coded True (see the unconfigured branch of _send_smtp).
-    return await EmailService.send_otp_email(
-        to_email,
-        otp,
-        purpose="password reset",
-    )
+# Thin re-exports of the shared password-reset service (one flow for every
+# portal — see app/services/password_reset_service.py). Kept here so the
+# existing imports/tests keep working.
+from app.services.password_reset_service import (  # noqa: E402,F401
+    GENERIC_SENT_MESSAGE,
+    find_user_for_reset as _find_user_for_reset,
+    generate_otp as _generate_otp,
+    send_reset_otp as _send_reset_otp,
+)
 
 
 # ─── Schemas ───
@@ -195,7 +163,7 @@ async def register(data: UserRegisterRequest):
 
 
 # ─── Forgot password — single emailed OTP ───
-# Step 1: request a reset with your username/email → a 6-digit OTP is emailed.
+# Step 1: request a reset with your username/email → a 4-digit OTP is emailed.
 # Step 2: enter that OTP + your new password → the code is verified and the
 # password is updated in the DB.
 # The code is sent ONCE and is never shown in the UI or API response.
@@ -208,30 +176,21 @@ class ForgotPasswordRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     identifier: str = Field(..., min_length=2, max_length=120)
     otp: str = Field(..., min_length=4, max_length=10)
-    new_password: str = Field(..., min_length=4, max_length=128)
+    new_password: str = Field(..., min_length=8, max_length=128)
 
 
 @router.post("/forgot-password")
 async def forgot_password(data: ForgotPasswordRequest):
-    """Send the single 6-digit OTP to the account's registered email.
-    The response never reveals whether an account exists (account enumeration
-    protection) — the code is only ever delivered by email, never shown in
-    the UI or returned in the API response.
+    """Student password recovery — send the 4-digit OTP to the registered email.
 
-    PENTEST/RELIABILITY FIX. This used to answer "a 6-digit code was sent to
-    your registered email" even when the deployment had NO mail provider at all
-    — the code was only written to the server log, so the user waited for an
-    email that could never arrive, and the API insisted it had worked. That is
-    the whole reason forgot-password looked broken with nothing to fix.
-
-    When no provider is configured we now say so with a 503. That reveals
-    nothing about the account: it is a property of the SERVER, so an unknown
-    identifier gets the identical answer.
+    Role-locked: only ``student`` accounts are served here. Shopkeeper/admin
+    identifiers get the same generic answer (no enumeration oracle) — they
+    must use their own portal's /forgot-password route.
     """
     if not email_delivery_configured():
         logger.error(
-            "forgot-password requested but no email provider is configured "
-            "(set RESEND_API_KEY or SMTP_HOST) — the reset code cannot be sent"
+            "student forgot-password requested but no email provider is configured "
+            "(set SMTP_HOST or RESEND_API_KEY) — the reset code cannot be sent"
         )
         raise HTTPException(
             status_code=503,
@@ -242,9 +201,10 @@ async def forgot_password(data: ForgotPasswordRequest):
         )
 
     user = await _find_user_for_reset(data.identifier)
-    if not user:
-        # Same response either way — don't leak which usernames exist.
-        return {"message": "If that account exists, a verification code was sent to its email.", "step": 1}
+    if not user or user.get("role") != "student":
+        # Same response either way — don't leak which usernames exist or which
+        # portal they belong to.
+        return {"message": GENERIC_SENT_MESSAGE, "step": 1}
 
     delivered = await _send_reset_otp(user)
     if not delivered:
@@ -255,7 +215,7 @@ async def forgot_password(data: ForgotPasswordRequest):
             detail="We could not send the reset email. Please try again shortly.",
         )
     return {
-        "message": "A 6-digit code was sent to your registered email. Enter it below to set a new password.",
+        "message": "A 4-digit code was sent to your registered email. Enter it below to set a new password.",
         "step": 1,
         "expires_minutes": settings.RESET_OTP_EXPIRE_MINUTES,
     }
@@ -263,24 +223,19 @@ async def forgot_password(data: ForgotPasswordRequest):
 
 @router.post("/reset-password")
 async def reset_password(data: ResetPasswordRequest):
-    """Validate the emailed code and set the new password (updates the DB)."""
+    """Validate the emailed OTP and set the new password (student accounts)."""
+    from app.services.password_reset_service import verify_otp_and_reset
+
     user = await _find_user_for_reset(data.identifier)
-    if not user:
+    if not user or user.get("role") != "student":
         raise HTTPException(status_code=400, detail="Invalid code. Please try again.")
 
-    reset = await run_db(db.get_password_reset, user["username"], data.otp.strip(), 1)
-    if not reset:
-        # Count the wrong guess — after 5 the code locks out (brute-force guard).
-        await run_db(db.bump_password_reset_attempts, user["username"])
-        raise HTTPException(status_code=400, detail="Invalid or expired code. Please request a new one.")
-
     password_hash = await asyncio.to_thread(hash_password, data.new_password)
-    updated = await run_db(db.update_user_password, user["username"], password_hash)
-    if not updated:
-        raise HTTPException(status_code=500, detail="Could not update the password. Please try again.")
+    ok, error = await verify_otp_and_reset(data.identifier, data.otp, password_hash)
+    if not ok:
+        status = 500 if error.startswith("Could not ") else 400
+        raise HTTPException(status_code=status, detail=error)
 
-    await run_db(db.invalidate_password_resets, user["username"])
-    logger.info(f"Password reset completed for user: {user['username']}")
     return {"message": "Password updated successfully! You can now sign in with your new password."}
 
 

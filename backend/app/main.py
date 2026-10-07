@@ -93,9 +93,11 @@ async def rate_limit_middleware(request: Request, call_next):
     """Rate-limit sensitive endpoints (login, register, forgot-password/username)."""
     path = request.url.path
     sensitive_prefixes = ("/auth/login", "/auth/register", "/users/login",
-                          "/users/register", "/vendor/login", "/vendor/register",
-                          "/admin/login", "/users/forgot-password",
-                          "/users/forgot-username", "/users/reset-password")
+                           "/users/register", "/vendor/login", "/vendor/register",
+                           "/admin/login", "/users/forgot-password",
+                           "/users/forgot-username", "/users/reset-password",
+                           "/vendor/forgot-password", "/vendor/reset-password",
+                           "/admin/forgot-password", "/admin/reset-password")
     if not any(path.endswith(p) for p in sensitive_prefixes):
         return await call_next(request)
 
@@ -333,7 +335,9 @@ from app.core import embedded_redis, read_cache, redis_cache, shared_cache, ttl_
 _NOOP_WRITE_PATHS = (
     "/login", "/auth/login", "/users/login", "/vendor/login", "/admin/login",
     "/users/forgot-password", "/users/forgot-username", "/users/reset-password",
-    "/users/verify-reset-otp", "/local/session", "/local/push/subscribe",
+    "/users/verify-reset-otp", "/vendor/forgot-password", "/vendor/reset-password",
+    "/admin/forgot-password", "/admin/reset-password",
+    "/local/session", "/local/push/subscribe",
 )
 
 

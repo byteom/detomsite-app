@@ -93,6 +93,25 @@ export interface PaymentSettings {
   instructions: string
 }
 
+export type PaymentProofStatus =
+  | 'PENDING_PAYMENT'
+  | 'PAYMENT_PROOF_SUBMITTED'
+  | 'PAYMENT_APPROVED'
+  | 'PAYMENT_REJECTED'
+
+export interface PaymentProofState {
+  proof_status: PaymentProofStatus
+  utr_saved: boolean
+  payment_submitted_at: string
+  payment_verified_at: string
+  payment_rejection_reason: string
+}
+
+/* Manual UPI proof submission (UTR + screenshot, admin-verified). Sent as
+ * multipart/form-data to POST /local/payments/proof — never as JSON. */
+export const PAYMENT_PROOF_MAX_MB = 5
+export const PAYMENT_PROOF_TYPES = ['image/jpeg', 'image/png', 'image/webp']
+
 export interface StudentNotice {
   enabled: boolean
   text: string

@@ -305,19 +305,21 @@ export function SettingsPage({
         </div>
       </Card>
 
-      {/* ─── 5. SMS Payment Agent (Automatic Bank Confirmation) ─── */}
+      {/* ─── 5. SMS Payment Agent (disabled — manual verification only) ─── */}
       <Card
         title={
           <span className="flex items-center gap-2 text-sm font-bold text-[var(--text-heading)]">
             <Smartphone className="w-4 h-4 text-emerald-600" />
-            Automatic SMS Payment Agent
+            SMS Payment Agent (Disabled)
           </span>
         }
-        subtitle="Auto-confirms student orders via local bank SMS parsing"
+        subtitle="Automatic bank confirmation is turned off — payments are verified manually by an admin"
       >
         <div className="space-y-2 text-xs text-[var(--text-muted)]">
           <p>
-            An optional Android app that runs locally on your shop's phone to verify credit SMS from your bank. Bank SMS data never leaves the device.
+            Automatic order confirmation via bank SMS is disabled. Student UPI
+            payments are verified by an admin from the submitted UTR +
+            screenshot — no agent app is required on the shop phone.
           </p>
           <div className="pt-2">
             <Button

@@ -1,6 +1,7 @@
 import { OperationsPanel } from '../../components/OperationsPanel'
 
 import { useEffect, useState, useCallback } from 'react'
+import { Link } from 'react-router-dom'
 import { apiCached, api } from '../../services/api'
 import {
   LocalComplaint,
@@ -14,6 +15,7 @@ import {
   LocalShop,
   LocalStudentNotice,
   LocalSummary,
+  PaymentProofQueueItem,
 } from '../../types/localApi'
 import { getLocalSession } from '../../utils/session'
 import { usePolling } from '../../hooks/usePolling'
@@ -59,6 +61,7 @@ export function AdminDashboard() {
   const [products, setProducts] = useState<LocalProduct[]>([])
   const [orders, setOrders] = useState<LocalOrder[]>([])
   const [payments, setPayments] = useState<LocalPayment[]>([])
+  const [proofQueue, setProofQueue] = useState<PaymentProofQueueItem[]>([])
   const [summary, setSummary] = useState<LocalSummary | null>(null)
   const [paymentSettings, setPaymentSettings] = useState<LocalPaymentSettings | null>(null)
   /* Site-wide info banner students read on the home page (settings tab). */
@@ -96,7 +99,7 @@ export function AdminDashboard() {
       // Load remaining data in parallel. Orders/payments are bounded to the
       // latest 100 — the dashboard renders recent activity, not full history —
       // so each poll ships KBs instead of the whole tables.
-      const [p, o, pa, ps, cm, re, se, mc, nt] = await Promise.all([
+      const [p, o, pa, ps, cm, re, se, mc, nt, pq] = await Promise.all([
         apiCached.get<LocalProduct[]>('/local/products', undefined, 30000),
         apiCached.get<LocalOrder[]>('/local/orders', { limit: 100 }, 15000),
         apiCached.get<LocalPayment[]>('/local/payments', undefined, 30000),
@@ -106,6 +109,8 @@ export function AdminDashboard() {
         api.get<LocalSettlement[]>('/local/settlements'),
         api.get<LocalMenuChangeRequest[]>('/local/menu-change-requests'),
         apiCached.get<LocalStudentNotice>('/local/student-notice', undefined, 30000),
+        // Manual-proof verification queue (UTR + screenshot, newest first).
+        apiCached.get<PaymentProofQueueItem[]>('/local/payments/verification-queue', undefined, 15000),
       ])
       setProducts(cur => same(cur, p) ? cur : p)
       setOrders(cur => same(cur, o) ? cur : o)
@@ -116,6 +121,7 @@ export function AdminDashboard() {
       setSettlements(cur => same(cur, se.data) ? cur : se.data)
       setMenuChanges(cur => same(cur, mc.data) ? cur : mc.data)
       setNotice(cur => same(cur, nt) ? cur : nt)
+      setProofQueue(cur => same(cur, pq) ? cur : pq)
     } catch {
       setError('Backend not reachable')
     }
@@ -297,6 +303,29 @@ export function AdminDashboard() {
     setMessage(`Payment ${st}`)
   }
 
+  // Manual proof decision (UTR + screenshot, admin-verified). Confirmation
+  // happens in the UI before this is ever called; rejection needs a reason.
+  const decideProof = async (paymentId: string, approved: boolean, orderLabel: string) => {
+    const action = approved ? 'approve' : 'reject'
+    let reason = ''
+    if (approved) {
+      if (!window.confirm(`Approve this payment${orderLabel ? ` (${orderLabel})` : ''}? The order will be released for processing.`)) return
+    } else {
+      reason = window.prompt(`Reject this payment${orderLabel ? ` (${orderLabel})` : ''}? Enter the reason the student will see:`) || ''
+      if (!reason.trim()) return
+      if (!window.confirm('Confirm rejection? The student can submit a fresh proof.')) return
+    }
+    try {
+      const r = await api.patch(`/local/payments/${paymentId}/verify`, { action, reason: reason.trim() })
+      setMessage(approved ? 'Payment approved — order released for processing.' : 'Payment rejected.')
+      setProofQueue(curr => curr.filter(q => q.payment_id !== paymentId))
+      void load()
+      return r.data
+    } catch (err: any) {
+      setError(err?.response?.data?.detail || 'Could not record the decision')
+    }
+  }
+
   // Complaint actions
   const updateComplaint = async (id: string, status: string, adminNotes = '') => {
     const r = await api.patch<LocalComplaint>(`/local/complaints/${id}`, { status, admin_notes: adminNotes })
@@ -348,7 +377,10 @@ export function AdminDashboard() {
   }
 
   const pendingShops = shops.filter(s => s.approval_status === 'Pending Approval')
-  const pendingPayments = payments.filter(p => p.status === 'Pending Verification')
+  const legacyPending = payments.filter(p => p.status === 'Pending Verification')
+  // The manual-proof queue (UTR + screenshot) is the live source of truth;
+  // legacy rows predate the proof workflow.
+  const queueCount = proofQueue.length
   const pendingPrices = products.filter(p => p.pending_price)
   const openComplaints = complaints.filter(c => c.status === 'Open' || c.status === 'Under Review')
   const pendingRefunds = refunds.filter(r => r.status === 'Pending')
@@ -356,7 +388,7 @@ export function AdminDashboard() {
   const totalRevenue = summary?.revenue ?? orders.reduce((s, o) => s + o.total, 0)
   const tabs: { id: Tab; label: string; count?: number }[] = [
     { id: 'approvals', label: 'Approvals', count: pendingShops.length + pendingPrices.length },
-    { id: 'payments', label: 'Payments', count: pendingPayments.length },
+    { id: 'payments', label: 'Payments', count: queueCount + legacyPending.length },
     { id: 'complaints', label: 'Complaints', count: openComplaints.length },
     { id: 'refunds', label: 'Refunds', count: pendingRefunds.length },
     { id: 'settlements', label: 'Settlements' },
@@ -443,7 +475,7 @@ export function AdminDashboard() {
             ['Revenue', money(totalRevenue)],
             ['Shops', shops.length],
             ['Pending', pendingShops.length],
-            ['Payments', pendingPayments.length],
+            ['Payments', queueCount + legacyPending.length],
             ['Open', summary?.orderable_shops ?? 0],
           ].map(([l, v]) => (
             <div key={l} className="rounded-btn bg-white p-3 shadow-card">
@@ -529,9 +561,52 @@ export function AdminDashboard() {
         {tab === 'payments' && (
           <section className="rounded-btn bg-white p-5 shadow-card">
             <h2 className="mb-3 text-lg font-bold text-primary">Payment Verification</h2>
+            <p className="mb-3 text-xs text-gray-500">
+              Manual UPI verification — confirm the money arrived in the bank account before approving. Never trust the UTR or screenshot alone.
+            </p>
             <div className="space-y-3">
-              {pendingPayments.map(p => (
-                <div key={p.id} className="rounded-btn border border-gold-200 bg-gold-50/30 p-4">
+              {proofQueue.map(q => (
+                <div key={q.payment_id} className="rounded-btn border border-gold-200 bg-gold-50/30 p-4">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                    <div className="min-w-0">
+                      <p className="font-bold text-primary-dark">
+                        Order {q.order_token ? `#${q.order_token}` : q.order_id}
+                        <span className="ml-2 text-xs font-medium text-gray-500">{q.customer_name}{q.customer_phone ? ` · ${q.customer_phone}` : ''}</span>
+                      </p>
+                      <p className="text-xs text-gray-500">
+                        {money(q.amount)} · {q.method} · UTR: {q.utr_number || 'N/A'}
+                      </p>
+                      <p className="text-[11px] text-gray-400">
+                        Submitted {q.payment_submitted_at ? new Date(q.payment_submitted_at).toLocaleString('en-IN') : '—'}
+                      </p>
+                      <Link to={`/admin/orders/${q.order_id}`} className="mt-1 inline-block text-xs font-bold text-primary hover:underline">
+                        Open verification page →
+                      </Link>
+                    </div>
+                    {q.payment_screenshot_url && (
+                      <a href={q.payment_screenshot_url} target="_blank" rel="noreferrer" title="Open full screenshot">
+                        <img src={q.payment_screenshot_url} alt="Payment screenshot" className="h-20 w-20 rounded-btn border border-gray-200 object-cover" />
+                      </a>
+                    )}
+                  </div>
+                  <div className="mt-3 flex shrink-0 gap-2">
+                    <button
+                      onClick={() => void decideProof(q.payment_id, true, q.order_token ? `#${q.order_token}` : q.order_id)}
+                      className="rounded-lg bg-primary px-3 py-2 text-sm font-bold text-white"
+                    >
+                      ✓ Approve
+                    </button>
+                    <button
+                      onClick={() => void decideProof(q.payment_id, false, q.order_token ? `#${q.order_token}` : q.order_id)}
+                      className="rounded-lg border border-red-200 px-3 py-2 text-sm font-bold text-red-600"
+                    >
+                      ✕ Reject
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {proofQueue.length === 0 && legacyPending.map(p => (
+                <div key={p.id} className="rounded-btn border border-gray-200 bg-gray-50/50 p-4">
                   <div className="flex items-start justify-between gap-4">
                     <div>
                       <p className="font-bold text-primary-dark">Order {p.order_id}</p>
@@ -556,7 +631,7 @@ export function AdminDashboard() {
                   </div>
                 </div>
               ))}
-              {pendingPayments.length === 0 && <p className="text-sm text-gray-400">No pending payments</p>}
+              {proofQueue.length === 0 && legacyPending.length === 0 && <p className="text-sm text-gray-400">No pending payments</p>}
             </div>
           </section>
         )}

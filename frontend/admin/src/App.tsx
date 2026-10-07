@@ -16,6 +16,7 @@ import { ForgotPasswordPage } from './pages/ForgotPasswordPage'
 import { DashboardPage } from './pages/DashboardPage'
 import ApprovalsPage from './pages/ApprovalsPage'
 import { OrdersPage } from './pages/OrdersPage'
+import { OrderVerifyPage } from './pages/OrderVerifyPage'
 import { VendorsPage } from './pages/VendorsPage'
 import { UsersPage } from './pages/UsersPage'
 import { UserDetailPage } from './pages/UserDetailPage'
@@ -64,6 +65,7 @@ export default function App() {
                       <Route path="/dashboard" element={<DashboardPage />} />
                       <Route path="/approvals" element={<ApprovalsPage />} />
                       <Route path="/orders" element={<OrdersPage />} />
+                      <Route path="/orders/:orderId" element={<OrderVerifyPage />} />
                       <Route path="/vendors" element={<VendorsPage />} />
                       <Route path="/users" element={<UsersPage />} />
                       <Route path="/users/:userId" element={<UserDetailPage />} />

@@ -11,6 +11,7 @@ import {
 import {
   getCart,
   clearCart,
+  saveCart,
   billBreakdown,
   MAIN_GATE,
   toE164,
@@ -21,8 +22,7 @@ import {
   isShopOrderable,
   safeParse,
 } from '../utils/helpers'
-import api, { dedupeGet } from '../services/api'
-import { usePolling } from '../hooks/usePolling'
+import api from '../services/api'
 import {
   CreditCard,
   Banknote,
@@ -165,8 +165,16 @@ export function PayPage() {
 
   const isUpi = method === 'qr' && upiAvailable
   const [draft, setDraft] = useState<{ id: string; token: number } | null>(null)
-  const [paid, setPaid] = useState(false)
   const [drafting, setDrafting] = useState(false)
+  // Draft-creation diagnostics: attempt counter for the status line, a latched
+  // failure flag (stops the silent infinite retry the old effect had — its
+  // `tries` reset on every re-run so the button could stay dead forever with
+  // no message), and a nonce the Retry button bumps to start over.
+  const [draftAttempt, setDraftAttempt] = useState(0)
+  const [draftFailed, setDraftFailed] = useState(false)
+  const [draftNonce, setDraftNonce] = useState(0)
+  // Bumped after rewriting cart prices so this render reads the fresh cart.
+  const [, setCartTick] = useState(0)
 
   const draftInFlight = useRef(false)
   const placeInFlight = useRef(false)
@@ -180,7 +188,10 @@ export function PayPage() {
     (method === 'cod' ? codOn : upiAvailable) &&
     (shop ? isShopOrderable(shop) : false)
 
-  const payable = canTakePayment && (isUpi ? paid : true)
+  // The button enables as soon as the ORDER is valid (prices fresh, shop
+  // open). It never waits on the up-front draft: tapping Continue creates the
+  // order on the spot when no draft exists (duplicate-safe via client_ref).
+  const payable = canTakePayment
 
   const qrUri = isUpi
     ? buildUpiUri(upiTarget, receiver, quotedTotal, `Detomsite ${quotedTotal}`)
@@ -235,56 +246,98 @@ export function PayPage() {
     return settled.map((s) => s.order)
   }
 
-  // Create UPI draft order up-front
+  // Create UPI draft order up-front. The attempt counter + failure latch live
+  // in state (not just refs) so the UI can say what's happening and offer a
+  // retry — previously a failing draft retried silently forever and the
+  // Continue button stayed grey with no explanation.
   useEffect(() => {
-    if (!isUpi || !canTakePayment || draft || drafting || draftInFlight.current)
+    if (!isUpi || !canTakePayment || draft || draftFailed || draftInFlight.current)
       return
     draftInFlight.current = true
     setDrafting(true)
     let tries = 0
+    let cancelled = false
 
     const attempt = () => {
+      if (cancelled) return
       tries++
+      setDraftAttempt(tries)
       createOrder()
         .then((orders) => {
+          if (cancelled) return
           const first = orders[0]
-          if (first) setDraft({ id: first.id, token: first.token })
+          if (!first) throw new Error('empty order response')
+          setDraft({ id: first.id, token: first.token })
+          setDrafting(false)
+          draftInFlight.current = false
         })
         .catch(() => {
+          if (cancelled) return
           if (tries < DRAFT_ATTEMPTS) {
             setTimeout(attempt, 2000)
           } else {
+            setDraftFailed(true)
+            setDrafting(false)
+            draftInFlight.current = false
             setErr(
               'Could not initialize the payment order. Please check your network and retry.'
             )
           }
         })
-        .finally(() => {
-          draftInFlight.current = false
-          setDrafting(false)
-        })
     }
     attempt()
-  }, [isUpi, canTakePayment, draft, drafting])
+    return () => {
+      cancelled = true
+    }
+    // NOTE: `drafting` is intentionally NOT a dep — flipping it mid-cycle
+    // would restart the attempt counter and retry forever.
+  }, [isUpi, canTakePayment, draft, draftFailed, draftNonce])
 
-  // Poll payment confirmation for UPI draft
-  usePolling(
-    React.useCallback(() => {
-      if (!isUpi || !draft?.id || paid) return
-      return dedupeGet<Order>(`/local/orders/${draft.id}`).then((r) => {
-        if (
-          r.data &&
-          ['Accepted', 'Confirmed', 'Preparing', 'Ready', 'Completed'].includes(
-            r.data.status
-          )
-        ) {
-          setPaid(true)
-        }
-      })
-    }, [isUpi, draft?.id, paid]),
-    4000,
-    [isUpi, draft?.id, paid]
-  )
+  const retryDraft = () => {
+    setErr('')
+    setDraftFailed(false)
+    setDraftAttempt(0)
+    setDraftNonce((n) => n + 1)
+  }
+
+  // Bring stale cart prices in line with the live quote (fixes `priceChanged`
+  // without sending the student back to the cart).
+  const syncCartPrices = () => {
+    if (!live) return
+    const itemsNow = getCart()
+    const synced = itemsNow.map((i) =>
+      live[i.product_id] != null
+        ? { ...i, price: live[i.product_id] / (i.quantity || 1) }
+        : i
+    )
+    saveCart(synced)
+    setCartTick((t) => t + 1)
+  }
+
+  // The exact reason Continue is disabled — rendered under the CTA so a grey
+  // button always explains itself instead of looking "stuck".
+  const blockReason: string = loading
+    ? 'Loading live prices…'
+    : err
+    ? ''
+    : live === null
+    ? 'Waiting for live prices…'
+    : priceChanged
+    ? `Cart total ₹${cartBill.total} no longer matches live prices ₹${quotedTotal}.`
+    : !upiAvailable && method !== 'cod'
+    ? 'UPI is not set up for this shop right now.'
+    : shop && !isShopOrderable(shop)
+    ? `${shop.name} is not accepting orders right now.`
+    : drafting
+    ? `Creating your order… (attempt ${Math.max(draftAttempt, 1)} of ${DRAFT_ATTEMPTS})`
+    : isUpi && !draft && !draftFailed
+    ? 'Preparing your order…'
+    : ''
+
+  // Verification is MANUAL: nothing here waits for an automatic bank
+  // confirmation. The draft order exists so the student can pay the exact QR
+  // amount; tapping continue takes them to the payment page where they submit
+  // the UTR + screenshot proof for admin verification.
 
   const handlePlaceOrder = async () => {
     if (!payable || placing || placeInFlight.current) return
@@ -293,9 +346,18 @@ export function PayPage() {
     setErr('')
 
     try {
-      if (isUpi && draft) {
+      if (isUpi) {
+        // Prefer the up-front draft, but never strand the student on it: if
+        // the draft never materialized, create the order right here (the
+        // deterministic client_ref keeps this duplicate-safe) and continue to
+        // payment-proof submission.
+        const target = draft ?? (await createOrder())[0]
         clearCart()
-        navigate(`/order/${draft.id}`, { replace: true })
+        if (target) {
+          navigate(`/pay/${target.id}`, { replace: true })
+        } else {
+          setErr('Could not create your order. Please retry.')
+        }
       } else {
         const orders = await createOrder()
         clearCart()
@@ -430,24 +492,16 @@ export function PayPage() {
               </span>
             </div>
 
-            {/* Live Verification Status */}
-            <div
-              className={`flex items-center justify-between p-4 rounded-btn border text-xs font-bold ${
-                paid
-                  ? 'bg-emerald-100/70 border-emerald-300 text-emerald-900'
-                  : 'bg-amber-50 border-amber-200 text-amber-900'
-              }`}
-            >
+            {/* What happens next (manual verification — nothing automatic) */}
+            <div className="flex items-center justify-between p-4 rounded-btn border text-xs font-bold bg-emerald-50 border-emerald-200 text-emerald-900">
               <div className="flex items-center gap-2">
-                <Clock
-                  className={`h-4 w-4 ${
-                    paid ? 'text-emerald-700' : 'text-amber-600 animate-spin'
-                  }`}
-                />
+                <ShieldCheck className="h-4 w-4 text-emerald-700" />
                 <span>
-                  {paid
-                    ? 'Payment Confirmed! Tap Place Order to proceed.'
-                    : 'Awaiting your payment confirmation...'}
+                  {draft
+                    ? 'Order ready. Continue to submit your UTR + payment screenshot for admin verification.'
+                    : draftFailed
+                    ? 'Order setup hit a snag — you can retry, or just tap Continue and it will be created.'
+                    : 'Pay the QR in your UPI app, then tap Continue to submit your payment proof.'}
                 </span>
               </div>
               {draft?.token && (
@@ -456,6 +510,15 @@ export function PayPage() {
                 </span>
               )}
             </div>
+            {draftFailed && (
+              <button
+                type="button"
+                onClick={retryDraft}
+                className="w-full rounded-btn border border-emerald-300 bg-white px-4 py-2.5 text-xs font-bold text-emerald-800 hover:bg-emerald-50"
+              >
+                Retry order setup
+              </button>
+            )}
           </div>
         )}
 
@@ -469,6 +532,21 @@ export function PayPage() {
             <p className="text-xs text-amber-800 leading-relaxed">
               Please keep exact change of <b>₹{quotedTotal}</b> ready. You will pay the delivery partner directly at the VIT-AP Main Gate.
             </p>
+          </div>
+        )}
+
+        {priceChanged && (
+          <div className="rounded-btn border-2 border-amber-300 bg-amber-50 px-4 py-3 space-y-2">
+            <p className="text-xs font-semibold text-amber-800">
+              Prices changed since you added these to your cart (cart ₹{cartBill.total}, now ₹{quotedTotal}).
+            </p>
+            <button
+              type="button"
+              onClick={syncCartPrices}
+              className="w-full rounded-btn bg-amber-600 px-4 py-2 text-xs font-bold text-white hover:bg-amber-700"
+            >
+              Update cart to latest prices (₹{quotedTotal})
+            </button>
           </div>
         )}
 
@@ -490,9 +568,13 @@ export function PayPage() {
               : 'bg-slate-300 cursor-not-allowed opacity-75'
           }`}
         >
-          <span>{placing ? 'Submitting Order...' : 'Place Order'}</span>
+          <span>{placing ? 'Submitting Order...' : isUpi ? 'Continue · Submit Payment Proof' : 'Place Order'}</span>
           <ArrowRight className="h-4 w-4" />
         </button>
+        {/* A grey button must always say why — never look "stuck". */}
+        {!payable && !placing && blockReason !== '' && (
+          <p className="text-center text-[11px] font-bold text-amber-700">{blockReason}</p>
+        )}
       </div>
     </div>
   )

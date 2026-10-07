@@ -27,8 +27,8 @@ function buildUpiUri(pa: string, pn: string, amount: number, note: string) {
  * The amount is priced from the LIVE product list rather than from the prices the
  * cart captured: the server re-prices every order from the product table and
  * ignores whatever total the client sends, so a stale cart price would otherwise
- * encode the wrong amount in the QR and the bank-SMS matcher would reject the
- * real payment as ambiguous. Server fees are all zero, so the live product-price
+ * encode the wrong amount in the QR and the admin could not match the real
+ * payment against the bill. Server fees are all zero, so the live product-price
  * sum IS the order total. If a vendor changed a price, the student is stopped
  * here and told rather than charged the difference after the fact. */
 export default function PayPage() {
@@ -162,9 +162,11 @@ export default function PayPage() {
         delivery_slot: slot,
         payment_method: method === 'cod' ? 'COD' : 'UTR',
       })
-      /* Record the payment row so the admin/bot has an amount to verify against.
-         A failure here does NOT mean the order failed — the order already exists,
-         so it is never re-submitted (that produced duplicate orders). */
+      /* Record the payment row so the admin has an amount to verify the manual
+         UPI proof against. A failure here does NOT mean the order failed — the
+         order already exists, so it is never re-submitted (that produced
+         duplicate orders). After placing the order the student submits the UTR
+         + screenshot on the order page for manual admin verification. */
       try {
         await api.post('/local/payments', {
           order_id: order.data.id,

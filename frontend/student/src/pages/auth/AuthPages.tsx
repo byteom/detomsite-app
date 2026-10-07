@@ -311,26 +311,98 @@ export function LoginPage() {
   )
 }
 
-/* ─── FORGOT PASSWORD PAGE ─── */
+/* ─── FORGOT PASSWORD PAGE (2-step: identifier → 4-digit OTP + new password) ─── */
 export function ForgotPasswordPage() {
-  const [email, setEmail] = useState('')
+  const [step, setStep] = useState<'request' | 'otp'>('request')
+  const [identifier, setIdentifier] = useState('')
+  const [otp, setOtp] = useState('')
+  const [pw, setPw] = useState('')
+  const [confirm, setConfirm] = useState('')
   const [msg, setMsg] = useState('')
   const [err, setErr] = useState('')
+  const [done, setDone] = useState(false)
   const [loading, setLoading] = useState(false)
 
-  const submit = async (e: FormEvent) => {
-    e.preventDefault()
+  const friendlyError = (e: any, fallback: string) => {
+    if (e?.response?.status === 503) {
+      return 'We could not send the reset email right now. Please try again shortly — or ask the admin for help.'
+    }
+    return apiError(e, fallback)
+  }
+
+  const requestOtp = async (e?: FormEvent) => {
+    e?.preventDefault()
     setErr('')
     setMsg('')
+    if (!identifier.trim()) {
+      setErr('Enter your username or registered email.')
+      return
+    }
     setLoading(true)
     try {
-      await api.post('/users/forgot-password', { email })
-      setMsg('If an account matches that email, reset instructions have been sent.')
+      const res = await api.post('/users/forgot-password', { identifier: identifier.trim() })
+      setMsg(res.data?.message || 'A 4-digit code was sent to your registered email.')
+      setStep('otp')
     } catch (e: any) {
-      setErr(apiError(e, 'Could not process password reset.'))
+      setErr(friendlyError(e, 'Could not process password reset.'))
     } finally {
       setLoading(false)
     }
+  }
+
+  const resetPw = async (e: FormEvent) => {
+    e.preventDefault()
+    setErr('')
+    setMsg('')
+    if (pw !== confirm) {
+      setErr('Passwords do not match')
+      return
+    }
+    if (pw.length < 8) {
+      setErr('Password must be at least 8 characters')
+      return
+    }
+    if (otp.trim().length < 4) {
+      setErr('Enter the 4-digit code sent to your email.')
+      return
+    }
+    setLoading(true)
+    try {
+      await api.post('/users/reset-password', {
+        identifier: identifier.trim(),
+        otp: otp.trim(),
+        new_password: pw,
+      })
+      setDone(true)
+    } catch (e: any) {
+      setErr(friendlyError(e, 'Password reset failed. Invalid or expired code.'))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  if (done) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50 px-4 py-12">
+        <div className="w-full max-w-md">
+          <div className="rounded-panel border border-slate-200 bg-white p-6 sm:p-8 shadow-card space-y-4 text-center">
+            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-emerald-600/10 text-emerald-600">
+              <CheckCircle2 className="h-6 w-6" />
+            </div>
+            <h1 className="text-xl font-black text-slate-900">Password Updated!</h1>
+            <p className="text-xs text-slate-500">
+              Your new password has been saved. Please sign in with your updated credentials.
+            </p>
+            <Link
+              to="/login"
+              className="block w-full rounded-btn bg-emerald-700 py-3 text-sm font-bold text-white hover:bg-emerald-800 transition-colors"
+            >
+              Proceed to Sign In
+            </Link>
+          </div>
+        </div>
+      </div>
+    )
   }
 
   return (
@@ -339,7 +411,9 @@ export function ForgotPasswordPage() {
         <div className="rounded-panel border border-slate-200 bg-white p-6 sm:p-8 shadow-card space-y-4">
           <h1 className="text-xl font-black text-slate-900">Reset Your Password</h1>
           <p className="text-xs text-slate-500">
-            Enter your registered campus email and we will send you a recovery link.
+            {step === 'request'
+              ? 'Step 1 of 2 · Enter your username or registered email — we will send a 4-digit code.'
+              : 'Step 2 of 2 · Enter the 4-digit code & choose a new password (code expires in 15 min).'}
           </p>
 
           {msg && (
@@ -356,27 +430,84 @@ export function ForgotPasswordPage() {
             </div>
           )}
 
-          <form onSubmit={submit} className="space-y-4 text-xs font-semibold">
-            <div>
-              <label className="block text-slate-600 mb-1">Campus Email</label>
-              <input
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                placeholder="your.email@campus.edu"
-                required
-                className="w-full rounded-btn border-2 border-slate-200 p-3 text-sm outline-none focus:border-emerald-600"
-              />
-            </div>
+          {step === 'request' ? (
+            <form onSubmit={requestOtp} className="space-y-4 text-xs font-semibold">
+              <div>
+                <label className="block text-slate-600 mb-1">Username or Email</label>
+                <input
+                  type="text"
+                  value={identifier}
+                  onChange={(e) => setIdentifier(e.target.value)}
+                  placeholder="your username or email"
+                  required
+                  className="w-full rounded-btn border-2 border-slate-200 p-3 text-sm outline-none focus:border-emerald-600"
+                />
+              </div>
 
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full rounded-btn bg-emerald-700 py-3 font-bold text-white hover:bg-emerald-800 transition-colors disabled:opacity-50"
-            >
-              {loading ? 'Sending...' : 'Send Reset Link'}
-            </button>
-          </form>
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full rounded-btn bg-emerald-700 py-3 font-bold text-white hover:bg-emerald-800 transition-colors disabled:opacity-50"
+              >
+                {loading ? 'Sending...' : 'Send 4-Digit Code'}
+              </button>
+            </form>
+          ) : (
+            <form onSubmit={resetPw} className="space-y-4 text-xs font-semibold">
+              <div>
+                <label className="block text-slate-600 mb-1">4-Digit Code</label>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={otp}
+                  onChange={(e) => setOtp(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                  placeholder="••••"
+                  required
+                  className="w-full rounded-btn border-2 border-slate-200 p-3 text-center text-2xl font-mono font-bold tracking-[0.4em] outline-none focus:border-emerald-600"
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-600 mb-1">New Password (min 8 characters)</label>
+                <PasswordInput value={pw} onChange={setPw} placeholder="At least 8 characters" />
+              </div>
+
+              <div>
+                <label className="block text-slate-600 mb-1">Confirm New Password</label>
+                <PasswordInput value={confirm} onChange={setConfirm} placeholder="Repeat new password" />
+              </div>
+
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full rounded-btn bg-emerald-700 py-3 font-bold text-white hover:bg-emerald-800 transition-colors disabled:opacity-50"
+              >
+                {loading ? 'Saving...' : 'Verify & Update Password'}
+              </button>
+
+              <div className="flex items-center justify-center gap-4 pt-1 text-xs">
+                <button
+                  type="button"
+                  onClick={() => requestOtp()}
+                  disabled={loading}
+                  className="font-bold text-emerald-700 hover:underline disabled:opacity-50"
+                >
+                  Resend code
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setStep('request')
+                    setErr('')
+                    setMsg('')
+                  }}
+                  className="font-bold text-emerald-700 hover:underline"
+                >
+                  ← Start over
+                </button>
+              </div>
+            </form>
+          )}
 
           <div className="pt-3 border-t border-slate-100 text-center text-xs">
             <Link to="/login" className="font-bold text-emerald-700 hover:underline">

@@ -119,8 +119,19 @@ create table if not exists public.payments (
   status text not null default 'Pending Verification',
   utr_number text,
   screenshot_name text,
+  -- Manual UPI proof workflow (UTR + Cloudinary screenshot + admin check).
+  -- proof_status: PENDING_PAYMENT | PAYMENT_PROOF_SUBMITTED | PAYMENT_APPROVED
+  --   | PAYMENT_REJECTED (status stays in sync for older readers).
+  proof_status text not null default 'PENDING_PAYMENT',
+  payment_screenshot_url text not null default '',
+  payment_screenshot_public_id text not null default '',
+  payment_submitted_at timestamptz,
+  payment_verified_at timestamptz,
+  payment_verified_by text not null default '',
+  payment_rejection_reason text not null default '',
   created_at timestamptz not null default now()
 );
+create index if not exists idx_payments_proof_status on public.payments (proof_status);
 
 -- ─── Support tickets ───
 create table if not exists public.tickets (
@@ -163,7 +174,7 @@ create table if not exists public.app_settings (
 );
 
 -- ─── Password resets (double email OTP verification) ───
--- Forgot-password flow stores a 6-digit OTP per step (1 then 2) with expiry.
+-- Forgot-password flow stores a 4-digit OTP per step (1 then 2) with expiry.
 create table if not exists public.password_resets (
   id bigserial primary key,
   username text not null,
@@ -333,6 +344,16 @@ create table if not exists public.parent_orders (
   total integer not null default 0,
   payment_method text not null default 'UPI',
   payment_status text not null default 'Pending',
+  -- Manual UPI proof workflow (one bill per parent; proof lives on this row).
+  payment_proof_status text not null default 'PENDING_PAYMENT',
+  utr_number text,
+  screenshot_name text,
+  payment_screenshot_url text not null default '',
+  payment_screenshot_public_id text not null default '',
+  payment_submitted_at timestamptz,
+  payment_verified_at timestamptz,
+  payment_verified_by text not null default '',
+  payment_rejection_reason text not null default '',
   delivery_location text not null default '',
   status text not null default 'Pending',
   created_at timestamptz not null default now()
@@ -340,6 +361,7 @@ create table if not exists public.parent_orders (
 create index if not exists idx_parent_orders_created on public.parent_orders (created_at desc);
 create index if not exists idx_parent_orders_status on public.parent_orders (status);
 create index if not exists idx_parent_orders_date on public.parent_orders (date_key);
+create index if not exists idx_parent_orders_proof_status on public.parent_orders (payment_proof_status);
 
 -- ─── Shop sub-orders (one per shop within a parent order) ───
 create table if not exists public.shop_sub_orders (

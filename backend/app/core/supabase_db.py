@@ -744,6 +744,25 @@ _MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'active'",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url text NOT NULL DEFAULT ''",
     "CREATE INDEX IF NOT EXISTS idx_users_status ON users (status)",
+    # ─── Manual UPI payment-proof workflow (Cloudinary screenshot + UTR + admin
+    # verification + Telegram notification). New canonical proof lifecycle in
+    # proof_status / payment_proof_status; legacy status columns stay in sync.
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS proof_status text NOT NULL DEFAULT 'PENDING_PAYMENT'",
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_screenshot_url text NOT NULL DEFAULT ''",
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_screenshot_public_id text NOT NULL DEFAULT ''",
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_submitted_at timestamptz",
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_verified_at timestamptz",
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_verified_by text NOT NULL DEFAULT ''",
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS payment_rejection_reason text NOT NULL DEFAULT ''",
+    "CREATE INDEX IF NOT EXISTS idx_payments_proof_status ON payments (proof_status)",
+    "ALTER TABLE parent_orders ADD COLUMN IF NOT EXISTS payment_proof_status text NOT NULL DEFAULT 'PENDING_PAYMENT'",
+    "ALTER TABLE parent_orders ADD COLUMN IF NOT EXISTS payment_screenshot_url text NOT NULL DEFAULT ''",
+    "ALTER TABLE parent_orders ADD COLUMN IF NOT EXISTS payment_screenshot_public_id text NOT NULL DEFAULT ''",
+    "ALTER TABLE parent_orders ADD COLUMN IF NOT EXISTS payment_submitted_at timestamptz",
+    "ALTER TABLE parent_orders ADD COLUMN IF NOT EXISTS payment_verified_at timestamptz",
+    "ALTER TABLE parent_orders ADD COLUMN IF NOT EXISTS payment_verified_by text NOT NULL DEFAULT ''",
+    "ALTER TABLE parent_orders ADD COLUMN IF NOT EXISTS payment_rejection_reason text NOT NULL DEFAULT ''",
+    "CREATE INDEX IF NOT EXISTS idx_parent_orders_proof_status ON parent_orders (payment_proof_status)",
 ]
 
 
@@ -1888,8 +1907,15 @@ def _parent_payment_shape(row: dict[str, Any]) -> dict[str, Any]:
         "amount": row["total"],
         "method": row["payment_method"],
         "status": "Success" if str(row.get("payment_status") or "").upper() == "PAID" else row.get("payment_status", "Pending"),
+        "proof_status": row.get("payment_proof_status") or "PENDING_PAYMENT",
         "utr_number": row.get("utr_number"),
         "screenshot_name": row.get("screenshot_name"),
+        "payment_screenshot_url": row.get("payment_screenshot_url") or "",
+        "payment_screenshot_public_id": row.get("payment_screenshot_public_id") or "",
+        "payment_submitted_at": str(row.get("payment_submitted_at") or ""),
+        "payment_verified_at": str(row.get("payment_verified_at") or ""),
+        "payment_verified_by": row.get("payment_verified_by") or "",
+        "payment_rejection_reason": row.get("payment_rejection_reason") or "",
         "created_at": str(row.get("created_at") or ""),
         "is_parent": True,
     }
@@ -2032,6 +2058,210 @@ def update_payment_status(payment_id: str, status: str) -> dict[str, Any] | None
             return dict(row) if row else None
 
 
+# ─── Manual UPI payment proofs (screenshot + UTR + admin verification) ───
+
+_PROOF_SUBMITTED = "PAYMENT_PROOF_SUBMITTED"
+_PROOF_APPROVED = "PAYMENT_APPROVED"
+_PROOF_REJECTED = "PAYMENT_REJECTED"
+
+
+def save_single_payment_proof(
+    order_id: str,
+    amount: int,
+    utr_number: str,
+    screenshot_url: str,
+    screenshot_public_id: str,
+) -> dict[str, Any] | None:
+    """Attach (or refresh) a UTR + screenshot proof on a single-shop order.
+
+    Reuses the order's open payment row when one exists, otherwise inserts a
+    fresh one. Legacy ``status`` is kept in sync ('Pending Verification').
+    Returns None when the order does not exist.
+    """
+    with _DBContext(_connect()) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
+            if not cursor.fetchone():
+                return None
+            cursor.execute(
+                "SELECT * FROM payments WHERE order_id = %s ORDER BY created_at DESC, id DESC LIMIT 1",
+                (order_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                cursor.execute(
+                    """UPDATE payments
+                       SET amount = %s, method = 'Manual UTR', utr_number = %s,
+                           proof_status = 'PAYMENT_PROOF_SUBMITTED', status = 'Pending Verification',
+                           payment_screenshot_url = %s, payment_screenshot_public_id = %s,
+                           payment_submitted_at = now(),
+                           payment_verified_at = NULL, payment_verified_by = '',
+                           payment_rejection_reason = ''
+                       WHERE id = %s""",
+                    (amount, utr_number, screenshot_url, screenshot_public_id, row["id"]),
+                )
+                payment_id = row["id"]
+            else:
+                cursor.execute("SELECT COUNT(*) + 1 AS next FROM payments")
+                payment_id = f"pay{cursor.fetchone()['next']}"
+                try:
+                    cursor.execute(
+                        """INSERT INTO payments (id, order_id, amount, method, status,
+                                                utr_number, proof_status, payment_screenshot_url,
+                                                payment_screenshot_public_id, payment_submitted_at)
+                           VALUES (%s, %s, %s, 'Manual UTR', 'Pending Verification',
+                                   %s, 'PAYMENT_PROOF_SUBMITTED', %s, %s, now())""",
+                        (payment_id, order_id, amount, utr_number, screenshot_url, screenshot_public_id),
+                    )
+                except psycopg2.errors.UniqueViolation:
+                    connection.rollback()
+                    return None
+            cursor.execute("SELECT * FROM payments WHERE id = %s", (payment_id,))
+            saved = cursor.fetchone()
+            return dict(saved) if saved else None
+
+
+def save_parent_payment_proof(
+    parent_order_id: str,
+    amount: int,
+    utr_number: str,
+    screenshot_url: str,
+    screenshot_public_id: str,
+) -> dict[str, Any] | None:
+    """Attach (or refresh) a UTR + screenshot proof on a multi-shop parent bill."""
+    with _DBContext(_connect()) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT * FROM parent_orders WHERE id = %s", (parent_order_id,))
+            parent = cursor_row(cursor)
+            if not parent:
+                return None
+            cursor.execute(
+                """UPDATE parent_orders
+                   SET payment_method = 'Manual UTR',
+                       payment_status = 'Pending',
+                       payment_proof_status = 'PAYMENT_PROOF_SUBMITTED',
+                       utr_number = %s,
+                       payment_screenshot_url = %s,
+                       payment_screenshot_public_id = %s,
+                       payment_submitted_at = now(),
+                       payment_verified_at = NULL,
+                       payment_verified_by = '',
+                       payment_rejection_reason = ''
+                   WHERE id = %s""",
+                (utr_number, screenshot_url, screenshot_public_id, parent_order_id),
+            )
+            cursor.execute("SELECT * FROM parent_orders WHERE id = %s", (parent_order_id,))
+            updated = cursor_row(cursor)
+            return _parent_payment_shape(updated) if updated else None
+
+
+def verify_single_payment_proof(
+    payment_id: str, approved: bool, admin_name: str, reason: str = ""
+) -> dict[str, Any] | None:
+    """Admin approve/reject of a single-order proof. Approval moves the order
+    to Pending Acceptance (normal pipeline resumes) + notifies the student;
+    rejection leaves the order awaiting payment so the student can resubmit."""
+    with _DBContext(_connect()) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT * FROM payments WHERE id = %s", (payment_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            proof = _PROOF_APPROVED if approved else _PROOF_REJECTED
+            legacy = "Success" if approved else "Rejected"
+            cursor.execute(
+                    """UPDATE payments
+                       SET proof_status = %s, status = %s, payment_verified_at = now(),
+                           payment_verified_by = %s, payment_rejection_reason = %s
+                       WHERE id = %s""",
+                (proof, legacy, admin_name[:100], (reason or "")[:500], payment_id),
+            )
+            order_id = row["order_id"]
+            cursor.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
+            order_row = cursor.fetchone()
+            if order_row and approved:
+                if str(order_row["status"]) in ("Pending", "Pending Payment", "Pending Acceptance"):
+                    cursor.execute("UPDATE orders SET status = %s WHERE id = %s", ("Pending Acceptance", order_row["id"]))
+                create_notification(
+                    title="Payment verified",
+                    message=f"Payment for token {order_row['token']} is verified — the shop will accept your order soon.",
+                    order_id=order_row["id"],
+                    status="Pending Acceptance",
+                    target_role="student",
+                    connection=connection,
+                )
+            elif order_row and not approved:
+                create_notification(
+                    title="Payment rejected",
+                    message=(
+                        f"Payment proof for token {order_row['token']} was rejected"
+                        + (f": {reason[:200]}" if (reason or "").strip() else "")
+                        + ". Please submit a fresh UTR + screenshot."
+                    ),
+                    order_id=order_row["id"],
+                    status=str(order_row["status"]),
+                    target_role="student",
+                    connection=connection,
+                )
+            cursor.execute("SELECT * FROM payments WHERE id = %s", (payment_id,))
+            saved = cursor.fetchone()
+            return dict(saved) if saved else None
+
+
+def verify_parent_payment_proof(
+    parent_order_id: str, approved: bool, admin_name: str, reason: str = ""
+) -> dict[str, Any] | None:
+    """Admin approve/reject of a multi-shop parent proof (mirrors
+    verify_parent_payment, plus proof columns + student notification)."""
+    with _DBContext(_connect()) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT * FROM parent_orders WHERE id = %s", (parent_order_id,))
+            parent = cursor_row(cursor)
+            if not parent:
+                return None
+            proof = _PROOF_APPROVED if approved else _PROOF_REJECTED
+            legacy = "Paid" if approved else "Failed"
+            cursor.execute(
+                """UPDATE parent_orders
+                   SET payment_proof_status = %s, payment_status = %s,
+                       payment_verified_at = now(), payment_verified_by = %s,
+                       payment_rejection_reason = %s
+                   WHERE id = %s""",
+                (proof, legacy, admin_name[:100], (reason or "")[:500], parent_order_id),
+            )
+            if approved:
+                if parent["status"] == "Pending":
+                    cursor.execute("UPDATE parent_orders SET status = 'Pending Acceptance' WHERE id = %s", (parent_order_id,))
+                cursor.execute(
+                    "UPDATE shop_sub_orders SET status = 'Accepted' WHERE parent_order_id = %s AND status = 'Pending'",
+                    (parent_order_id,),
+                )
+                create_notification(
+                    title="Payment verified",
+                    message=f"Payment for token {parent['token']} is verified — the shops will accept your order soon.",
+                    order_id=None,
+                    status="Pending Acceptance",
+                    target_role="student",
+                    connection=connection,
+                )
+            else:
+                create_notification(
+                    title="Payment rejected",
+                    message=(
+                        f"Payment proof for token {parent['token']} was rejected"
+                        + (f": {reason[:200]}" if (reason or "").strip() else "")
+                        + ". Please submit a fresh UTR + screenshot."
+                    ),
+                    order_id=None,
+                    status=str(parent.get("status") or "Pending"),
+                    target_role="student",
+                    connection=connection,
+                )
+            cursor.execute("SELECT * FROM parent_orders WHERE id = %s", (parent_order_id,))
+            updated = cursor_row(cursor)
+            return _parent_payment_shape(updated) if updated else None
+
+
 def get_payment_by_order_id(order_id: str) -> dict[str, Any] | None:
     """Get the most recent payment record for an order. For multi-shop parents
     the payment is anchored on a sub-order id but keeps ``parent_order_id`` —
@@ -2105,6 +2335,45 @@ def get_payment_by_utr(utr_number: str) -> dict[str, Any] | None:
             cursor.execute(
                 "SELECT * FROM payments WHERE utr_number = %s ORDER BY created_at DESC, id DESC LIMIT 1",
                 (utr_number,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+
+def list_payments_by_utr(utr_number: str) -> list[dict[str, Any]]:
+    """Indexed UTR lookup for /sms/match Tier-1 duplicate detection.
+
+    Uses the partial unique index on payments(utr_number) instead of the
+    full-table ``list_payments()`` scan, so concurrent bank credits cost one
+    indexed read no matter how large the table grows.
+    """
+    if not utr_number:
+        return []
+    with _DBReadContext() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT * FROM payments WHERE utr_number = %s ORDER BY created_at DESC, id DESC",
+                (utr_number,),
+            )
+            return _rows_to_dicts(cursor.fetchall())
+
+
+def settle_payment_if_open(payment_id: str) -> dict[str, Any] | None:
+    """Atomically flip a payment to Success only if it is still open.
+
+    Single-statement conditional UPDATE (Postgres executes it atomically and
+    holds the row lock to COMMIT — see Postgres UPDATE + RETURNING docs): two
+    concurrent credits racing on the same payment serialize here, the loser
+    gets zero rows back (None) instead of double-settling. Returns the settled
+    row, or None when it was already Success/Cancelled/Failed/Rejected.
+    """
+    with _DBContext(_connect()) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """UPDATE payments SET status = 'Success'
+                   WHERE id = %s AND status NOT IN ('Success','Cancelled','Failed','Rejected')
+                   RETURNING *""",
+                (payment_id,),
             )
             row = cursor.fetchone()
             return dict(row) if row else None

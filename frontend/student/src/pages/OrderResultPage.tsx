@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { useParams, Link } from 'react-router-dom'
-import { Order, Shop } from '../types'
+import { Order, Shop, PaymentProofStatus } from '../types'
 import { formatPlacedAt, MAIN_GATE } from '../utils/helpers'
 import api, { dedupeGet } from '../services/api'
 import { usePolling } from '../hooks/usePolling'
@@ -25,6 +25,24 @@ export function OrderResultPage() {
   const [order, setOrder] = useState<Order | null>(null)
   const [shop, setShop] = useState<Shop | null>(null)
   const [loading, setLoading] = useState(true)
+  const [proofStatus, setProofStatus] = useState<PaymentProofStatus>('PENDING_PAYMENT')
+  const [rejectReason, setRejectReason] = useState('')
+
+  // Proof state drives the pending/approved/rejected banner. Verification is
+  // MANUAL by an admin — this page never flips to paid by itself.
+  usePolling(
+    useCallback(() => {
+      if (!orderId) return
+      return dedupeGet(`/local/orders/${orderId}/payment`)
+        .then((r) => {
+          if (r.data?.proof_status) setProofStatus(r.data.proof_status)
+          setRejectReason(String(r.data?.payment_rejection_reason || ''))
+        })
+        .catch(() => {})
+    }, [orderId]),
+    8000,
+    [orderId]
+  )
 
   // Poll order status
   usePolling(
@@ -160,23 +178,42 @@ export function OrderResultPage() {
         )}
 
         {/* Payment Alert if Unpaid */}
-        {isUnpaid && (
+        {isUnpaid && proofStatus !== 'PAYMENT_PROOF_SUBMITTED' && proofStatus !== 'PAYMENT_APPROVED' && (
           <div className="rounded-card border border-amber-300 bg-amber-50 p-4 text-left flex items-start gap-3">
             <CreditCard className="h-5 w-5 text-amber-700 shrink-0 mt-0.5" />
             <div className="flex-1 space-y-2">
               <p className="text-xs sm:text-sm font-bold text-amber-900">
-                Payment Pending for this Order
+                {proofStatus === 'PAYMENT_REJECTED'
+                  ? `Payment proof rejected${rejectReason ? `: ${rejectReason}` : '.'} Please submit a fresh proof.`
+                  : 'Payment Pending for this Order'}
               </p>
               <p className="text-xs text-amber-800">
-                Please complete your UPI payment of ₹{order.total} so the kitchen can confirm and begin preparing your food.
+                {proofStatus === 'PAYMENT_REJECTED'
+                  ? 'Check your payment and submit a new UTR + screenshot.'
+                  : `Please complete your UPI payment of ₹${order.total} and submit the UTR + screenshot so an admin can verify it.`}
               </p>
               <Link
                 to={`/pay/${order.id}`}
                 className="inline-flex items-center gap-1.5 rounded-btn bg-emerald-700 px-4 py-2 text-xs font-bold text-white hover:bg-emerald-800 transition-colors shadow-sm"
               >
-                <span>Pay ₹{order.total} with UPI</span>
+                <span>{proofStatus === 'PAYMENT_REJECTED' ? 'Submit fresh proof' : `Pay ₹${order.total} with UPI`}</span>
                 <ArrowRight className="h-3.5 w-3.5" />
               </Link>
+            </div>
+          </div>
+        )}
+
+        {/* Pending-verification banner */}
+        {isUnpaid && proofStatus === 'PAYMENT_PROOF_SUBMITTED' && (
+          <div className="rounded-card border border-emerald-300 bg-emerald-50 p-4 text-left flex items-start gap-3">
+            <CheckCircle2 className="h-5 w-5 text-emerald-700 shrink-0 mt-0.5" />
+            <div className="flex-1 space-y-1">
+              <p className="text-xs sm:text-sm font-bold text-emerald-900">
+                Payment proof submitted successfully. Your order is waiting for admin verification.
+              </p>
+              <p className="text-xs text-emerald-800">
+                The kitchen starts cooking as soon as an admin verifies your payment — no further action needed.
+              </p>
             </div>
           </div>
         )}

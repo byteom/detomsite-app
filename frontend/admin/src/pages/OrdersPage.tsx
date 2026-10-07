@@ -206,6 +206,15 @@ export function OrdersPage() {
       align: 'right',
       render: (o: any) => (
         <div className="flex items-center justify-end gap-1.5">
+          {(o.payment_method || 'UPI').toUpperCase() !== 'COD' && (
+            <a
+              href={`/orders/${o.id}`}
+              title="Open payment verification"
+              className="inline-flex items-center gap-1 border border-emerald-600/40 bg-emerald-50 dark:bg-emerald-900/30 text-emerald-800 dark:text-emerald-300 px-2 py-1 text-[11px] font-bold hover:bg-emerald-100"
+            >
+              Verify
+            </a>
+          )}
           {['Pending Payment', 'Pending Acceptance', 'Pending', 'Placed', 'Accepted'].includes(
             o.status
           ) && (

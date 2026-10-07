@@ -29,9 +29,10 @@ export function PaymentsPage() {
   const [shares, setShares] = useState<any>({ vendors: [], summary: {} })
   const [payments, setPayments] = useState<any[]>([])
   const [sharePayments, setSharePayments] = useState<any[]>([])
+  const [proofQueue, setProofQueue] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
-  const [activeTab, setActiveTab] = useState<'shares' | 'records' | 'orders'>('shares')
+  const [activeTab, setActiveTab] = useState<'queue' | 'shares' | 'records' | 'orders'>('queue')
   const [shareErr, setShareErr] = useState('')
   const [msg, setMsg] = useState('')
 
@@ -41,15 +42,17 @@ export function PaymentsPage() {
     setShareErr('')
 
     try {
-      const [sharesRes, paymentsRes, sharePayRes] = await Promise.all([
+      const [sharesRes, paymentsRes, sharePayRes, queueRes] = await Promise.all([
         api.get('/admin/payments/monthly-shares').catch(() => ({ data: { vendors: [], summary: {} } })),
         api.get('/admin/payments').catch(() => ({ data: [] })),
         api.get('/admin/payments/share-records').catch(() => ({ data: [] })),
+        api.get('/local/payments/verification-queue').catch(() => ({ data: [] })),
       ])
 
       setShares(sharesRes.data || { vendors: [], summary: {} })
       setPayments(paymentsRes.data || [])
       setSharePayments(sharePayRes.data || [])
+      setProofQueue(Array.isArray(queueRes.data) ? queueRes.data : [])
     } catch (e: any) {
       setShareErr(apiError(e, 'Could not load payment records'))
     } finally {
@@ -244,6 +247,87 @@ export function PaymentsPage() {
     },
   ]
 
+  // Manual UPI proof verification queue (UTR + screenshot, admin-verified).
+  const queueColumns: Column<any>[] = [
+    {
+      key: 'order_token',
+      header: 'Order',
+      sortable: true,
+      render: (q: any) => (
+        <a
+          href={`/orders/${q.order_id}`}
+          className="font-mono font-black text-xs text-emerald-700 dark:text-emerald-400 hover:underline"
+        >
+          #{q.order_token || q.order_id}
+        </a>
+      ),
+    },
+    {
+      key: 'customer_name',
+      header: 'Customer',
+      sortable: true,
+      render: (q: any) => (
+        <div>
+          <p className="font-bold text-[var(--text-heading)]">{q.customer_name || '—'}</p>
+          <p className="text-[11px] text-[var(--text-muted)]">{q.customer_phone || ''}</p>
+        </div>
+      ),
+    },
+    {
+      key: 'amount',
+      header: 'Amount',
+      sortable: true,
+      align: 'right',
+      render: (q: any) => (
+        <span className="font-mono font-black text-[var(--text-heading)]">₹{q.amount}</span>
+      ),
+    },
+    {
+      key: 'utr_number',
+      header: 'UTR / Txn Ref',
+      render: (q: any) => (
+        <span className="font-mono text-xs text-[var(--text-body)]">{q.utr_number || '—'}</span>
+      ),
+    },
+    {
+      key: 'payment_screenshot_url',
+      header: 'Screenshot',
+      render: (q: any) =>
+        q.payment_screenshot_url ? (
+          <a href={q.payment_screenshot_url} target="_blank" rel="noreferrer" title="Open full screenshot">
+            <img
+              src={q.payment_screenshot_url}
+              alt="Payment screenshot"
+              className="h-12 w-12 rounded border border-[var(--border-main)] object-cover"
+            />
+          </a>
+        ) : (
+          <span className="text-xs text-[var(--text-dim)] italic">—</span>
+        ),
+    },
+    {
+      key: 'payment_submitted_at',
+      header: 'Submitted',
+      sortable: true,
+      render: (q: any) => (
+        <span className="text-[var(--text-muted)] text-xs">{fmtTime(q.payment_submitted_at)}</span>
+      ),
+    },
+    {
+      key: 'actions',
+      header: 'Verify',
+      align: 'right',
+      render: (q: any) => (
+        <a
+          href={`/orders/${q.order_id}`}
+          className="inline-flex items-center gap-1 bg-emerald-700 dark:bg-emerald-600 text-white px-2.5 py-1 text-[11px] font-bold hover:bg-emerald-800"
+        >
+          Open <ExternalLink className="w-3 h-3" />
+        </a>
+      ),
+    },
+  ]
+
   // Order Payments Columns
   const orderPaymentColumns: Column<any>[] = [
     {
@@ -392,6 +476,17 @@ export function PaymentsPage() {
       {/* View Switcher Tabs */}
       <div className="flex flex-wrap items-center gap-1.5 border-b border-[var(--border-main)] pb-2">
         <button
+          onClick={() => setActiveTab('queue')}
+          className={`px-3 py-1.5 text-xs font-bold transition-colors ${
+            activeTab === 'queue'
+              ? 'bg-emerald-700 dark:bg-emerald-600 text-white'
+              : 'bg-[var(--bg-surface-subtle)] text-[var(--text-body)] hover:bg-[var(--bg-surface-hover)] border border-[var(--border-main)]'
+          }`}
+          style={{ borderRadius: 0 }}
+        >
+          Verify Proofs ({proofQueue.length})
+        </button>
+        <button
           onClick={() => setActiveTab('shares')}
           className={`px-3 py-1.5 text-xs font-bold transition-colors ${
             activeTab === 'shares'
@@ -429,6 +524,18 @@ export function PaymentsPage() {
       </div>
 
       {/* Tab Panels */}
+      {activeTab === 'queue' && (
+        <DataTable
+          columns={queueColumns}
+          data={proofQueue}
+          loading={loading}
+          searchPlaceholder="Search by customer, order or UTR..."
+          searchableKeys={['customer_name', 'customer_phone', 'order_id', 'utr_number']}
+          emptyTitle="No proofs awaiting verification"
+          emptyDescription="When a student submits a UTR + payment screenshot, it appears here — and the admin gets a Telegram notification with a direct link."
+        />
+      )}
+
       {activeTab === 'shares' && (
         <DataTable
           columns={vendorColumns}

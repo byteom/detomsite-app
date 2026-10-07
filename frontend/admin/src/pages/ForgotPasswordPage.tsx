@@ -17,17 +17,28 @@ export function ForgotPasswordPage() {
   const [done, setDone] = useState(false)
   const [loading, setLoading] = useState(false)
 
-  const requestOtp = async (e: FormEvent) => {
-    e.preventDefault()
+  const friendlyError = (err: any, fallback: string) => {
+    if (err?.response?.status === 503) {
+      return 'We could not send the reset email right now. Please try again shortly — or contact the server admin.'
+    }
+    return apiError(err, fallback)
+  }
+
+  const requestOtp = async (e?: FormEvent) => {
+    e?.preventDefault()
     setErr('')
     setInfo('')
+    if (!identifier.trim()) {
+      setErr('Enter your admin username or email.')
+      return
+    }
     setLoading(true)
     try {
-      const res = await api.post('/users/forgot-password', { identifier })
-      setInfo(res.data?.message || 'A 6-digit recovery code was sent to your registered address.')
+      const res = await api.post('/admin/forgot-password', { identifier: identifier.trim() })
+      setInfo(res.data?.message || 'A 4-digit recovery code was sent to your registered address.')
       setStep('otp')
     } catch (err: any) {
-      setErr(apiError(err, 'Request failed. Please verify your username or email.'))
+      setErr(friendlyError(err, 'Request failed. Please verify your username or email.'))
     } finally {
       setLoading(false)
     }
@@ -41,16 +52,20 @@ export function ForgotPasswordPage() {
       setErr('Passwords do not match')
       return
     }
-    if (pw.length < 4) {
-      setErr('Password must be at least 4 characters')
+    if (pw.length < 8) {
+      setErr('Password must be at least 8 characters')
+      return
+    }
+    if (otp.trim().length < 4) {
+      setErr('Enter the 4-digit code sent to your email.')
       return
     }
     setLoading(true)
     try {
-      await api.post('/users/reset-password', { identifier, otp, new_password: pw })
+      await api.post('/admin/reset-password', { identifier: identifier.trim(), otp: otp.trim(), new_password: pw })
       setDone(true)
     } catch (err: any) {
-      setErr(apiError(err, 'Password reset failed. Invalid or expired code.'))
+      setErr(friendlyError(err, 'Password reset failed. Invalid or expired code.'))
     } finally {
       setLoading(false)
     }
@@ -134,26 +149,26 @@ export function ForgotPasswordPage() {
               />
 
               <Button type="submit" variant="primary" size="md" loading={loading} className="w-full">
-                Send 6-Digit Code
+                Send 4-Digit Code
               </Button>
             </form>
           ) : (
             <form onSubmit={resetPw} className="space-y-4">
               <p className="text-xs text-[var(--text-body)] leading-relaxed">
-                Enter the <b>6-digit code</b> sent to your registered address along with your new
+                Enter the <b>4-digit code</b> sent to your registered address along with your new
                 password. Code expires in 15 minutes.
               </p>
 
               <div>
                 <label className="block text-xs font-bold uppercase tracking-wider text-[var(--text-heading)] mb-1.5">
-                  6-Digit Verification Code
+                  4-Digit Verification Code
                 </label>
                 <input
                   type="text"
                   inputMode="numeric"
                   value={otp}
-                  onChange={e => setOtp(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                  placeholder="••••••"
+                  onChange={e => setOtp(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                  placeholder="••••"
                   className="w-full text-center text-2xl font-mono font-bold tracking-[0.4em] bg-[var(--bg-surface)] border border-[var(--border-main)] py-2 text-[var(--text-heading)] outline-none focus:border-emerald-600 transition-colors"
                   style={{ borderRadius: 0 }}
                   required
@@ -165,7 +180,7 @@ export function ForgotPasswordPage() {
                 type="password"
                 value={pw}
                 onChange={e => setPw(e.target.value)}
-                placeholder="At least 4 characters"
+                placeholder="At least 8 characters"
                 required
               />
 
@@ -182,7 +197,15 @@ export function ForgotPasswordPage() {
                 Verify & Update Password
               </Button>
 
-              <div className="text-center pt-2">
+              <div className="text-center pt-2 flex items-center justify-center gap-4">
+                <button
+                  type="button"
+                  onClick={() => requestOtp()}
+                  disabled={loading}
+                  className="text-xs font-bold text-emerald-700 dark:text-emerald-400 hover:underline disabled:opacity-50"
+                >
+                  Resend code
+                </button>
                 <button
                   type="button"
                   onClick={() => {

@@ -151,10 +151,35 @@ class Settings(BaseSettings):
     DEFAULT_SUPER_ADMIN_EMAIL: str = ""
     DEFAULT_SUPER_ADMIN_PASSWORD: str = ""
     
-    # Cloudinary
+    # Cloudinary — primary image/file storage. Secrets stay server-side;
+    # the frontend only ever receives secure delivery URLs.
     CLOUDINARY_CLOUD_NAME: str = ""
     CLOUDINARY_API_KEY: str = ""
     CLOUDINARY_API_SECRET: str = ""
+    # Folder prefix for every asset this app uploads (payment screenshots go
+    # to <prefix>/payments/<order_id>/).
+    CLOUDINARY_FOLDER_PREFIX: str = "detomsite"
+    # Payment screenshot upload guard (also enforced in the frontend).
+    PAYMENT_SCREENSHOT_MAX_MB: int = 5
+
+    # Telegram admin notifications — bot token and admin chat stay server-side.
+    # Created via BotFather; chat id from getUpdates after the admin messages
+    # the bot once.
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_ADMIN_CHAT_ID: str = ""
+    # Admin portal base URL for the Telegram "VIEW ORDER" button. The admin
+    # portal is a separate deployment from the student frontend, so this
+    # defaults to FRONTEND_URL only when unset. The button opens
+    # <base>/admin/orders/<orderId> on the legacy portal, or
+    # <base>/orders/<orderId> on the split admin portal (see ADMIN_ORDER_PATH).
+    ADMIN_PORTAL_URL: str = ""
+    # Path (under FRONTEND_URL) the Telegram "VIEW ORDER" button opens.
+    ADMIN_ORDER_PATH: str = "/admin/orders"
+    # Inbound Telegram webhook (lets the bot answer /start, /help, /status).
+    # Register with: setWebhook?url=<BACKEND_URL>/api/v1/local/telegram/webhook
+    # When set, Telegram must send it back as X-Telegram-Bot-Api-Secret-Token
+    # (pass secret_token=... in the setWebhook call) or updates are refused.
+    TELEGRAM_WEBHOOK_SECRET: str = ""
     
     # Razorpay
     RAZORPAY_KEY_ID: str = ""
@@ -183,6 +208,7 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     SMTP_FROM: str = "DETOMSITE <no-reply@detomsite.local>"
     SMTP_USE_TLS: bool = True
+    SMTP_TIMEOUT_SECONDS: int = 15
 
     # Resend (https://resend.com) — preferred delivery path for the OTP / reset
     # emails. When RESEND_API_KEY is set, the email service sends via the Resend

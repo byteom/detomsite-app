@@ -1,14 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- READ_SMS ships with every release to bridge the old auto-forward
-         path. The phone also needs android.permission.RECEIVE_SMS declared
-         so it is treated as the default SMS handler for forwarding. -->
+    <!-- RECEIVE_SMS + READ_SMS are enough for SMS_RECEIVED delivery; the app
+         does NOT need to be the default SMS handler. -->
     <uses-permission android:name="android.permission.READ_SMS" />
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Lets the setup screen offer the system battery-optimization exemption
+         (PowerManager.isIgnoringBatteryOptimizations). Without it Doze/OEM
+         killers suspend the SMS receiver + WorkManager retries. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <!-- WhatsApp bot: polls the server in the background (foreground service),
          re-opens WhatsApp after a reboot, and needs "Display over other apps"
@@ -26,10 +29,10 @@
     </queries>
 
     <!--
-      allowBackup=false: this app stores the ADMIN BEARER TOKEN in
-      SharedPreferences. With backups on, that token is swept into Google Auto
-      Backup and can be restored onto another device — a full admin credential
-      leaving the phone without the admin ever seeing it. There is nothing here
+      allowBackup=false: this app stores the SMS agent shared key
+      (X-Agent-Key) in SharedPreferences. With backups on, that key is swept
+      into Google Auto Backup and can be restored onto another device — a
+      payment-settling credential leaving the phone silently. Nothing here is
       worth restoring, so backups are off entirely.
     -->
     <application

@@ -1,7 +1,7 @@
 """
 API routes backed by Supabase Postgres (the only database).
 """
-from fastapi import APIRouter, HTTPException, Depends, Header, Query, Request
+from fastapi import APIRouter, HTTPException, Depends, Header, Query, Request, UploadFile, File, Form
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from datetime import datetime, timezone
 import asyncio
@@ -24,13 +24,17 @@ from app.core.order_slots import (
 from app.core.security import hash_password, verify_password, create_access_token, create_refresh_token, decode_token
 from app.services import push_service
 from app.services import sms_service
+from app.services import cloudinary_service
+from app.services import telegram_service
 from typing import Any, Literal, Optional
 import logging
+import time
 
 from app.core.status_values import (
     ComplaintStatus,
     MenuChangeStatus,
     OrderStatus,
+    PaymentProofStatus,
     PaymentStatus,
     RefundStatus,
     ShopApprovalStatus,
@@ -90,12 +94,15 @@ def _order_age_minutes(order: dict) -> float | None:
         placed = placed.replace(tzinfo=KOLKATA_TZ)
     return (datetime.now(timezone.utc) - placed).total_seconds() / 60
 
-# Payment verification is UTR-ONLY: the student pastes the UPI transaction
-# reference (a string stored in the database) and the shop's bank credit SMS
-# carrying the same UTR auto-confirms the order. The old screenshot-upload
-# system was removed — files written to a serverless /tmp directory vanished
-# between invocations (which is why payments "didn't save"), and a UTR is the
-# stronger proof anyway.
+# Payment verification is MANUAL: the student pays the displayed UPI QR in
+# their own UPI app, then submits the UTR + a screenshot via
+# ``POST /payments/proof`` (stored on Cloudinary). An admin verifies the money
+# arrived and approves/rejects the proof by hand; only approval marks the
+# order paid. The old automated paths (bank-SMS auto-match, Razorpay gateway,
+# UTR-only submission) are cut off — their routes answer 410 Gone.
+#
+# Nothing here ever writes files to the server disk: screenshots live on
+# Cloudinary and the database keeps only the secure URL + public_id.
 
 
 
@@ -349,7 +356,11 @@ class LocalOrderCreate(BaseModel):
     @field_validator("payment_method")
     @classmethod
     def _validate_payment_method(cls, value: str) -> str:
-        return _clean_payment_method(value, ("UPI", "COD", "RAZORPAY"))
+        # CUT OFF — the Razorpay gateway is disabled: an order created with a
+        # gateway method could never be settled (both gateway endpoints answer
+        # 410), so it is refused at checkout instead of stranding the student.
+        # Prepaid orders go through manual UPI (UTR + screenshot proof).
+        return _clean_payment_method(value, ("UPI", "COD"))
 
 
 
@@ -469,8 +480,9 @@ class LocalPaymentCreate(BaseModel):
     @classmethod
     def _validate_method(cls, value: str) -> str:
         # Keep the caller's spelling (views display it) but refuse anything
-        # outside the methods the platform can actually settle.
-        if (value or "").strip().lower() not in {"manual utr", "upi", "cod", "razorpay"}:
+        # outside the methods the platform can actually settle. CUT OFF: the
+        # Razorpay gateway is disabled, so gateway rows can never be verified.
+        if (value or "").strip().lower() not in {"manual utr", "upi", "cod"}:
             raise ValueError("Unsupported payment method")
         return value
 
@@ -1269,7 +1281,10 @@ async def order_payment_status(order_id: str, current_user: dict = Depends(get_c
 
     payment = None
     try:
-        payment = await _db(db.get_payment_by_order_id, order_id)
+        if is_parent:
+            payment = await _db(db.get_parent_payment, order_id)
+        else:
+            payment = await _db(db.get_payment_by_order_id, order_id)
     except Exception as e:
         logger.warning(f"payment status lookup failed for {order_id}: {e}")
 
@@ -1284,6 +1299,11 @@ async def order_payment_status(order_id: str, current_user: dict = Depends(get_c
         # A UTR is stored as proof for the admin/bot, but it is never echoed
         # back — only the fact that one is on file.
         "utr_saved": bool(str((payment or {}).get("utr_number") or "").strip()),
+        # Manual-proof lifecycle (drives the student's pending/approved UI).
+        "proof_status": (payment or {}).get("proof_status") or (payment or {}).get("payment_proof_status") or "PENDING_PAYMENT",
+        "payment_submitted_at": str((payment or {}).get("payment_submitted_at") or ""),
+        "payment_verified_at": str((payment or {}).get("payment_verified_at") or ""),
+        "payment_rejection_reason": (payment or {}).get("payment_rejection_reason") or "",
     }
 
 
@@ -1893,153 +1913,29 @@ async def confirm_own_payment(
     data: LocalPaymentClaimConfirm,
     current_user: dict = Depends(get_current_local_user),
 ):
-    """Attach the student's UTR to their own pending order and re-arm matching.
+    """CUT OFF — automated UTR-claim verification is disabled.
 
-    This does NOT mark the order paid — that still requires bank evidence
-    (``/sms/match``). What it does is give the matcher something exact to
-    match: once a UTR is on file, an incoming credit carrying that same
-    reference settles the order through tier 1 instead of the amount-only tier
-    2, so the student is no longer dependent on being the only person at that
-    shop with an open bill of the same value.
+    Kept (not deleted) so old clients get an explicit answer instead of a
+    404. Use ``POST /payments/proof`` (UTR + screenshot, admin-verified).
     """
-    if not rate_allow(
-        "claim_payment", f"{current_user.get('id')}:{order_id}", max_attempts=10, window_sec=600
-    ):
-        raise HTTPException(
-            status_code=429, detail="Too many attempts — please wait a few minutes and try again."
-        )
-
-    order, _is_parent = await _resolve_owned_order(order_id, current_user)
-
-    utr = (data.utr_number or "").strip().upper()
-    if not _is_valid_utr(utr):
-        raise HTTPException(
-            status_code=422,
-            detail="That doesn't look like a UTR — it is usually a 12-digit number with no spaces or symbols.",
-        )
-
-    if str(order.get("payment_method") or "").upper() not in ("UPI", "MANUAL UTR"):
-        raise HTTPException(
-            status_code=400, detail="This is not a prepaid order — nothing to confirm."
-        )
-    if str(order.get("status") or "") not in _AWAITING_PAYMENT_STATUSES:
-        raise HTTPException(
-            status_code=409, detail="This order is no longer awaiting payment."
-        )
-
-    server_total = int(round(float(order.get("total") or 0)))
-
-    # One UTR = one payment. A reference already filed against a DIFFERENT
-    # order is refused, so a student cannot park the same UTR on two baskets.
-    existing = await _db(db.get_payment_by_utr, utr)
-    if existing and str(existing.get("order_id") or "") != str(order_id):
-        raise HTTPException(
-            status_code=409,
-            detail="This UTR is already saved on another order — please double-check the number.",
-        )
-
-    payment = await _db(db.set_payment_utr, order_id, utr)
-    if not payment:
-        payment = await _db(db.create_payment, order_id, server_total, "Manual UTR", utr)
-    if not payment:
-        raise HTTPException(
-            status_code=400, detail="Could not save the reference — please try again."
-        )
-
-    _push_admin(
-        "Payment reference submitted",
-        f"Order #{order.get('token')} — the student submitted UTR {utr} for ₹{server_total}.",
-        tag="payment-verify",
+    raise HTTPException(
+        status_code=410,
+        detail="Automatic payment confirmation is disabled. Please submit your UTR + payment screenshot for admin verification.",
     )
-    return {
-        "message": (
-            "Reference saved. Your order unlocks as soon as the shop's payment "
-            "confirmation reaches us — this usually takes a few seconds."
-        ),
-        "order_id": order_id,
-        "utr_saved": True,
-    }
 
 
 @router.post("/payments/utr")
 async def submit_payment_utr(data: LocalPaymentUtr, request: Request, current_user: dict = Depends(get_current_local_user)):
-    """Optional: the student may paste the UPI transaction UTR after paying.
+    """CUT OFF — UTR-only submission is disabled (screenshot is mandatory).
 
-    The UTR verification method (bank-SMS credit check + same-amount
-    matching) was removed: this endpoint only STORES the reference against
-    the order's payment record so the admin can review it in Admin Center →
-    Payments. If the checkout failed to create the payment row (the old
-    "record didn't save" bug), this endpoint creates it on the spot from the
-    SERVER-side order total — a UTR paste always saves.
+    Kept (not deleted) so old clients get an explicit answer instead of a
+    404. Use ``POST /payments/proof`` (multipart: order_id + utr_number +
+    screenshot), which an admin manually verifies.
     """
-    # PENTEST FIX: bound UTR submissions per student+IP — every call writes to
-    # (or probes) the payment record, so it must not be an unthrottled write
-    # primitive. 12 per 5 minutes is far beyond any real retry pattern.
-    if not rate_allow("utr", f"{current_user.get('id')}:{rate_ip(request)}", max_attempts=12, window_sec=300):
-        raise HTTPException(status_code=429, detail="Too many UTR attempts — please wait a few minutes and try again.")
-
-    # PENTEST FIX: a UTR is an alphanumeric reference (UPI UTRs are 12 digits).
-    # Reject anything else BEFORE touching the order so junk/symbol-laden input
-    # never reaches a query, and the student gets a message they can act on.
-    #
-    # PENTEST FIX 2: ``str.isalnum()`` is Unicode-aware, so it happily accepts
-    # Cyrillic look-alikes ("АВСDЕF"), circled digits ("①②③") and precomposed
-    # accented letters. Those are visually identical to the ASCII UTR a student
-    # actually paid with, yet compare as a DIFFERENT string — so the same real
-    # bank reference could be filed twice under two spellings and defeat the
-    # "one UTR = one payment" replay guard. A UTR is ASCII, so require that.
-    utr = (data.utr_number or "").strip().upper()
-    if not _is_valid_utr(utr):
-        raise HTTPException(
-            status_code=422,
-            detail="That doesn't look like a UTR — it is usually a 12-digit number with no spaces or symbols.",
-        )
-
-    # Resolve across single orders AND multi-shop parent orders — the multi
-    # checkout pays one bill whose payment row lives on the parent, so the old
-    # orders-only lookup made every parent UTR save 404 ("Order not found").
-    order, is_parent = await _resolve_owned_order(data.order_id, current_user)
-
-    # PENTEST FIX: a reference is only meaningful while the order still awaits
-    # payment — pasting a UTR onto a cancelled / delivered / settled order just
-    # pollutes the admin's verify queue with proof for food never owed. Admins
-    # (the tools manager) may still annotate any order.
-    if current_user.get("role") != "admin" and str(order.get("status") or "") not in _AWAITING_PAYMENT_STATUSES:
-        raise HTTPException(status_code=409, detail="This order is no longer awaiting payment — nothing left to verify.")
-
-    server_total = int(round(float(order.get("total") or 0)))
-
-    # One UTR = one payment: both databases enforce a unique index on
-    # payments.utr_number. Pre-check so a re-used reference gets a FRIENDLY
-    # 409 instead of the raw 500 crash students saw as "it didn't save".
-    existing = await _db(db.get_payment_by_utr, utr)
-    if existing and str(existing.get("order_id") or "") != str(data.order_id):
-        raise HTTPException(
-            status_code=409,
-            detail="This UTR is already saved on another order — double-check the number, or contact support with your token.",
-        )
-
-    payment = await _db(db.set_payment_utr, data.order_id, utr)
-    if not payment:
-        if is_parent:
-            payment = await _db(
-                db.record_parent_payment, data.order_id, server_total, "Manual UTR", utr
-            )
-        else:
-            payment = await _db(
-                db.create_payment, data.order_id, server_total, "Manual UTR", utr
-            )
-    if not payment:
-        raise HTTPException(status_code=400, detail="Could not save the UTR for this order — please try again.")
-
-    # UTR verification (bank-SMS credit check + same-amount matching) was
-    # removed from the portal flow: a saved UTR is only a reference for the
-    # admin to review in Admin Center → Payments.
-    return {
-        "message": "UTR saved — the admin will verify your payment shortly.",
-        "payment": payment,
-        "order": None,
-    }
+    raise HTTPException(
+        status_code=410,
+        detail="UTR-only submission is disabled. Please submit your UTR together with the payment screenshot for admin verification.",
+    )
 
 
 @router.post("/sms/incoming")
@@ -2080,16 +1976,18 @@ async def sms_incoming(data: LocalIncomingSms, request: Request, x_agent_key: Op
 
     report = {"received": True, "phone": phone, "text": text, "order": None}
 
-    # All bank proofs use the same strict UTR + shop + amount match.
+    # CUT OFF — automatic bank-credit settlement is disabled. An SMS carrying
+    # a UTR + amount used to auto-confirm the order here; payment is now
+    # verified manually by an admin from the student's UTR + screenshot proof.
+    # The YES/NO shop-acceptance flow below is kept (acceptance, not payment).
     utr = _extract_utr(text)
     amount = _extract_amount(text)
     if utr and amount is not None:
-        # Already past the agent gate above — go straight to the matching core
-        # instead of re-entering the HTTP-level key check.
-        result = await _sms_match_core(LocalSmsMatch(phone=phone, utr=utr, amount=amount))
-        report["order"] = await _get_order(result["order_id"])
-        report["matched"] = result
-        return report
+        await _log_sms_inbound("", phone, f"bank-credit ignored:{utr}", "Ignored")
+        raise HTTPException(
+            status_code=410,
+            detail="Automatic bank verification is disabled. Payments are verified manually by an admin.",
+        )
     # Bank text must not fall through to YES/NO commands (e.g. "Ref No").
     if not re.fullmatch(r"(?i)(?:yes|y|confirm|accept|ok|no|n|reject|decline|cancel)\s+#?\d+", text):
         raise HTTPException(status_code=400, detail="Unrecognised or ambiguous SMS; manual review required")
@@ -2190,38 +2088,27 @@ class LocalSmsMatch(BaseModel):
     # Empty is allowed (QR / no-claim case). When present it must still look
     # like a real reference — the ASCII check in _sms_match_core is the guard
     # that stops a look-alike UTR from defeating the one-UTR-one-payment rule.
-    utr: str = Field(default="", max_length=30, pattern=r"^[A-Za-z0-9]*$")
-    amount: float = Field(..., gt=0, allow_inf_nan=False)
+    # max_length 40 to match _is_valid_utr (6-40) and LocalPaymentUtr: a 31-40
+    # char legit reference must reach the ASCII validator (422 with a helpful
+    # message) instead of dying at schema validation.
+    utr: str = Field(default="", max_length=40, pattern=r"^[A-Za-z0-9]*$")
+    amount: float = Field(..., gt=0, le=1_000_000, allow_inf_nan=False)
 
 
 @router.post("/sms/match")
 async def sms_match(data: LocalSmsMatch, request: Request, x_agent_key: Optional[str] = Header(None)):
-    """Privacy-first auto-confirm: the shop's Android agent extracts the UTR
-    and amount **on-device** and sends only the minimal proof here — the raw
-    bank SMS text never leaves the phone.
+    """CUT OFF — automatic bank-credit settlement is disabled.
 
-    This is the website↔bot join: an order placed in the student portal is
-    settled here the moment the shop's bank credits the money, and the result
-    is reflected in both the student and the admin portal (see
-    ``_sms_match_core`` for the two matching tiers and the fail-closed rules).
+    Kept (not deleted, agent-key gate intact) so monitoring gets an explicit
+    answer instead of a 404. Payment is now verified manually by an admin from
+    the student's UTR + screenshot proof (``POST /payments/proof``).
     """
-    # Agent auth: fail closed. Only the Android agent (which holds the shared
-    # key) may submit bank SMS — an unset key must NOT mean "everyone is the
-    # agent", because this endpoint can mark an order paid.
+    # Agent auth stays FIRST so unauthenticated callers still learn nothing.
     _require_agent_key(x_agent_key, request)
-    # Bound how many orders ONE agent key may settle in an hour. The shared key
-    # lives in a phone's SharedPreferences and is pasted into every shop's
-    # device, so a leaked copy would otherwise be an unlimited "mark any order
-    # paid" primitive. A real shop never settles 60 orders an hour, and the
-    # budget is per shop, so a busy campus does not lock itself out.
-    if not rate_allow(
-        "bank_match", str(data.phone or "")[-10:], max_attempts=60, window_sec=3600
-    ):
-        raise HTTPException(
-            status_code=429,
-            detail="Too many payment matches from this shop — please try again in a little while.",
-        )
-    return await _sms_match_core(data)
+    raise HTTPException(
+        status_code=410,
+        detail="Automatic bank verification is disabled. Payments are verified manually by an admin.",
+    )
 
 
 async def _sms_match_core(data: LocalSmsMatch) -> dict:
@@ -2275,35 +2162,23 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
             raise HTTPException(status_code=404, detail="No shop found matching this phone number")
 
         orders = await _db(db.list_orders_by_shop, shop["id"])
-        payments = await _db(db.list_payments) or []
-        # One pass builds the order→payment index tier 2 needs, so a same-amount
-        # credit never costs N extra round-trips to the database.
-        #
-        # BUG FIX: ``list_payments()`` returns rows NEWEST-FIRST (both stores
-        # order by created_at DESC / rowid DESC). A plain dict comprehension lets
-        # the LAST assignment win, which silently kept the OLDEST payment row for
-        # an order — disagreeing with ``get_payment_by_order_id``, which takes the
-        # newest. An order carrying two payment rows (a retried checkout, or one
-        # that was cancelled and re-recorded) was therefore judged on a dead
-        # payment intent: a stale "Cancelled" row made the bot refuse a
-        # legitimate payment, and a stale "Pending" row could let it settle one
-        # that was already closed. ``setdefault`` keeps the FIRST row seen — the
-        # newest — matching the rest of the codebase.
-        payment_by_order: dict[str, dict] = {}
-        for p in payments:
-            row_order_id = str(p.get("order_id") or "")
-            if row_order_id:
-                payment_by_order.setdefault(row_order_id, p)
+        # Indexed lookups only (no full-table list_payments scan): Tier-1 reads
+        # exactly the rows carrying this UTR via the partial unique index;
+        # Tier-2 pre-filters orders in Python, then batch-fetches only those
+        # payments in ONE indexed query. Per Postgres UPDATE..RETURNING docs a
+        # single conditional UPDATE is atomic, so the final settle below
+        # serializes concurrent credits on the row lock.
+        if utr:
+            claims = await _db(db.list_payments_by_utr, utr)
+        else:
+            claims = []
         # A claim only exists when the agent actually sent a reference. Without
         # this guard an empty ``utr`` would equal the empty ``utr_number`` of
         # every QR order (checkout records ``utr_number: ""``), so ``claims``
         # would collect ALL of them and the first one would be settled as if the
         # student had claimed it — settling an arbitrary customer's order. An
         # absent reference must fall through to tier 2, never impersonate a claim.
-        claims = [
-            p for p in payments
-            if utr and str(p.get("utr_number") or "").strip().upper() == utr
-        ]
+        # (claims already filtered by indexed lookup above; empty utr -> no claim)
 
         payment = None
         order = None
@@ -2330,7 +2205,10 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
             )
         else:
             # ── Tier 2: match the credit against this shop's open UPI orders ──
-            candidates = []
+            # Pre-filter orders (shop already scoped) by status/method/amount/
+            # recency first, then batch-fetch ONLY those payments in one indexed
+            # query — never the whole payments table.
+            prefiltered = []
             for candidate in orders:
                 if str(candidate.get("status") or "") not in BANK_SETTLEABLE_STATUSES:
                     continue
@@ -2338,6 +2216,26 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
                     continue
                 if abs(float(candidate.get("total") or 0) - amount) >= 0.01:
                     continue
+                age = _order_age_minutes(candidate)
+                if age is None or age > BANK_MATCH_WINDOW_MINUTES or age < -5:
+                    continue
+                prefiltered.append(candidate)
+            payment_by_order: dict[str, dict] = {}
+            if prefiltered:
+                try:
+                    payment_by_order = await _db(
+                        db.get_payments_map_by_order_ids,
+                        [str(c.get("id") or "") for c in prefiltered],
+                    ) or {}
+                except AttributeError:
+                    # Extremely old store without batch helper — fall back to
+                    # per-order indexed reads (still no full-table scan).
+                    for c in prefiltered:
+                        row = await _db(db.get_payment_by_order_id, str(c.get("id") or ""))
+                        if row:
+                            payment_by_order[str(c.get("id") or "")] = row
+            candidates = []
+            for candidate in prefiltered:
                 row = payment_by_order.get(str(candidate.get("id") or ""))
                 # The order must actually have been presented for payment…
                 if not row:
@@ -2347,11 +2245,6 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
                 if str(row.get("status") or "") in ("Success", "Cancelled", "Failed", "Rejected"):
                     continue
                 if abs(float(row.get("amount") or 0) - amount) >= 0.01:
-                    continue
-                # Only a *recent* order may be settled this way, so a stale
-                # same-amount row can't be picked up by today's credit.
-                age = _order_age_minutes(candidate)
-                if age is None or age > BANK_MATCH_WINDOW_MINUTES or age < -5:
                     continue
                 candidates.append((candidate, row))
 
@@ -2429,7 +2322,21 @@ async def _sms_match_core(data: LocalSmsMatch) -> dict:
             if stamped:
                 payment = stamped
 
-        await _db(db.update_payment_status, payment["id"], "Success")
+        # Atomic settle: single conditional UPDATE ... WHERE status NOT IN
+        # (Success/Cancelled/Failed/Rejected) ... RETURNING * (Postgres docs:
+        # one statement is atomic + holds the row lock to COMMIT). Concurrent
+        # duplicate credits serialize here — loser gets None -> 409 instead of
+        # double-settling. Falls back to legacy update when the store lacks
+        # the helper (very old modules).
+        try:
+            settled = await _db(db.settle_payment_if_open, payment["id"])
+        except AttributeError:
+            settled = await _db(db.update_payment_status, payment["id"], "Success")
+        if not settled:
+            raise HTTPException(
+                status_code=409,
+                detail="This payment is already settled — nothing left to verify.",
+            )
 
         # RELEASE POINT: a prepaid order was held back from the shop at creation
         # time, so the bank credit matching here is the moment the shop finally
@@ -2833,61 +2740,16 @@ async def create_razorpay_order(
     data: LocalRazorpayOrderCreate,
     current_user: dict = Depends(get_current_local_user),
 ):
-    """Create a Razorpay order for payment.
+    """CUT OFF — automated Razorpay verification is disabled.
 
-    Authenticated AND amount-bound: the payable amount is derived from the
-    STORED order total, never from the request body. Previously the caller's
-    ``amount`` was forwarded to the gateway as-is and no token was required, so
-    anyone could open a ₹1 gateway order against a ₹500 local order.
+    Kept (not deleted) so old clients get an explicit answer instead of a
+    404. Use ``POST /payments/proof`` (manual UPI: UTR + screenshot,
+    admin-verified).
     """
-    order, is_parent = await _resolve_owned_order(data.order_id, current_user)
-
-    payment_settings = await _db(db.get_payment_settings)
-    if not payment_settings.get("razorpay_enabled"):
-        raise HTTPException(status_code=400, detail="Razorpay is not enabled by admin")
-
-    key_id = settings.RAZORPAY_KEY_ID
-    key_secret = settings.RAZORPAY_KEY_SECRET
-    if not key_id or not key_secret:
-        raise HTTPException(status_code=500, detail="Razorpay API keys not configured on server")
-
-    if str(order.get("status") or "") != "Pending Payment":
-        raise HTTPException(status_code=400, detail="This order is not awaiting an online payment.")
-
-    expected_paise = int(round(float(order.get("total") or 0) * 100))
-    if expected_paise <= 0:
-        raise HTTPException(status_code=400, detail="This order has nothing left to pay.")
-    if int(data.amount) != expected_paise:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Payment amount must be ₹{expected_paise // 100} for this order.",
-        )
-
-    try:
-        import razorpay
-        client = razorpay.Client(auth=(key_id, key_secret))
-
-        # Create Razorpay order (network call — off the event loop)
-        razorpay_order = await asyncio.to_thread(
-            client.order.create,
-            {
-                "amount": expected_paise,
-                "currency": data.currency,
-                "receipt": data.order_id,
-                "payment_capture": 1,  # Auto-capture
-            },
-        )
-
-        return {
-            "razorpay_order_id": razorpay_order["id"],
-            "amount": razorpay_order["amount"],
-            "currency": razorpay_order["currency"],
-            "key_id": key_id,
-            "order_id": data.order_id,
-        }
-    except Exception as e:
-        logger.error(f"Error creating Razorpay order: {e}")
-        raise HTTPException(status_code=400, detail=f"Could not create payment: {str(e)}")
+    raise HTTPException(
+        status_code=410,
+        detail="Online gateway payments are disabled. Please pay via UPI and submit your UTR + payment screenshot for admin verification.",
+    )
 
 
 @router.post("/payments/verify-razorpay")
@@ -2895,101 +2757,16 @@ async def verify_razorpay_payment(
     data: LocalRazorpayVerify,
     current_user: dict = Depends(get_current_local_user),
 ):
-    """Verify a Razorpay payment signature and mark the order paid.
+    """CUT OFF — automated Razorpay verification is disabled.
 
-    Three independent checks are enforced before the order is marked paid:
-    the caller must own the order, the captured amount must equal the stored
-    order total, and the gateway payment id must not already be recorded
-    against another order (replay). Without them a single ₹1 payment could be
-    presented as settling an arbitrary order.
+    Kept (not deleted) so old clients get an explicit answer instead of a
+    404. Use ``POST /payments/proof`` (manual UPI: UTR + screenshot,
+    admin-verified).
     """
-    order, is_parent = await _resolve_owned_order(data.order_id, current_user)
-
-    if str(order.get("status") or "") != "Pending Payment":
-        raise HTTPException(status_code=400, detail="This order is not awaiting an online payment.")
-
-    key_secret = settings.RAZORPAY_KEY_SECRET
-    if not key_secret:
-        raise HTTPException(status_code=500, detail="Razorpay secret not configured")
-
-    try:
-        import razorpay
-        client = razorpay.Client(auth=(settings.RAZORPAY_KEY_ID, key_secret))
-
-        # Verify signature
-        params_dict = {
-            "razorpay_order_id": data.razorpay_order_id,
-            "razorpay_payment_id": data.razorpay_payment_id,
-            "razorpay_signature": data.razorpay_signature,
-        }
-        await asyncio.to_thread(client.utility.verify_payment_signature, params_dict)
-
-        # Fetch payment details to get amount (network call — off the event loop)
-        payment_info = await asyncio.to_thread(client.payment.fetch, data.razorpay_payment_id)
-        amount_paise = payment_info.get("amount", 0)
-        amount_rupees = amount_paise // 100
-
-        # ─── Amount binding: the gateway amount must match the order total ───
-        expected_rupees = float(order.get("total") or 0)
-        if abs(amount_rupees - expected_rupees) >= 0.01:
-            raise HTTPException(
-                status_code=400,
-                detail=f"The amount paid (₹{amount_rupees}) does not match this order's total (₹{int(expected_rupees)}).",
-            )
-
-        # ─── Replay guard: one gateway payment settles exactly one order ───
-        existing_payments = await _db(db.list_payments)
-        if any(
-            str(p.get("utr_number") or "").strip() == data.razorpay_payment_id
-            for p in existing_payments
-        ):
-            raise HTTPException(status_code=409, detail="This payment has already been applied to an order.")
-        if any(
-            str(p.get("order_id") or "") == data.order_id and str(p.get("status") or "") == "Success"
-            for p in existing_payments
-        ):
-            raise HTTPException(status_code=409, detail="This order has already been paid.")
-
-        # Create payment record in local DB
-        if is_parent:
-            payment = await _db(
-                db.record_parent_payment,
-                data.order_id,
-                amount_rupees,
-                "Razorpay",
-                data.razorpay_payment_id,
-                None,
-            )
-        else:
-            payment = await _db(
-                db.create_payment,
-                order_id=data.order_id,
-                amount=amount_rupees,
-                method="Razorpay",
-                utr_number=data.razorpay_payment_id,
-            )
-        if not payment:
-            raise HTTPException(status_code=400, detail="Could not save payment record")
-
-        # Payment verified → the order is now genuinely paid and can move on to
-        # the shop's acceptance queue. Parent (multi-shop) orders keep their
-        # status on parent_orders.
-        if is_parent:
-            await _db(db.update_parent_order_status, data.order_id, "Pending Acceptance")
-        else:
-            await _db(db.update_order_status, data.order_id, "Pending Acceptance")
-
-        return {
-            "message": "Payment verified successfully",
-            "payment": payment,
-        }
-    except HTTPException:
-        # Ownership/amount/replay rejections must reach the client as-is instead
-        # of being flattened into the generic "verification failed" 400 below.
-        raise
-    except Exception as e:
-        logger.error(f"Error verifying Razorpay payment: {e}")
-        raise HTTPException(status_code=400, detail=f"Payment verification failed: {str(e)}")
+    raise HTTPException(
+        status_code=410,
+        detail="Online gateway payments are disabled. Please pay via UPI and submit your UTR + payment screenshot for admin verification.",
+    )
 
 
 @router.get("/payment-settings")
@@ -3047,6 +2824,437 @@ async def patch_payment_status(payment_id: str, data: LocalPaymentStatusUpdate, 
                 await _notify_shop_of_paid_order(order)
 
     return payment
+
+
+# ─── Manual UPI payment proofs (UTR + screenshot, admin-verified) ───
+# This is the ONLY prepaid verification path: the student pays the displayed
+# UPI QR in their own UPI app, then submits the UTR + a screenshot. Nothing
+# here marks the order paid — an admin approves the proof by hand after
+# checking the money actually arrived.
+
+
+class LocalPaymentProofVerify(BaseModel):
+    action: Literal["approve", "reject"]
+    reason: str = Field(default="", max_length=500)
+
+
+def _proof_shape(order: dict, proof: dict | None, is_parent: bool) -> dict:
+    """Public proof view: screenshot URL is shown (needed for verification),
+    but nothing sensitive beyond the order itself is included."""
+    proof = proof or {}
+    return {
+        "order_id": order.get("id"),
+        "payment_id": proof.get("id") or "",
+        "is_parent": is_parent,
+        "order_status": order.get("status"),
+        "payment_method": order.get("payment_method"),
+        "amount": order.get("total"),
+        "proof_status": proof.get("proof_status") or proof.get("payment_proof_status") or "PENDING_PAYMENT",
+        "legacy_status": proof.get("status") or "",
+        "utr_saved": bool(str(proof.get("utr_number") or "").strip()),
+        "payment_screenshot_url": proof.get("payment_screenshot_url") or "",
+        "payment_submitted_at": str(proof.get("payment_submitted_at") or ""),
+        "payment_verified_at": str(proof.get("payment_verified_at") or ""),
+        "payment_verified_by": proof.get("payment_verified_by") or "",
+        "payment_rejection_reason": proof.get("payment_rejection_reason") or "",
+    }
+
+
+async def _current_proof(order_id: str, is_parent: bool) -> dict | None:
+    try:
+        if is_parent:
+            return await _db(db.get_parent_payment, order_id)
+        return await _db(db.get_payment_by_order_id, order_id)
+    except Exception as e:
+        logger.warning(f"proof lookup failed for {order_id}: {e}")
+        return None
+
+
+@router.post("/payments/proof")
+async def submit_payment_proof(
+    request: Request,
+    order_id: str = Form(..., max_length=100),
+    utr_number: str = Form(..., max_length=40),
+    screenshot: UploadFile = File(...),
+    current_user: dict = Depends(get_current_local_user),
+):
+    """Submit UTR + payment screenshot for manual admin verification.
+
+    Multipart (order_id, utr_number, screenshot file). The order enters
+    PAYMENT_PROOF_SUBMITTED and waits for an admin — it is never marked paid
+    here. The admin is notified via Telegram (best-effort: a Telegram outage
+    is logged and the submission still succeeds).
+    """
+    if not rate_allow(
+        "proof", f"{current_user.get('id')}:{rate_ip(request)}", max_attempts=12, window_sec=300
+    ):
+        raise HTTPException(status_code=429, detail="Too many proof submissions — please wait a few minutes and try again.")
+
+    order_id = (order_id or "").strip()
+    order, is_parent = await _resolve_owned_order(order_id, current_user)
+
+    if str(order.get("payment_method") or "").upper() == "COD":
+        raise HTTPException(status_code=400, detail="Cash-on-delivery orders need no payment proof.")
+    if str(order.get("status") or "") not in _AWAITING_PAYMENT_STATUSES:
+        raise HTTPException(status_code=409, detail="This order is no longer awaiting payment — nothing left to verify.")
+
+    utr = (utr_number or "").strip().upper()
+    if not _is_valid_utr(utr):
+        raise HTTPException(
+            status_code=422,
+            detail="That doesn't look like a UTR — it is usually a 12-digit number with no spaces or symbols.",
+        )
+
+    # One UTR = one payment across the platform (friendly 409, never a raw 500).
+    existing = await _db(db.get_payment_by_utr, utr)
+    if existing and str(existing.get("order_id") or "") != str(order_id):
+        raise HTTPException(
+            status_code=409,
+            detail="This UTR is already saved on another order — double-check the number.",
+        )
+
+    # No double queueing: a submitted-but-undecided proof must be approved or
+    # rejected first. A rejected proof MAY be replaced with a fresh one.
+    current = await _current_proof(order_id, is_parent)
+    current_status = str(
+        (current or {}).get("proof_status") or (current or {}).get("payment_proof_status") or "PENDING_PAYMENT"
+    )
+    if current_status == "PAYMENT_PROOF_SUBMITTED":
+        raise HTTPException(status_code=409, detail="Payment proof already submitted — it is waiting for admin verification.")
+    if current_status == "PAYMENT_APPROVED":
+        raise HTTPException(status_code=409, detail="This order has already been paid.")
+
+    try:
+        raw = await screenshot.read()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not read the uploaded screenshot.")
+    if not raw:
+        raise HTTPException(status_code=422, detail="A payment screenshot is required.")
+    if len(raw) > cloudinary_service.max_bytes():
+        raise HTTPException(
+            status_code=413,
+            detail=f"Screenshot must be {settings.PAYMENT_SCREENSHOT_MAX_MB} MB or smaller.",
+        )
+    try:
+        cloudinary_service.validate_image_bytes(raw)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    if not cloudinary_service.is_configured():
+        raise HTTPException(status_code=503, detail="Screenshot storage is not configured on this server.")
+    try:
+        uploaded = await asyncio.to_thread(
+            cloudinary_service.upload_image,
+            raw,
+            folder=f"payments/{order_id}",
+            public_id=f"proof-{order_id}",
+        )
+    except Exception as e:
+        logger.error(f"Proof upload failed for order {order_id}: {e}")
+        raise HTTPException(status_code=502, detail="Could not store the screenshot — please try again.")
+    if not uploaded.get("secure_url"):
+        raise HTTPException(status_code=502, detail="Could not store the screenshot — please try again.")
+
+    server_total = int(round(float(order.get("total") or 0)))
+    if is_parent:
+        saved = await _db(
+            db.save_parent_payment_proof,
+            order_id, server_total, utr,
+            uploaded["secure_url"], uploaded.get("public_id", ""),
+        )
+    else:
+        saved = await _db(
+            db.save_single_payment_proof,
+            order_id, server_total, utr,
+            uploaded["secure_url"], uploaded.get("public_id", ""),
+        )
+    if not saved:
+        cloudinary_service.delete_image(uploaded.get("public_id", ""))
+        raise HTTPException(status_code=400, detail="Could not save the payment proof — please try again.")
+
+    # Admin alerts: in-app bell + web push (existing), Telegram (new). Every
+    # channel is best-effort — none may fail this submission.
+    try:
+        customer = str(order.get("student_name") or current_user.get("name") or "A student")
+        sub_count = 0
+        try:
+            full = await _db(db.get_parent_order, order_id) if is_parent else None
+            subs = (full or {}).get("sub_orders") or []
+            sub_count = len(subs)
+        except Exception:
+            sub_count = 0
+        telegram_service.notify_payment_proof_async(
+            customer_name=customer,
+            order_id=order_id,
+            order_token=str(order.get("token") or ""),
+            amount=server_total,
+            utr=utr,
+            item_count=sub_count if is_parent else 1,
+            submitted_at=time.strftime("%d %b %Y, %I:%M %p"),
+        )
+    except Exception as e:
+        logger.warning(f"Telegram proof notification failed for {order_id}: {e}")
+    _push_admin(
+        "New payment proof to verify",
+        f"{customer if 'customer' in dir() else 'A student'} submitted UPI proof (₹{server_total}, UTR {utr}) — verify in Admin → Orders.",
+        tag="payment-verify",
+    )
+
+    return {
+        "message": "Payment proof submitted successfully. Your order is waiting for admin verification.",
+        "order_id": order_id,
+        "proof_status": "PAYMENT_PROOF_SUBMITTED",
+        "utr_saved": True,
+    }
+
+
+@router.get("/payments/verification-queue")
+async def verification_queue(_admin: dict = Depends(_require_admin)):
+    """Admin queue of proofs awaiting manual verification (newest first)."""
+    queue: list[dict] = []
+    try:
+        singles = await _db(db.list_payments)
+    except Exception as e:
+        logger.warning(f"verification queue list_payments failed: {e}")
+        singles = []
+    for p in singles or []:
+        if str(p.get("proof_status") or "") != "PAYMENT_PROOF_SUBMITTED":
+            continue
+        order = None
+        try:
+            order = await _db(db.get_order, str(p.get("order_id") or ""))
+        except Exception:
+            order = None
+        queue.append({
+            "payment_id": p.get("id"),
+            "order_id": p.get("order_id"),
+            "is_parent": False,
+            "amount": p.get("amount"),
+            "method": p.get("method"),
+            "utr_number": p.get("utr_number"),
+            "payment_screenshot_url": p.get("payment_screenshot_url") or "",
+            "payment_submitted_at": str(p.get("payment_submitted_at") or p.get("created_at") or ""),
+            "proof_status": "PAYMENT_PROOF_SUBMITTED",
+            "customer_name": (order or {}).get("student_name") or "",
+            "customer_phone": (order or {}).get("student_phone") or "",
+            "customer_email": (order or {}).get("student_email") or "",
+            "owner_user_id": (order or {}).get("owner_user_id") or "",
+            "order_token": (order or {}).get("token") or "",
+            "order_status": (order or {}).get("status") or "",
+        })
+    try:
+        parents = await _db(db.list_parent_payments)
+    except Exception as e:
+        logger.warning(f"verification queue list_parent_payments failed: {e}")
+        parents = []
+    for p in parents or []:
+        shape_status = str(p.get("proof_status") or "")
+        if shape_status != "PAYMENT_PROOF_SUBMITTED":
+            continue
+        order = None
+        try:
+            order = await _db(db.get_parent_order, str(p.get("order_id") or ""))
+        except Exception:
+            order = None
+        order = order or {}
+        queue.append({
+            "payment_id": p.get("id"),
+            "order_id": p.get("order_id"),
+            "is_parent": True,
+            "amount": p.get("amount"),
+            "method": p.get("method"),
+            "utr_number": p.get("utr_number"),
+            "payment_screenshot_url": p.get("payment_screenshot_url") or "",
+            "payment_submitted_at": str(p.get("payment_submitted_at") or p.get("created_at") or ""),
+            "proof_status": "PAYMENT_PROOF_SUBMITTED",
+            "customer_name": order.get("student_name") or "",
+            "customer_phone": order.get("student_phone") or "",
+            "customer_email": order.get("student_email") or "",
+            "owner_user_id": order.get("owner_user_id") or "",
+            "order_token": order.get("token") or "",
+            "order_status": order.get("status") or "",
+        })
+    queue.sort(key=lambda q: q.get("payment_submitted_at") or "", reverse=True)
+    return queue
+
+
+@router.get("/payments/proof/{order_id}")
+async def payment_proof_detail(order_id: str, current_user: dict = Depends(get_current_local_user)):
+    """One order's full verification view: order + items + proof + customer.
+
+    The owner sees their own; admins see any. Powers the admin order page
+    (opened from the Telegram VIEW ORDER button) and the student's proof
+    status box. Never exposes another user's data.
+    """
+    order, is_parent = await _resolve_owned_order(order_id, current_user)
+    proof = await _current_proof(order_id, is_parent)
+    view = _proof_shape(order, proof, is_parent)
+    if is_parent:
+        full = None
+        try:
+            full = await _db(db.get_parent_order, order_id)
+        except Exception:
+            full = None
+        view["sub_orders"] = (full or {}).get("sub_orders") or []
+        view["items_summary"] = "; ".join(
+            str(s.get("items_summary") or "") for s in view["sub_orders"]
+        )[:2000]
+    else:
+        view["items_summary"] = str(order.get("items") or "")[:2000]
+        view["sub_orders"] = []
+    view["customer_name"] = order.get("student_name") or ""
+    view["customer_phone"] = order.get("student_phone") or ""
+    view["customer_email"] = order.get("student_email") or ""
+    view["owner_user_id"] = order.get("owner_user_id") or ""
+    view["order_token"] = order.get("token") or ""
+    view["delivery_location"] = order.get("delivery_location") or ""
+    view["created_at"] = str(order.get("created_at") or "")
+    # Privacy: the UTR is a bank reference for the admin's eyes only (owners
+    # only learn whether one is on file). Owners may re-view their own
+    # screenshot while it is pending review; admins always see everything.
+    if current_user.get("role") != "admin":
+        view["utr_number"] = ""
+        if view.get("proof_status") != "PAYMENT_PROOF_SUBMITTED":
+            view.pop("payment_screenshot_url", None)
+    elif proof:
+        view["utr_number"] = proof.get("utr_number") or ""
+    return view
+
+
+@router.patch("/payments/{payment_id}/verify")
+async def verify_payment_proof(payment_id: str, data: LocalPaymentProofVerify, _admin: dict = Depends(_require_admin)):
+    """Admin approve/reject of a submitted proof — with confirmation done in
+    the UI. Only the admin API can move money states; the frontend can never
+    mark an order paid by itself."""
+    payment_id = (payment_id or "").strip()
+    if not payment_id:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    is_parent = False
+    target: dict | None = None
+    try:
+        parent_order = await _db(db.get_parent_order, payment_id)
+    except Exception:
+        parent_order = None
+    if parent_order:
+        is_parent = True
+        try:
+            target = await _db(db.get_parent_payment, payment_id)
+        except Exception:
+            target = None
+    else:
+        try:
+            target = await _db(db.get_payment_by_id, payment_id)
+        except Exception:
+            target = None
+    if not target:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    status_now = str(target.get("proof_status") or target.get("payment_proof_status") or "PENDING_PAYMENT")
+    if status_now != "PAYMENT_PROOF_SUBMITTED":
+        raise HTTPException(
+            status_code=409,
+            detail=f"This proof is already decided ({status_now.replace('_', ' ').title()}).",
+        )
+
+    admin_name = str(_admin.get("name") or _admin.get("username") or _admin.get("sub") or "admin")[:100]
+    approved = data.action == "approve"
+    if not approved and not (data.reason or "").strip():
+        raise HTTPException(status_code=422, detail="A rejection reason is required so the student knows what to fix.")
+
+    if is_parent:
+        saved = await _db(db.verify_parent_payment_proof, payment_id, approved, admin_name, (data.reason or "").strip())
+        order_id = payment_id
+    else:
+        saved = await _db(db.verify_single_payment_proof, payment_id, approved, admin_name, (data.reason or "").strip())
+        order_id = str((saved or {}).get("order_id") or "")
+    if not saved:
+        raise HTTPException(status_code=400, detail="Could not record the decision — please try again.")
+
+    if approved and order_id and not is_parent:
+        try:
+            order = await _db(db.get_order, order_id)
+            if order:
+                await _notify_shop_of_paid_order(order)
+        except Exception as e:
+            logger.warning(f"shop notify after approval failed for {order_id}: {e}")
+
+    try:
+        token = ""
+        try:
+            o = await _db(db.get_parent_order, order_id) if is_parent else await _db(db.get_order, order_id)
+            token = str((o or {}).get("token") or "")
+        except Exception:
+            token = ""
+        telegram_service.notify_payment_decision_async(
+            order_id=order_id, order_token=token,
+            approved=approved, reason=(data.reason or "").strip(),
+        )
+    except Exception as e:
+        logger.warning(f"Telegram decision notification failed for {order_id}: {e}")
+
+    return {
+        "message": "Payment approved — the order is now being processed." if approved else "Payment rejected — the student can submit a fresh proof.",
+        "approved": approved,
+        "proof_status": "PAYMENT_APPROVED" if approved else "PAYMENT_REJECTED",
+        "payment": saved,
+    }
+
+
+@router.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    """Inbound Telegram updates — answers the bot's /start, /help, /status.
+
+    Public by design (Telegram's servers call it, not portal users), so it
+    authenticates with the shared webhook secret instead of a JWT — the same
+    pattern as payment-gateway callbacks. Register with:
+    ``setWebhook?url=<BACKEND_URL>/api/v1/local/telegram/webhook`` (plus
+    ``secret_token`` when TELEGRAM_WEBHOOK_SECRET is set).
+
+    Only the configured admin chat ever receives order/payment details;
+    everyone else gets the generic intro. Throttled per chat so a retry storm
+    can never flood the Bot API. Never raises to Telegram beyond 4xx — a 500
+    would make Telegram retry the same update for hours.
+    """
+    secret = (settings.TELEGRAM_WEBHOOK_SECRET or "").strip()
+    if secret:
+        given = request.headers.get("x-telegram-bot-api-secret-token", "")
+        if not secrets.compare_digest(given, secret):
+            raise HTTPException(status_code=401, detail="Invalid webhook secret")
+    try:
+        update = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid update body")
+    parsed = telegram_service.parse_incoming(update if isinstance(update, dict) else {})
+    if not parsed:
+        return {"ok": True}
+    chat_id, command = parsed
+    if not rate_allow("tg_webhook", chat_id, max_attempts=30, window_sec=60):
+        return {"ok": True}
+    pending: int | None = None
+    if command == "status" and telegram_service.is_admin_chat(chat_id):
+        try:
+            singles = await _db(db.list_payments)
+            pending = sum(
+                1 for p in singles or []
+                if str(p.get("proof_status") or "") == "PAYMENT_PROOF_SUBMITTED"
+            )
+            parents = await _db(db.list_parent_payments)
+            pending += sum(
+                1 for p in parents or []
+                if str(p.get("proof_status") or "") == "PAYMENT_PROOF_SUBMITTED"
+            )
+        except Exception as e:
+            logger.warning(f"telegram /status queue read failed: {e}")
+            pending = None
+    reply = telegram_service.command_reply(command, chat_id, pending_count=pending)
+    if reply:
+        try:
+            # Network send off the event loop; a failure is logged, not raised.
+            await asyncio.to_thread(telegram_service.send_message_to, chat_id, reply)
+        except Exception as e:
+            logger.warning(f"telegram reply to {chat_id} failed: {e}")
+    return {"ok": True}
 
 
 @router.get("/tickets")

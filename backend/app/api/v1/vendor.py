@@ -283,6 +283,80 @@ def login(data: VendorLoginRequest, request: Request):
     )
 
 
+class VendorForgotPasswordRequest(BaseModel):
+    identifier: str = Field(..., min_length=2, max_length=120, description="Username or registered email")
+
+
+class VendorResetPasswordRequest(BaseModel):
+    identifier: str = Field(..., min_length=2, max_length=120)
+    otp: str = Field(..., min_length=4, max_length=10)
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
+@router.post("/forgot-password")
+def vendor_forgot_password(data: VendorForgotPasswordRequest):
+    """Shopkeeper password recovery — Step 1: email the 4-digit OTP.
+
+    Enter your username OR registered email → the code goes to the shop's
+    registered email → enter it with your new password at /vendor/reset-password.
+    The response never reveals whether an account exists (enumeration guard);
+    non-shopkeeper identifiers get the identical answer.
+    """
+    from app.services.email_service import email_delivery_configured
+    from app.services.password_reset_service import (
+        GENERIC_SENT_MESSAGE,
+        find_user_for_reset_sync,
+        send_reset_otp_sync,
+    )
+
+    if not email_delivery_configured():
+        logger.error(
+            "vendor forgot-password requested but no email provider is configured "
+            "(set SMTP_HOST or RESEND_API_KEY)"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Password reset by email is not available right now — this "
+                "server has no email service configured. Please contact the admin."
+            ),
+        )
+    user = find_user_for_reset_sync(data.identifier)
+    if not user or user.get("role") != "shopkeeper":
+        return {"message": GENERIC_SENT_MESSAGE, "step": 1}
+    if not send_reset_otp_sync(user):
+        raise HTTPException(
+            status_code=503,
+            detail="We could not send the reset email. Please try again shortly.",
+        )
+    return {
+        "message": "A 4-digit code was sent to your registered email. Enter it below to set a new password.",
+        "step": 1,
+        "expires_minutes": settings.RESET_OTP_EXPIRE_MINUTES,
+    }
+
+
+@router.post("/reset-password")
+def vendor_reset_password(data: VendorResetPasswordRequest):
+    """Shopkeeper password recovery — Step 2: verify OTP + set new password."""
+    from app.services.password_reset_service import (
+        find_user_for_reset_sync,
+        verify_otp_and_reset_sync,
+    )
+
+    user = find_user_for_reset_sync(data.identifier)
+    if not user or user.get("role") != "shopkeeper":
+        raise HTTPException(status_code=400, detail="Invalid code. Please try again.")
+    ok, error = verify_otp_and_reset_sync(
+        data.identifier, data.otp, hash_password(data.new_password)
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=500 if error.startswith("Could not ") else 400, detail=error
+        )
+    return {"message": "Password updated successfully! You can now sign in with your new password."}
+
+
 @router.get("/dashboard")
 def dashboard(current_vendor: dict = Depends(get_current_vendor)):
     """Get vendor dashboard with shop details, orders, and admin dues (₹10 per order)."""

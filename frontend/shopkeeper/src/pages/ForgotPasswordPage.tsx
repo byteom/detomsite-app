@@ -18,17 +18,29 @@ export function ForgotPasswordPage() {
   const [done, setDone] = useState(false)
   const [loading, setLoading] = useState(false)
 
-  const requestOtp = async (e: FormEvent) => {
-    e.preventDefault()
+  const friendlyError = (error: any, fallback: string) => {
+    const status = error?.response?.status
+    if (status === 503) {
+      return 'We could not send the reset email right now. Please try again shortly — or ask the admin for help.'
+    }
+    return apiError(error, fallback)
+  }
+
+  const requestOtp = async (e?: FormEvent) => {
+    e?.preventDefault()
     setErr('')
     setInfo('')
+    if (!identifier.trim()) {
+      setErr('Enter your shopkeeper username or registered email.')
+      return
+    }
     setLoading(true)
     try {
-      const res = await api.post('/users/forgot-password', { identifier })
-      setInfo(res.data?.message || 'A 6-digit code was sent to your registered email.')
+      const res = await api.post('/vendor/forgot-password', { identifier: identifier.trim() })
+      setInfo(res.data?.message || 'A 4-digit code was sent to your registered email.')
       setStep('otp')
     } catch (error: any) {
-      setErr(apiError(error, 'Request failed'))
+      setErr(friendlyError(error, 'Request failed. Please verify your username or email.'))
     } finally {
       setLoading(false)
     }
@@ -42,16 +54,20 @@ export function ForgotPasswordPage() {
       setErr('Passwords do not match')
       return
     }
-    if (pw.length < 4) {
-      setErr('Password must be at least 4 characters')
+    if (pw.length < 8) {
+      setErr('Password must be at least 8 characters')
+      return
+    }
+    if (otp.trim().length < 4) {
+      setErr('Enter the verification code sent to your email.')
       return
     }
     setLoading(true)
     try {
-      await api.post('/users/reset-password', { identifier, otp, new_password: pw })
+      await api.post('/vendor/reset-password', { identifier: identifier.trim(), otp: otp.trim(), new_password: pw })
       setDone(true)
     } catch (error: any) {
-      setErr(apiError(error, 'Reset failed'))
+      setErr(friendlyError(error, 'Reset failed. Invalid or expired code.'))
     } finally {
       setLoading(false)
     }
@@ -85,8 +101,8 @@ export function ForgotPasswordPage() {
           <h1 className="text-xl font-bold text-[var(--text-heading)]">Reset Password</h1>
           <p className="text-xs text-[var(--text-muted)]">
             {step === 'request'
-              ? 'Enter your username or email'
-              : 'Enter verification OTP & new password'}
+              ? 'Step 1 of 2 · Enter your username or email'
+              : 'Step 2 of 2 · Enter the 4-digit code & your new password (expires in 15 min)'}
           </p>
         </div>
 
@@ -120,10 +136,10 @@ export function ForgotPasswordPage() {
         ) : (
           <form onSubmit={resetPw} className="space-y-3.5">
             <Input
-              label="6-Digit OTP Code"
+              label="4-Digit OTP Code"
               value={otp}
-              onChange={(e) => setOtp(e.target.value)}
-              placeholder="e.g. 123456"
+              onChange={(e) => setOtp(e.target.value.replace(/\D/g, '').slice(0, 4))}
+              placeholder="e.g. 1234"
               required
             />
             <div>
@@ -133,7 +149,7 @@ export function ForgotPasswordPage() {
               <PasswordField
                 value={pw}
                 onChange={setPw}
-                placeholder="Min 4 characters"
+                placeholder="Min 8 characters"
                 autoComplete="new-password"
               />
             </div>
@@ -151,6 +167,16 @@ export function ForgotPasswordPage() {
             <Button variant="primary" size="md" type="submit" loading={loading} className="w-full">
               Save New Password
             </Button>
+            <div className="text-center">
+              <button
+                type="button"
+                onClick={() => requestOtp()}
+                disabled={loading}
+                className="text-xs font-bold text-emerald-700 hover:underline disabled:opacity-50"
+              >
+                Resend code
+              </button>
+            </div>
           </form>
         )}
 

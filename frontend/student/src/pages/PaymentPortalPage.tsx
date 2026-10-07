@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { QRCodeSVG } from 'qrcode.react'
-import { Order, Shop, PaymentSettings } from '../types'
+import { Order, Shop, PaymentSettings, PaymentProofStatus } from '../types'
 import {
   buildUpiUri,
   downloadQrPng,
@@ -10,6 +10,7 @@ import {
 } from '../utils/helpers'
 import api, { dedupeGet } from '../services/api'
 import { usePolling } from '../hooks/usePolling'
+import { PaymentProofForm } from '../components/food/PaymentProofForm'
 import {
   CreditCard,
   ShieldCheck,
@@ -26,9 +27,19 @@ export function PaymentPortalPage() {
   const [order, setOrder] = useState<Order | null>(null)
   const [shop, setShop] = useState<Shop | null>(null)
   const [ps, setPs] = useState<PaymentSettings | null>(null)
-  const [utr, setUtr] = useState('')
-  const [utrMsg, setUtrMsg] = useState('')
+  const [proofStatus, setProofStatus] = useState<PaymentProofStatus>('PENDING_PAYMENT')
+  const [rejectReason, setRejectReason] = useState('')
   const [loading, setLoading] = useState(true)
+
+  const refreshProof = React.useCallback(() => {
+    if (!orderId) return Promise.resolve()
+    return dedupeGet(`/local/orders/${orderId}/payment`)
+      .then((r) => {
+        if (r.data?.proof_status) setProofStatus(r.data.proof_status)
+        setRejectReason(String(r.data?.payment_rejection_reason || ''))
+      })
+      .catch(() => {})
+  }, [orderId])
 
   // Load Order, Shop, and Payment settings
   useEffect(() => {
@@ -46,26 +57,33 @@ export function PaymentPortalPage() {
     api.get<PaymentSettings>('/local/payment-settings')
       .then((r) => setPs(r.data))
       .catch(() => {})
-  }, [orderId])
+    refreshProof()
+  }, [orderId, refreshProof])
 
-  // Poll order status
+  // Poll order + proof status. Verification is MANUAL by an admin — the page
+  // flips to verified when the admin approves, never by itself.
   usePolling(
     React.useCallback(() => {
       if (!orderId || !order) return
-      if (['Completed', 'Accepted', 'Confirmed', 'Preparing', 'Ready'].includes(order.status)) return
-      return dedupeGet<Order>(`/local/orders/${orderId}`).then((r) => {
-        if (r.data) setOrder(r.data)
-      })
-    }, [orderId, order?.status]),
-    4000,
+      if (['Completed', 'Accepted', 'Confirmed', 'Preparing', 'Ready', 'Pending Acceptance'].includes(order.status)) return
+      return (async () => {
+        await dedupeGet<Order>(`/local/orders/${orderId}`).then((r) => {
+          if (r.data) setOrder(r.data)
+        })
+        await refreshProof()
+      })()
+    }, [orderId, order?.status, refreshProof]),
+    5000,
     [orderId, order?.status]
   )
 
   const isPaid =
     order &&
-    ['Accepted', 'Confirmed', 'Preparing', 'Ready', 'Completed'].includes(
+    ['Pending Acceptance', 'Accepted', 'Confirmed', 'Preparing', 'Ready', 'Completed'].includes(
       order.status
     )
+  const proofSubmitted = proofStatus === 'PAYMENT_PROOF_SUBMITTED'
+  const proofRejected = proofStatus === 'PAYMENT_REJECTED'
 
   const shopUpi = shop?.upi_id?.trim() || ''
   const globalUpi = ps?.upi_id?.trim() || ''
@@ -78,22 +96,6 @@ export function PaymentPortalPage() {
   const qrUri = upiTarget
     ? buildUpiUri(upiTarget, receiver, amount, `Detomsite #${order?.token || ''}`)
     : ''
-
-  const submitUtr = async (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!utr.trim()) return
-    setUtrMsg('')
-    try {
-      await api.post('/payments/utr', {
-        order_id: orderId,
-        utr_number: utr.trim(),
-      })
-      setUtrMsg('UTR reference submitted! The kitchen is verifying it.')
-      setUtr('')
-    } catch {
-      setUtrMsg('Could not submit UTR. Please ensure you entered a valid 12-digit number.')
-    }
-  }
 
   if (loading) {
     return (
@@ -159,7 +161,9 @@ export function PaymentPortalPage() {
             <span className="font-bold text-sm">
               {isPaid
                 ? 'Payment Verified! Your kitchen is preparing this order.'
-                : 'Payment Pending · Checking live verification status...'}
+                : proofSubmitted
+                ? 'Payment proof submitted successfully. Your order is waiting for admin verification.'
+                : 'Payment Pending · Pay the QR, then submit your proof below.'}
             </span>
           </div>
           <span className="font-black text-base">₹{order.total}</span>
@@ -210,32 +214,38 @@ export function PaymentPortalPage() {
               </button>
             </div>
 
-            {/* Manual UTR Reference Input */}
-            <div className="rounded-card border border-slate-200 bg-slate-50 p-4 space-y-2">
-              <p className="font-bold text-xs text-slate-800">
-                Already paid? Enter UPI Reference / UTR Number
-              </p>
-              <form onSubmit={submitUtr} className="flex gap-2">
-                <input
-                  type="text"
-                  value={utr}
-                  onChange={(e) => setUtr(e.target.value)}
-                  placeholder="12-digit UTR (e.g. 423456789012)"
-                  className="flex-1 rounded-btn border border-slate-200 bg-white px-3 py-2 text-xs font-mono outline-none focus:border-emerald-600"
-                />
-                <button
-                  type="submit"
-                  className="rounded-btn bg-slate-900 px-4 py-2 text-xs font-bold text-white hover:bg-slate-800 transition-colors"
-                >
-                  Verify
-                </button>
-              </form>
-              {utrMsg && (
-                <p className="text-xs font-medium text-emerald-700 mt-1">
-                  {utrMsg}
+            {/* Manual UTR + screenshot proof (admin-verified) */}
+            {proofRejected && (
+              <div className="rounded-card border border-red-200 bg-red-50 p-4 text-left">
+                <p className="text-xs sm:text-sm font-bold text-red-800">
+                  Your payment proof was rejected{rejectReason ? `: ${rejectReason}` : '.'}
                 </p>
-              )}
-            </div>
+                <p className="mt-1 text-xs text-red-700">
+                  Please check your payment and submit a fresh UTR + screenshot below.
+                </p>
+              </div>
+            )}
+            {proofSubmitted && (
+              <div className="rounded-card border border-amber-200 bg-amber-50 p-4 text-left">
+                <p className="text-xs sm:text-sm font-bold text-amber-900">
+                  Payment proof submitted successfully. Your order is waiting for admin verification.
+                </p>
+                <p className="mt-1 text-xs text-amber-800">
+                  The kitchen starts cooking as soon as an admin verifies your payment — no further action needed.
+                </p>
+              </div>
+            )}
+            {!isPaid && !proofSubmitted && orderId && (
+              <PaymentProofForm
+                orderId={orderId}
+                onSubmitted={() => {
+                  refreshProof()
+                  dedupeGet<Order>(`/local/orders/${orderId}`)
+                    .then((r) => r.data && setOrder(r.data))
+                    .catch(() => {})
+                }}
+              />
+            )}
           </div>
         )}
 

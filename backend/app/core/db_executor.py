@@ -26,10 +26,25 @@ _pool: ThreadPoolExecutor | None = None
 
 
 def _max_workers() -> int:
+    # Sized from the DB pool, not CPUs: WAN-bound DB threads park on I/O, but
+    # every worker beyond DB_POOL_MAX only queues on the pool (default pool is
+    # 10 — see supabase_db._POOL_MAX, shared across Vercel instances against a
+    # 60-connection Supabase budget). FastAPI docs recommend running blocking
+    # DB calls on a threadpool via run_in_executor / def endpoints; the pool
+    # here is that dedicated threadpool (never the default executor), kept at
+    # pool+4 so checkout storms fail fast with retryable 503 instead of
+    # queueing unrelated endpoints behind each other.
     try:
-        return max(8, int(os.environ.get("DB_IO_WORKERS", "32")))
+        pool_max = max(4, int(os.environ.get("DB_POOL_MAX", "10")))
     except (TypeError, ValueError):
-        return 32
+        pool_max = 10
+    try:
+        override = os.environ.get("DB_IO_WORKERS")
+        if override:
+            return max(8, int(override))
+    except (TypeError, ValueError):
+        pass
+    return pool_max + 4
 
 
 def db_executor() -> ThreadPoolExecutor:

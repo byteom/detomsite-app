@@ -45,6 +45,8 @@ import {
   HelpCircle,
   ShoppingBag,
   RotateCcw,
+  Upload,
+  Receipt,
 } from 'lucide-react'
 
 export {
@@ -93,6 +95,8 @@ export {
   HelpCircle,
   ShoppingBag,
   RotateCcw,
+  Upload,
+  Receipt,
 }
 
 /* ─── Specialized Food Delivery Symbols ─── */

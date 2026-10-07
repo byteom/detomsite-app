@@ -64,15 +64,23 @@ export function Navbar() {
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
 
-  // Poll notifications
+  // Poll notifications. Backs off when the backend is sick: after 3 straight
+  // failures the bell quiets to one check every 2 minutes (instead of
+  // stamping a 500 into the console every 30 s forever) until it recovers.
+  const notifFails = React.useRef(0)
   usePolling(
     React.useCallback(() => {
       if (document.visibilityState !== 'visible') return
       return dedupeGet<Notification[]>('/local/notifications', { role: 'student' })
-        .then((r) => setNotifs(r.data || []))
-        .catch(() => {})
+        .then((r) => {
+          notifFails.current = 0
+          setNotifs(r.data || [])
+        })
+        .catch(() => {
+          notifFails.current += 1
+        })
     }, []),
-    30000,
+    () => (notifFails.current >= 3 ? 120000 : 30000),
     []
   )
 

@@ -247,6 +247,77 @@ async def login(data: AdminLoginRequest, request: Request):
     )
 
 
+class AdminForgotPasswordRequest(BaseModel):
+    identifier: str = Field(..., min_length=2, max_length=120, description="Admin username or email")
+
+
+class AdminResetPasswordRequest(BaseModel):
+    identifier: str = Field(..., min_length=2, max_length=120)
+    otp: str = Field(..., min_length=4, max_length=10)
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
+@router.post("/forgot-password")
+async def admin_forgot_password(data: AdminForgotPasswordRequest):
+    """Admin password recovery — Step 1: email the 4-digit OTP.
+
+    Enter the admin username OR email → the code goes to
+    DEFAULT_SUPER_ADMIN_EMAIL (admin DB rows carry a placeholder email) →
+    enter it with the new password at /admin/reset-password. The response
+    never reveals whether an account exists; non-admin identifiers get the
+    identical answer.
+    """
+    from app.services.email_service import email_delivery_configured
+    from app.services.password_reset_service import (
+        GENERIC_SENT_MESSAGE,
+        find_user_for_reset,
+        send_reset_otp,
+    )
+
+    if not email_delivery_configured():
+        logger.error(
+            "admin forgot-password requested but no email provider is configured "
+            "(set SMTP_HOST or RESEND_API_KEY)"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Password reset by email is not available right now — this "
+                "server has no email service configured. Please contact the admin."
+            ),
+        )
+    user = await find_user_for_reset(data.identifier)
+    if not user or user.get("role") != "admin":
+        return {"message": GENERIC_SENT_MESSAGE, "step": 1}
+    if not await send_reset_otp(user):
+        raise HTTPException(
+            status_code=503,
+            detail="We could not send the reset email. Please try again shortly.",
+        )
+    return {
+        "message": "A 4-digit code was sent to your registered email. Enter it below to set a new password.",
+        "step": 1,
+        "expires_minutes": settings.RESET_OTP_EXPIRE_MINUTES,
+    }
+
+
+@router.post("/reset-password")
+async def admin_reset_password(data: AdminResetPasswordRequest):
+    """Admin password recovery — Step 2: verify OTP + set new password."""
+    from app.services.password_reset_service import find_user_for_reset, verify_otp_and_reset
+
+    user = await find_user_for_reset(data.identifier)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=400, detail="Invalid code. Please try again.")
+    password_hash = await asyncio.to_thread(hash_password, data.new_password)
+    ok, error = await verify_otp_and_reset(data.identifier, data.otp, password_hash)
+    if not ok:
+        raise HTTPException(
+            status_code=500 if error.startswith("Could not ") else 400, detail=error
+        )
+    return {"message": "Password updated successfully! You can now sign in with your new password."}
+
+
 @router.get("/dashboard")
 async def dashboard(admin: dict = Depends(verify_admin)):
     """Get admin dashboard statistics."""
@@ -1213,18 +1284,28 @@ async def update_share_payment(payment_id: str, data: SharePaymentStatusUpdate, 
 async def verify_payment(payment_id: str, data: PaymentVerifyRequest, admin: dict = Depends(verify_admin)):
     """Verify or reject a manual payment.
 
+    Delegates to the payment-proof store functions so the proof lifecycle
+    columns (proof_status, verified_at/by, rejection reason) stay consistent
+    no matter which admin API records the decision. Request/response shape is
+    unchanged for older admin clients.
+
     When approved, the payment is provably received, so the shopkeeper's
-    WhatsApp notification is auto-generated exactly as with the bank-SMS/UTR
-    path — the money has been verified either way.
+    WhatsApp notification is auto-generated exactly as with the old
+    bank-SMS/UTR path — the money has been verified either way.
     """
     status = data.status
+    approved = str(status).lower() in ("success", "verified", "received")
+    admin_name = str(admin.get("username") or admin.get("email") or admin.get("sub") or "admin")[:100]
     payment = await _db(db.get_payment_by_id, payment_id)
     if not payment:
         # Multi-shop parent order — its payment proof is on the parent_orders row.
-        payment = await _db(db.verify_parent_payment, payment_id, status)
+        parent = await _db(db.get_parent_order, payment_id)
+        if not parent:
+            raise HTTPException(status_code=404, detail="Payment not found")
+        payment = await _db(db.verify_parent_payment_proof, payment_id, approved, admin_name, "")
         if not payment:
             raise HTTPException(status_code=404, detail="Payment not found")
-        if str(status).lower() in ("success", "verified", "received"):
+        if approved:
             try:
                 parent = await _db(db.get_parent_order, payment_id)
                 if parent and parent.get("sub_orders"):
@@ -1236,6 +1317,9 @@ async def verify_payment(payment_id: str, data: PaymentVerifyRequest, admin: dic
             except Exception as e:
                 logger.warning(f"Admin verify parent payment — WhatsApp notify error: {e}")
         return {"message": f"Payment {status.lower()}", "payment": payment}
+    payment = await _db(db.verify_single_payment_proof, payment_id, approved, admin_name, "")
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
     payment = await _db(db.update_payment_status, payment_id, status)
     if not payment:
         raise HTTPException(status_code=404, detail="Payment not found")

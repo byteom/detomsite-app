@@ -203,9 +203,45 @@ export interface LocalPayment {
   amount: number
   method: string
   status: string
+  proof_status?: PaymentProofStatus
   utr_number: string | null
   screenshot_name: string | null
+  payment_screenshot_url?: string
+  payment_submitted_at?: string
+  payment_verified_at?: string
+  payment_verified_by?: string
+  payment_rejection_reason?: string
   created_at: string
+}
+
+export type PaymentProofStatus =
+  | 'PENDING_PAYMENT'
+  | 'PAYMENT_PROOF_SUBMITTED'
+  | 'PAYMENT_APPROVED'
+  | 'PAYMENT_REJECTED'
+
+/* Manual UPI proof submission (UTR + screenshot, admin-verified). Sent as
+ * multipart/form-data to POST /local/payments/proof — never as JSON. */
+export const PAYMENT_PROOF_MAX_MB = 5
+export const PAYMENT_PROOF_TYPES = ['image/jpeg', 'image/png', 'image/webp']
+
+/* One row of GET /local/payments/verification-queue (newest first). */
+export interface PaymentProofQueueItem {
+  payment_id: string
+  order_id: string
+  is_parent: boolean
+  amount: number
+  method: string
+  utr_number: string | null
+  payment_screenshot_url: string
+  payment_submitted_at: string
+  proof_status: PaymentProofStatus
+  customer_name: string
+  customer_phone: string
+  customer_email: string
+  owner_user_id: string
+  order_token: string | number
+  order_status: string
 }
 
 export interface LocalTicket {

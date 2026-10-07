@@ -728,12 +728,15 @@ export function VendorApp() {
         open={showAgentGuide}
         onClose={() => setShowAgentGuide(false)}
         title="📲 Payment Agent Setup"
-        description="Local Android app that auto-confirms orders via bank credit SMS"
+        description="Automatic bank confirmation is disabled — verification is manual"
         maxWidth="md"
       >
         <div className="space-y-3 text-xs text-[var(--text-body)]">
           <p className="text-[var(--text-muted)]">
-            The SMS Payment Agent is an Android helper app that runs locally on your shop phone to parse incoming bank credit SMS without requiring manual screenshot checks.
+            Automatic bank confirmation is disabled on this platform: student
+            UPI payments are verified by an admin from the submitted UTR +
+            screenshot. The agent app below is kept for reference only and no
+            longer confirms orders.
           </p>
 
           <ol className="space-y-2 rounded-xl border border-[var(--border-subtle)] p-3.5 bg-[var(--bg-surface-subtle)]">
