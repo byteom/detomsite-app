@@ -20,8 +20,9 @@ COPY . .
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Expose port
+# Expose port (informational — Render routes to $PORT at runtime)
 EXPOSE 8000
 
-# Run application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run application. Render injects $PORT (default 10000); hardcoded 8000 would
+# fail Render's health check, so bind to $PORT with a local fallback.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
