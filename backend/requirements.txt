@@ -1,6 +1,6 @@
 fastapi==0.109.0
 uvicorn[standard]==0.27.0
-pydantic==2.5.0
+pydantic==2.12.4
 pydantic-settings==2.1.0
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
@@ -17,7 +17,7 @@ prometheus-client==0.19.0
 cryptography==41.0.7
 python-slugify==8.0.1
 razorpay==2.0.1
-psycopg2-binary==2.9.9
+psycopg2-binary==2.9.11
 pywebpush==1.14.1
 # Shared read cache (app/core/redis_cache.py). Two transports, both supported:
 #   * Upstash / Vercel KV REST — KV_REST_API_URL + KV_REST_API_TOKEN, spoken
@@ -25,12 +25,13 @@ pywebpush==1.14.1
 #   * Raw RESP — REDIS_URL=rediss://… for Render Key Value / Redis Cloud /
 #     Railway / self-hosted. That transport needs the client below.
 # With neither configured, app/core/embedded_redis.py boots a real redis-server
-# inside the process on a unix socket (redislite bundles the binary), so the
-# shared layer works with no credential at all. Set DETOMSITE_EMBEDDED_REDIS=0
-# to keep it off, or supply a real REDIS_URL to shadow it.
-# The import is guarded and every call is best-effort, so an unreachable or
-# unconfigured Redis can never break a request: reads fall back to the Postgres
-# app_cache table. Leave the env vars empty and everything still works.
+# inside the process on a unix socket — but only when the `redislite` package
+# is installed (it bundles the binary; install it locally with
+# `pip install redislite` if you want the embedded cache in dev).
+# redislite is intentionally NOT pinned here: it ships no prebuilt wheels for
+# newer Pythons, and a source build would fail the Render deploy. The import
+# is guarded and every call is best-effort, so without it reads simply fall
+# back to the Postgres app_cache table. Set DETOMSITE_EMBEDDED_REDIS=0
+# to keep it off explicitly, or supply a real REDIS_URL to shadow it.
 redis>=5.0
-redislite==6.2.912183
 setuptools>=70
