@@ -198,6 +198,7 @@ os.environ["SUPABASE_DB_PASSWORD"] = "dummy"
 os.environ["DEFAULT_SUPER_ADMIN_EMAIL"] = "admin@example.com"
 os.environ["DEFAULT_SUPER_ADMIN_PASSWORD"] = "pytest-admin-password"
 os.environ["SMS_FORWARD_KEY"] = ""
+os.environ["TELEGRAM_WEBHOOK_SECRET"] = ""
 
 import pytest
 import httpx

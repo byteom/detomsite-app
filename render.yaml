@@ -10,28 +10,109 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: DEBUG
+        value: "False"
+      - key: SEED_DEMO_DATA
+        value: "False"
+      # Supabase Postgres (only production DB). Get URI from Supabase
+      # Dashboard -> Connect (pooler, port 6543).
       - key: SUPABASE_DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
       - key: JWT_SECRET
         sync: false
+      # Portals on Vercel. BACKEND_URL must be this Render service's URL
+      # (https://detomsite-backend.onrender.com) once it is live — the
+      # in-app keep-alive self-pings it, and Telegram buttons use it.
       - key: FRONTEND_URL
         sync: false
       - key: BACKEND_URL
         sync: false
       - key: ALLOWED_ORIGINS
         sync: false
+      - key: HEALTH_URL
+        sync: false
+      - key: ADMIN_PORTAL_URL
+        sync: false
       - key: DEFAULT_SUPER_ADMIN_EMAIL
         sync: false
       - key: DEFAULT_SUPER_ADMIN_PASSWORD
         sync: false
-      # Read cache. Use Render's "Key Value" instance for REDIS_URL (add the
-      # optional `redis` package), or an Upstash/Vercel KV REST URL + token.
-      # Leave all four empty to run without a shared cache.
+      # Student registration lock (empty = any valid email accepted).
+      - key: STUDENT_EMAIL_DOMAINS
+        value: ""
+      # Read cache. Use Render's "Key Value" instance for REDIS_URL, or an
+      # Upstash/Vercel KV REST URL + token. Leave all empty to run on the
+      # Postgres cache (+ in-process embedded Redis) with no credential.
       - key: REDIS_URL
         sync: false
       - key: KV_REST_API_URL
         sync: false
       - key: KV_REST_API_TOKEN
         sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
       - key: REDIS_KEY_PREFIX
         value: "detomsite:"
+      # DB pool sizing — keep small on Render free + Supabase pooler.
+      - key: DB_POOL_MIN
+        value: "5"
+      - key: DB_POOL_MAX
+        value: "10"
+      # Telegram admin alerts (bot token + admin chat stay server-side).
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ADMIN_CHAT_ID
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      # Cloudinary payment screenshots (secrets server-side only).
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      # Web Push (vendor app order notifications). Generate with
+      # python backend/scripts/gen_vapid.py
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        value: "mailto:admin@detomsite.local"
+      # SMS-forwarder agent key (Android app posts bank SMS with it).
+      - key: SMS_FORWARD_KEY
+        sync: false
+      # WhatsApp auto-delivery (optional; empty = queued wa.me links only).
+      - key: WA_PROVIDER
+        sync: false
+      - key: WA_API_TOKEN
+        sync: false
+      - key: WA_API_URL
+        sync: false
+      # OTP email (SMTP tried first, Resend second).
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: SENTRY_DSN
+        sync: false
+      # Only True behind your own proxy that rewrites x-forwarded-for.
+      - key: TRUST_PROXY_HEADERS
+        value: "False"

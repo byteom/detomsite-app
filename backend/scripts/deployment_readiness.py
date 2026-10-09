@@ -28,8 +28,14 @@ def has_all(text: str, names: list[str]) -> list[str]:
 def main() -> int:
     checks: list[tuple[str, bool, str]] = []
 
-    # Backend env (Supabase mode)
-    required_env = ["SUPABASE_DATABASE_URL", "JWT_SECRET", "FRONTEND_URL", "BACKEND_URL", "ALLOWED_ORIGINS"]
+    # Backend env (Supabase mode) — must match render.yaml + .env.example.
+    required_env = ["SUPABASE_DATABASE_URL", "SUPABASE_URL", "SUPABASE_ANON_KEY",
+                    "SUPABASE_SERVICE_ROLE_KEY", "JWT_SECRET", "FRONTEND_URL",
+                    "BACKEND_URL", "ALLOWED_ORIGINS", "HEALTH_URL",
+                    "STUDENT_EMAIL_DOMAINS", "TELEGRAM_BOT_TOKEN",
+                    "TELEGRAM_WEBHOOK_SECRET", "SMS_FORWARD_KEY",
+                    "VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY", "SMTP_HOST",
+                    "DB_POOL_MAX"]
     backend_env = read("backend/.env.example")
     missing = has_all(backend_env, required_env)
     checks.append(("backend/.env.example has required variables", not missing, ", ".join(missing)))
