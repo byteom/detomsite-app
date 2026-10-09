@@ -14,8 +14,11 @@ create table if not exists public.users (
   email text not null default '',
   phone text not null default '',
   role text not null check (role in ('student', 'shopkeeper', 'admin')),
+  status text not null default 'active',
+  avatar_url text not null default '',
   created_at timestamptz not null default now()
 );
+create index if not exists idx_users_status on public.users (status);
 -- One account per email (case-insensitive, non-empty only). Registration is
 -- rejected with "email already registered" when this index would be violated.
 create unique index if not exists idx_users_email_unique
@@ -116,8 +119,19 @@ create table if not exists public.payments (
   status text not null default 'Pending Verification',
   utr_number text,
   screenshot_name text,
+  -- Manual UPI proof workflow (UTR + Cloudinary screenshot + admin check).
+  -- proof_status: PENDING_PAYMENT | PAYMENT_PROOF_SUBMITTED | PAYMENT_APPROVED
+  --   | PAYMENT_REJECTED (status stays in sync for older readers).
+  proof_status text not null default 'PENDING_PAYMENT',
+  payment_screenshot_url text not null default '',
+  payment_screenshot_public_id text not null default '',
+  payment_submitted_at timestamptz,
+  payment_verified_at timestamptz,
+  payment_verified_by text not null default '',
+  payment_rejection_reason text not null default '',
   created_at timestamptz not null default now()
 );
+create index if not exists idx_payments_proof_status on public.payments (proof_status);
 
 -- ─── Support tickets ───
 create table if not exists public.tickets (
@@ -160,7 +174,7 @@ create table if not exists public.app_settings (
 );
 
 -- ─── Password resets (double email OTP verification) ───
--- Forgot-password flow stores a 6-digit OTP per step (1 then 2) with expiry.
+-- Forgot-password flow stores a 4-digit OTP per step (1 then 2) with expiry.
 create table if not exists public.password_resets (
   id bigserial primary key,
   username text not null,
@@ -227,6 +241,7 @@ create index if not exists idx_orders_status on public.orders (status);
 create index if not exists idx_orders_created_at on public.orders (created_at);
 create index if not exists idx_orders_shop_id on public.orders (shop_id);
 create index if not exists idx_products_shop_id on public.products (shop_id);
+create index if not exists idx_products_shop_category_name on public.products (shop_id, category, name);
 create index if not exists idx_payments_order_id on public.payments (order_id);
 create index if not exists idx_payments_created_at on public.payments (created_at);
 
@@ -329,6 +344,16 @@ create table if not exists public.parent_orders (
   total integer not null default 0,
   payment_method text not null default 'UPI',
   payment_status text not null default 'Pending',
+  -- Manual UPI proof workflow (one bill per parent; proof lives on this row).
+  payment_proof_status text not null default 'PENDING_PAYMENT',
+  utr_number text,
+  screenshot_name text,
+  payment_screenshot_url text not null default '',
+  payment_screenshot_public_id text not null default '',
+  payment_submitted_at timestamptz,
+  payment_verified_at timestamptz,
+  payment_verified_by text not null default '',
+  payment_rejection_reason text not null default '',
   delivery_location text not null default '',
   status text not null default 'Pending',
   created_at timestamptz not null default now()
@@ -336,6 +361,7 @@ create table if not exists public.parent_orders (
 create index if not exists idx_parent_orders_created on public.parent_orders (created_at desc);
 create index if not exists idx_parent_orders_status on public.parent_orders (status);
 create index if not exists idx_parent_orders_date on public.parent_orders (date_key);
+create index if not exists idx_parent_orders_proof_status on public.parent_orders (payment_proof_status);
 
 -- ─── Shop sub-orders (one per shop within a parent order) ───
 create table if not exists public.shop_sub_orders (
@@ -362,6 +388,9 @@ create table if not exists public.shop_sub_orders (
 create index if not exists idx_shop_sub_orders_parent on public.shop_sub_orders (parent_order_id);
 create index if not exists idx_shop_sub_orders_shop on public.shop_sub_orders (shop_id, status);
 create index if not exists idx_shop_sub_orders_status on public.shop_sub_orders (status);
+-- Bounded auto-confirm sweep: serves WHERE status + delivered_at range so the
+-- per-minute sweep is an index scan, never a full-table scan.
+create index if not exists idx_shop_sub_orders_status_delivered on public.shop_sub_orders (status, delivered_at);
 
 -- ─── Order items (line items per sub-order) ───
 create table if not exists public.order_items (

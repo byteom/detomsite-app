@@ -1,32 +1,13 @@
-import { FormEvent, useState } from 'react'
+import type { FormEvent } from 'react'
+import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import api from '../services/api'
 import { saveSessionToBackend } from '../services/localApi'
 import { clearLocalSession, saveLocalSession, UserRoleChoice, getDashboardPath } from '../utils/session'
 import { syncProfileToSupabase, isSupabaseConfigured } from '../services/supabase'
+import { PasswordInput } from '../components/PasswordInput'
 
 type AuthMode = 'login' | 'signup'
-
-/* Password field with a show/hide toggle, styled to match the portal switcher. */
-function AuthPasswordField({ value, onChange, placeholder, autoComplete, required = true }: { value: string; onChange: (v: string) => void; placeholder?: string; autoComplete?: string; required?: boolean }) {
-  const [show, setShow] = useState(false)
-  return (
-    <div className="relative">
-      <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400">🔒</span>
-      <input type={show ? 'text' : 'password'} value={value} onChange={e => onChange(e.target.value)}
-        className="w-full rounded-card border border-slate-200 bg-white pl-11 pr-11 py-3 text-slate-700 placeholder-slate-400 outline-none transition-all focus:border-primary focus:shadow-[0_0_0_3px_rgba(15,118,110,0.12)]"
-        placeholder={placeholder} autoComplete={autoComplete} required={required} />
-      <button type="button" onClick={() => setShow(s => !s)} tabIndex={-1} aria-label={show ? 'Hide password' : 'Show password'}
-        className="absolute right-3 top-1/2 -translate-y-1/2 rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-slate-100 hover:text-primary">
-        {show ? (
-          <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" /><path d="m1 1 22 22" /></svg>
-        ) : (
-          <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" /><circle cx="12" cy="12" r="3" /></svg>
-        )}
-      </button>
-    </div>
-  )
-}
 
 export function AuthPage() {
   const navigate = useNavigate()
@@ -300,7 +281,7 @@ export function AuthPage() {
 
             <div>
               <label className="mb-1.5 block text-sm font-semibold text-slate-700">Password</label>
-              <AuthPasswordField value={password} onChange={setPassword}
+              <PasswordInput value={password} onChange={setPassword}
                 placeholder={mode === 'signup' ? 'Create a password' : 'Enter your password'}
                 autoComplete={mode === 'signup' ? 'new-password' : 'current-password'} />
             </div>
@@ -308,7 +289,7 @@ export function AuthPage() {
             {mode === 'signup' && (
               <div>
                 <label className="mb-1.5 block text-sm font-semibold text-slate-700">Confirm Password</label>
-                <AuthPasswordField value={confirmPassword} onChange={setConfirmPassword}
+                <PasswordInput value={confirmPassword} onChange={setConfirmPassword}
                   placeholder="Confirm your password" autoComplete="new-password" />
               </div>
             )}

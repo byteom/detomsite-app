@@ -2,7 +2,7 @@ import { OperationsPanel } from '../../components/OperationsPanel'
 
 import { useState, useCallback } from 'react'
 import { Link } from 'react-router-dom'
-import api from '../../services/api'
+import api, { apiCached } from '../../services/api'
 import { LocalAnnouncement, LocalShop, LocalSubOrder } from '../../types/localApi'
 import { getLocalSession } from '../../utils/session'
 import { usePolling } from '../../hooks/usePolling'
@@ -22,22 +22,26 @@ export function ShopkeeperDashboard() {
 
   const load = useCallback(async () => {
     try {
+      // Shops + announcements change rarely: serve from the shared TTL cache
+      // (7–30s) and dedupe identical in-flight GETs instead of paying 2 fresh
+      // pool checkouts on every 30s tick. Only the per-shop orders are live.
       const [s, o, a] = await Promise.all([
-        api.get<LocalShop[]>('/local/shops'),
+        apiCached.get<LocalShop[]>('/local/shops', undefined, 30000),
         shop ? api.get<LocalSubOrder[]>(`/local/shop-orders/${shop.id}`) : Promise.resolve({ data: [] }),
-        api.get<LocalAnnouncement[]>('/local/announcements'),
+        apiCached.get<LocalAnnouncement[]>('/local/announcements', undefined, 30000),
       ])
-      setShops(cur => same(cur, s.data) ? cur : s.data)
+      setShops(cur => same(cur, s) ? cur : s)
       setSubOrders(cur => same(cur, o.data) ? cur : o.data)
-      setAnnouncements(cur => same(cur, a.data) ? cur : a.data)
+      setAnnouncements(cur => same(cur, a) ? cur : a)
     } catch { setMessage('Backend not reachable') }
     finally { setLoading(false) }
   }, [shop?.id])
 
-  // Live-update every 10s, but only while this tab is visible — background
-  // tabs stop hitting the API, and the screen refreshes the moment you focus
-  // back.
-  usePolling(load, 10000, [shop?.id])
+  // Poll every 30s while this tab is visible (was 10s — a settled dashboard
+  // re-fetched 3 endpoints 6×/minute even when nothing changed; the server
+  // cache TTL is 10s, so 10s polling re-hit the DB on nearly every tick).
+  // Background tabs pause and refresh instantly on switch-back.
+  usePolling(load, 30000, [shop?.id])
 
   const pending = subOrders.filter(o => o.status === 'Pending')
   const active = subOrders.filter(o => ['Accepted', 'Preparing', 'Ready'].includes(o.status))

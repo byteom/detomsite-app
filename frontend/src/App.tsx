@@ -1,5 +1,6 @@
 import { BrowserRouter as Router, Routes, Route, Link } from 'react-router-dom'
 import { lazy, Suspense } from 'react'
+import { ScrollToTop } from './components/ScrollToTop'
 import './App.css'
 
 const Home = lazy(() => import('./pages/Home').then(m => ({ default: m.Home })))
@@ -9,6 +10,7 @@ const CustomerDashboard = lazy(() => import('./pages/customer/CustomerDashboard'
 const FeedbackPage = lazy(() => import('./pages/customer/FeedbackPage').then(m => ({ default: m.FeedbackPage })))
 const ShopkeeperDashboard = lazy(() => import('./pages/shopkeeper/ShopkeeperDashboard').then(m => ({ default: m.ShopkeeperDashboard })))
 const AdminDashboard = lazy(() => import('./pages/admin/AdminDashboard').then(m => ({ default: m.AdminDashboard })))
+const AdminOrderPage = lazy(() => import('./pages/admin/AdminOrderPage').then(m => ({ default: m.AdminOrderPage })))
 const AuthPage = lazy(() => import('./pages/AuthPage').then(m => ({ default: m.AuthPage })))
 const RoleGate = lazy(() => import('./components/RoleGate').then(m => ({ default: m.RoleGate })))
 const MainLayout = lazy(() => import('./components/Layout').then(m => ({ default: m.MainLayout })))
@@ -124,6 +126,7 @@ function NotFound() {
 function App() {
   return (
     <Router>
+      <ScrollToTop />
       <Suspense fallback={<PageSpinner />}>
         <Routes>
           {/* Portal landing selector - no auth needed */}
@@ -157,6 +160,7 @@ function App() {
                     <Route path="/feedback" element={<FeedbackPage />} />
                     <Route path="/shopkeeper-dashboard" element={<ShopkeeperDashboard />} />
                     <Route path="/admin-dashboard" element={<AdminDashboard />} />
+                    <Route path="/admin/orders/:orderId" element={<AdminOrderPage />} />
                     <Route path="*" element={<NotFound />} />
                   </Routes>
                 </Suspense>

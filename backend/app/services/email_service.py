@@ -1,10 +1,10 @@
 """Email service for sending emails.
 
-Delivery order: Resend HTTP API when ``RESEND_API_KEY`` is set (the easiest,
-most reliable path — no SMTP server to maintain), then SMTP when ``SMTP_HOST``
-is configured (see app.core.config). With neither, it falls back to logging the
-email body so the flow still works in development. Forgot-password OTPs are
-only ever delivered by email — the API never returns the code.
+Delivery order: SMTP first when ``SMTP_HOST`` is set (Gmail App Password
+default — see app.core.config), Resend HTTP API as fallback when SMTP is
+absent or rejects the mail. With neither, it falls back to logging the email
+body so the flow still works in development. Forgot-password OTPs are only
+ever delivered by email — the API never returns the code.
 """
 import asyncio
 import logging
@@ -41,12 +41,17 @@ def email_delivery_configured() -> bool:
 def _send_smtp(to_email: str, subject: str, html_body: str, text_body: str) -> bool:
     """Deliver an email over SMTP. Returns True when accepted by the server.
     smtplib is blocking, so callers must run this off the event loop — the
-    public EmailService methods wrap it in asyncio.to_thread."""
+    public EmailService methods wrap it in asyncio.to_thread.
+
+    Gmail default: host=smtp.gmail.com, port=587, STARTTLS on, auth with the
+    full Gmail address + a 16-char App Password (Google Account → Security →
+    2-Step Verification → App passwords). Port 465 uses implicit SSL instead.
+    """
     if not _smtp_configured():
         # No mail server configured. PENTEST/RELIABILITY FIX: this used to
         # `return True`, i.e. "email sent", while nothing had been sent at all.
         # Every caller ignored the return value anyway, so the whole chain
-        # reported success and the user was told "a 6-digit code was sent to
+        # reported success and the user was told "a 4-digit code was sent to
         # your registered email" while the code only ever reached the log file.
         # That is exactly why forgot-password looked broken with nothing to
         # debug: the API said it worked, so nobody checked the mail server.
@@ -65,28 +70,48 @@ def _send_smtp(to_email: str, subject: str, html_body: str, text_body: str) -> b
             )
         return False
 
+    from email.utils import parseaddr
+
+    _, sender_addr = parseaddr(settings.SMTP_FROM or "")
+    envelope_from = sender_addr or (settings.SMTP_USER or "no-reply@detomsite.local")
+    # Gmail App Passwords are shown with spaces ("xxxx xxxx ...") — spaces break login.
+    smtp_password = (settings.SMTP_PASSWORD or "").replace(" ", "")
+    timeout = getattr(settings, "SMTP_TIMEOUT_SECONDS", 15)
+
     message = MIMEMultipart("alternative")
     message["Subject"] = subject
-    message["From"] = settings.SMTP_FROM
+    message["From"] = settings.SMTP_FROM or envelope_from
     message["To"] = to_email
     message.attach(MIMEText(text_body, "plain"))
     message.attach(MIMEText(html_body, "html"))
 
+    server = None
     try:
-        server = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=15)
-        server.ehlo()
-        if settings.SMTP_USE_TLS:
-            server.starttls()
+        if int(settings.SMTP_PORT) == 465:
+            # Implicit SSL (e.g. Gmail smtp.gmail.com:465 when STARTTLS is off).
+            server = smtplib.SMTP_SSL(settings.SMTP_HOST, settings.SMTP_PORT, timeout=timeout)
             server.ehlo()
+        else:
+            # Submission port 587 with STARTTLS (Gmail default).
+            server = smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT, timeout=timeout)
+            server.ehlo()
+            if settings.SMTP_USE_TLS:
+                server.starttls()
+                server.ehlo()
         if settings.SMTP_USER:
-            server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
-        server.sendmail(settings.SMTP_FROM, [to_email], message.as_string())
-        server.quit()
-        logger.info(f"Email sent to {to_email}: {subject}")
+            server.login(settings.SMTP_USER, smtp_password)
+        server.sendmail(envelope_from, [to_email], message.as_string())
+        logger.info(f"Email sent to {to_email} via SMTP {settings.SMTP_HOST}: {subject}")
         return True
     except Exception as e:
-        logger.error(f"Error sending email to {to_email} ({subject}): {e}")
+        logger.error(f"Error sending email to {to_email} via SMTP {settings.SMTP_HOST} ({subject}): {e}")
         return False
+    finally:
+        try:
+            if server is not None:
+                server.quit()
+        except Exception:
+            pass
 
 
 async def _send_resend(to_email: str, subject: str, html_body: str, text_body: str) -> bool:
@@ -120,8 +145,21 @@ async def _send_resend(to_email: str, subject: str, html_body: str, text_body: s
 
 
 async def _deliver(to_email: str, subject: str, html_body: str, text_body: str) -> bool:
-    """Route an email through whichever delivery path is configured:
-    Resend API first, then SMTP, then the local log fallback."""
+    """Route an email through whichever delivery path is configured.
+
+    SMTP is the primary path (user requirement — Gmail App Password default);
+    Resend is the fallback when SMTP is absent or its server rejects the mail.
+    """
+    if _smtp_configured():
+        delivered = await asyncio.to_thread(_send_smtp, to_email, subject, html_body, text_body)
+        if delivered:
+            return True
+        # SMTP configured but failed — try Resend before giving up so one
+        # provider outage does not break password recovery.
+        if settings.RESEND_API_KEY:
+            logger.warning("SMTP delivery failed — retrying via Resend")
+            return await _send_resend(to_email, subject, html_body, text_body)
+        return False
     if settings.RESEND_API_KEY:
         return await _send_resend(to_email, subject, html_body, text_body)
     return await asyncio.to_thread(_send_smtp, to_email, subject, html_body, text_body)
@@ -158,7 +196,7 @@ class EmailService:
         code: str,
         purpose: str = "verification"
     ) -> bool:
-        """Send a 6-digit OTP by email (single-code forgot-password flow)."""
+        """Send a 4-digit OTP by email (single-code forgot-password flow)."""
         subject = f"DETOMSITE {purpose.replace('_', ' ').title()} Code: {code}"
         text = (
             f"Hi,\n\nYour {purpose.replace('_', ' ')} code is:\n\n  {code}\n\n"

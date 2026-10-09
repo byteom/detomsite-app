@@ -10,6 +10,13 @@ import android.os.Build
 import android.provider.Telephony
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.work.BackoffPolicy
+import androidx.work.Constraints
+import androidx.work.Data
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -94,65 +101,83 @@ class SmsReceiver : BroadcastReceiver() {
 
     private fun isBankCreditSms(text: String): Boolean {
         val lower = text.lowercase()
-        // A debit SMS is never a payment proof — never match against it even if
-        // it happens to mention "upi"/"utr"/"ref".
-        if (listOf("debited", " debit", "deducted", "paid out").any { lower.contains(it) }) return false
-        return listOf("credited", " credit ", "deposited", "received", "rcvd", "cr ")
-            .any { lower.contains(it) }
+        // A debit/outgoing SMS is never a payment proof — never match against
+        // it even if it happens to mention "upi"/"utr"/"ref".
+        if (listOf(
+                "debited", " debit", "deducted", "paid out", "spent",
+                "transferred to", "withdrawn", "withdrawal", "paid to",
+                "purchase", "debited:", "debit:"
+            ).any { lower.contains(it) }) return false
+        // OTP / request spam that mentions an amount must not pass even with
+        // credit-adjacent words elsewhere in the message.
+        if (lower.contains("otp") || lower.contains("one time password")) return false
+        return listOf(
+            "credited", " credit ", "deposited", "received", "rcvd",
+            "cr ", "cr:", "cr.", "jama", "prapt"
+        ).any { lower.contains(it) }
     }
 
     /** Extract UTR on-device. Never sent: sender, balance, account, raw text. */
     private fun extractUtr(text: String): String? {
         val patterns = listOf(
             Regex("(?i)\\butr\\s*:?\\s*([a-z0-9]{6,30})"),
+            Regex("(?i)\\brrn\\s*:?\\s*([a-z0-9]{6,30})"),
+            Regex("(?i)\\bupi\\s*(?:ref|txn|transaction)?\\s*:?\\s*([a-z0-9]{6,30})"),
+            Regex("(?i)\\btransaction\\s*(?:id|no)?\\s*:?\\s*([a-z0-9]{6,30})"),
+            Regex("(?i)\\btxn\\s*(?:no|id)?\\s*:?\\s*([a-z0-9]{6,30})"),
             Regex("(?i)\\bref\\s*(?:erence|\\.|no|#)?\\s*[:.]?\\s*([a-z0-9]{6,30})"),
-            Regex("(?<![a-z0-9])([a-z]{0,4}\\d{10,16})(?![a-z0-9])"),
         )
         for (p in patterns) {
-            p.find(text)?.let { return it.groupValues[1].uppercase() }
+            val hit = p.find(text)?.groupValues?.get(1)?.uppercase().orEmpty()
+            if (hit.length in 6..30 && !isPhoneShaped(hit)) return hit
         }
+        // Bare 12-digit UPI reference (usually starts with 4) with no label.
+        // Phone-shaped 10-digit numbers starting 6-9 are explicitly excluded
+        // so a sender/footer number is never filed as a UTR.
+        Regex("(?<![a-z0-9])(4\\d{11})(?![a-z0-9])").find(text)?.let { return it.groupValues[1] }
         return null
     }
 
-    /** Extract the credited amount on-device. */
+    private fun isPhoneShaped(code: String): Boolean {
+        val digits = code.filter { it.isDigit() }
+        // 10-digit Indian mobile starting 6-9 with no letters = phone, not UTR.
+        return code.all { it.isDigit() } && digits.length == 10 && digits[0] in "6789"
+    }
+
+    /** Extract the credited amount on-device. Supports Rs/INR/₹/रु/रू. */
     private fun extractAmount(text: String): Double? {
-        val regex = Regex("(?:Rs\\.?|INR|₹|\\bCr\\.?)\\s*([\\d,]+(?:\\.\\d{1,2})?)", RegexOption.IGNORE_CASE)
+        val regex = Regex("(?:Rs\\.?|INR|₹|रु|रू|\\bCr\\.?)\\s*([\\d,]+(?:\\.\\d{1,2})?)", RegexOption.IGNORE_CASE)
         val matches = regex.findAll(text).toList()
-        if (matches.isEmpty()) return null
 
         val lower = text.lowercase()
         val creditCues = listOf(
-            "credited", "deposited", "received", "rcvd", "successful", "credit", "trns"
+            "credited", "deposited", "received", "rcvd", "successful", "credit", "jama", "prapt"
         )
 
         // Prefer the amount whose surroundings mention a credit cue, so a
-        // balance mention ("A/c bal: Rs 5,000") is never chosen over the
-        // ₹80 credit. Fall back to the last match.
+        // balance mention ("Available balance Rs 5,000") is never chosen over
+        // the ₹80 credit. A value labelled as balance/available/avl within a
+        // 30-char window is never the credit. With no credit cue at all, drop
+        // the SMS for manual review instead of guessing the trailing balance.
+        if (matches.isEmpty()) return null
         var best: MatchResult? = null
         var bestDist = Int.MAX_VALUE
-        var sawCue = false
         for (m in matches) {
-            // A value directly labelled as the balance (within 12 chars) is
-            // never the credit.
-            val before = lower.substring(maxOf(0, m.range.first - 12), m.range.first)
-            if ("bal" in before) continue
+            val before = lower.substring(maxOf(0, m.range.first - 30), m.range.first)
+            if (listOf("bal", "balance", "available", "avl").any { it in before }) continue
             val start = maxOf(0, m.range.first - 30)
             val end = minOf(text.length, m.range.last + 30)
             val window = lower.substring(start, end)
-            val cue = creditCues.firstOrNull { it in window } ?: continue
-            val dist = minOf(
-                m.range.first - start,
-                window.indexOf(cue),
-                maxOf(0, end - (start + window.indexOf(cue) + cue.length))
-            )
+            val cuePos = creditCues.map { window.indexOf(it) }.filter { it >= 0 }.minOrNull()
+                ?: continue
+            val dist = kotlin.math.abs((m.range.first - start) - cuePos)
             if (dist < bestDist) {
                 bestDist = dist
                 best = m
-                sawCue = true
             }
         }
 
-        val chosen = if (sawCue) best!! else matches.last()
+        val chosen = best ?: return null
         return try {
             chosen.groupValues[1].replace(",", "").toDouble()
         } catch (e: Exception) { null }
@@ -174,8 +199,13 @@ class SmsReceiver : BroadcastReceiver() {
             // without a scheme), so an old install recovers instead of failing
             // every incoming bank SMS.
             val root = normalizeBackendUrl(baseUrl)
+            val phone = configuredPhone(context, context.getSharedPreferences("agent", Context.MODE_PRIVATE))
+            if (phone.isEmpty()) {
+                notifyRejected(context, "Shop phone not set or invalid — open the app and save a 10-digit mobile number.")
+                return
+            }
             val json = JSONObject()
-                .put("phone", configuredPhone(context, context.getSharedPreferences("agent", Context.MODE_PRIVATE)))
+                .put("phone", phone)
                 .put("utr", utr)
                 .put("amount", amount)
             val body = json.toString().toRequestBody(JSON_MEDIA)
@@ -185,25 +215,18 @@ class SmsReceiver : BroadcastReceiver() {
                 .header("Content-Type", "application/json")
                 .header("X-Agent-Key", agentKey)
                 .build()
-            // Timeouts must cover a COLD serverless start.
-            //
-            // BUG FIX (payments silently never confirmed). These were 6 s, sized
-            // for the goAsync() budget. But the backend is a Vercel serverless
-            // function that boots per request, and a cold start measures
-            // 7.5–14 s in production. So on a cold instance the proof POST was
-            // aborted client-side BEFORE the server ever saw it: the student had
-            // paid, the order stayed "Pending Payment", and nothing was logged
-            // on the server to explain why. The `goAsync()` budget is ~10 s of
-            // *pending* time, but Android's limit is not a hard kill on a
-            // socket that is already established — and a background broadcast
-            // receiver is exactly the case where finishing the upload matters
-            // more than returning instantly. 20 s comfortably covers a cold
-            // boot while still letting the broadcast finish well inside the
-            // platform's window.
+            // goAsync budget: per Android BroadcastReceiver docs the receiver must
+            // finish in ~10s (30s max for non-foreground broadcasts like
+            // SMS_RECEIVED). So ONE fast attempt lives here (5s connect / 8s
+            // read) and every retry/durable delivery moves to WorkManager
+            // (ProofRetryWorker: persisted + exponential backoff + CONNECTED),
+            // which survives Doze, process death and cold serverless starts.
+            // In-receiver sleep+retry loops are what got the process killed
+            // mid-retry before.
             client = OkHttpClient.Builder()
-                .connectTimeout(10, TimeUnit.SECONDS)
-                .readTimeout(20, TimeUnit.SECONDS)
-                .writeTimeout(10, TimeUnit.SECONDS)
+                .connectTimeout(5, TimeUnit.SECONDS)
+                .readTimeout(8, TimeUnit.SECONDS)
+                .writeTimeout(5, TimeUnit.SECONDS)
                 .build()
             client!!.newCall(request!!).execute().use { resp ->
                 val code = resp.code
@@ -223,84 +246,56 @@ class SmsReceiver : BroadcastReceiver() {
                     // why. The server sends a plain-language reason, so show it.
                     val reason = rejectionReason(bodyText)
                     Log.w(TAG, "Match rejected ($code): $reason")
-                    // Retry ONCE, and only on a server-side error. A 5xx can be a
-                    // cold start or a blip; a 429 is a deliberate throttle and
-                    // retrying only burns more of the budget. The delay is sized
-                    // to finish inside the ~10 s goAsync() window — overrun it and
-                    // Android kills the process mid-retry, which is the very bug
-                    // this class is fixing.
-                    if (code in 500..599) {
-                        delay(1500)
-                        val retry = client!!.newCall(request!!.newBuilder().build()).execute()
-                        retry.use { r2 ->
-                            val retryBody = r2.body?.string().orEmpty()
-                            if (r2.code in 200..299) {
-                                val orderId = runCatching { JSONObject(retryBody).optString("order_id") }.getOrDefault("")
-                                // Same wording rule as the first attempt: a credit
-                                // settled WITHOUT a UTR must not print "UTR " and
-                                // then nothing, which reads as a bug to the shopkeeper.
-                                notifySent(
-                                    context,
-                                    if (utr.isEmpty()) "₹${amount.toInt()} received ✓ — order $orderId completed"
-                                    else "UTR $utr ✓ — order $orderId completed"
-                                )
-                            } else {
-                                notifyRejected(context, rejectionReason(retryBody))
-                            }
-                            return
-                        }
+                    // Retry via WorkManager ONLY on a server-side error. A 5xx can
+                    // be a cold start or a blip; a 429/4xx is deliberate and an
+                    // immediate retry only burns budget. The worker carries
+                    // CONNECTED + exponential backoff and survives process death.
+                    if (code in 500..599 || code == 429) {
+                        enqueueProofRetry(context, baseUrl, agentKey, phone, utr, amount)
                     }
                     notifyRejected(context, reason)
                 }
             }
         } catch (e: Exception) {
-            // BUG FIX (paid orders never confirmed). This gave up on the FIRST
-            // network error, so a momentary dropout — a dead spot, a switching
-            // mobile data, the app process being frozen — meant the bank credit
-            // was simply lost. The SMS is not re-delivered, so there is no
-            // second chance: the student had paid, the order sat unpaid, and
-            // nothing on the server recorded that proof ever existed.
-            //
-            // A timeout/IO failure is safe to retry — the match endpoint is
-            // idempotent per credit (it stamps the UTR onto the payment row), and
-            // the server's own 409 for an already-settled credit is handled
-            // below rather than double-settling anything. One retry after a
-            // short pause covers the common case, which is a brief blip.
-            Log.e(TAG, "sendProof failed (${e.message}) — retrying once")
-            var settled = false
-            // If the request never got built (a bad URL, say) there is nothing
-            // to retry, and saying "check your connection" would be misleading.
-            val builtRequest = request
-            val builtClient = client
-            if (builtRequest != null && builtClient != null) {
-                try {
-                    delay(2000)
-                    val retry = builtClient.newCall(builtRequest.newBuilder().build()).execute()
-                    retry.use { r2 ->
-                        val retryBody = r2.body?.string().orEmpty()
-                        if (r2.code in 200..299) {
-                            val orderId = runCatching { JSONObject(retryBody).optString("order_id") }.getOrDefault("")
-                            notifySent(
-                                context,
-                                if (utr.isEmpty()) "₹${amount.toInt()} received ✓ — order $orderId completed"
-                                else "UTR $utr ✓ — order $orderId completed"
-                            )
-                        } else {
-                            notifyRejected(context, rejectionReason(retryBody))
-                        }
-                        settled = true
-                    }
-                } catch (e2: Exception) {
-                    Log.e(TAG, "sendProof retry also failed: ${e2.message}")
-                }
-            }
-            // Only claim we could not reach the server when the retry never got
-            // an answer at all; a rejection reason is more useful to the shop.
-            if (!settled) {
-                notifyRejected(context, "Could not reach DETOMSITE — check your internet connection.")
-            }
+            // Network/IO failure: the SMS is NOT redelivered, so hand the proof
+            // to WorkManager (persisted + CONNECTED + exponential backoff). The
+            // match endpoint is idempotent per credit, so a duplicate delivery
+            // from the worker is safe (replay -> 409, never double-settles).
+            Log.e(TAG, "sendProof failed (${e.message}) — enqueuing WorkManager retry")
+            enqueueProofRetry(context, baseUrl, agentKey,
+                configuredPhone(context, context.getSharedPreferences("agent", Context.MODE_PRIVATE)),
+                utr, amount)
+            notifyRejected(context, "Could not reach DETOMSITE — queued for retry.")
         }
     }
+
+    private fun enqueueProofRetry(
+        context: Context, baseUrl: String, agentKey: String, phone: String, utr: String, amount: Double
+    ) {
+        try {
+            if (baseUrl.isEmpty() || agentKey.isEmpty() || phone.isEmpty() || amount <= 0) return
+            val input = Data.Builder()
+                .putString(ProofRetryWorker.KEY_BASE_URL, baseUrl)
+                .putString(ProofRetryWorker.KEY_AGENT_KEY, agentKey)
+                .putString(ProofRetryWorker.KEY_PHONE, phone)
+                .putString(ProofRetryWorker.KEY_UTR, utr)
+                .putDouble(ProofRetryWorker.KEY_AMOUNT, amount)
+                .build()
+            val constraints = Constraints.Builder()
+                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .build()
+            val work = OneTimeWorkRequestBuilder<ProofRetryWorker>()
+                .setInputData(input)
+                .setConstraints(constraints)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+                .build()
+            // Unique per credit so rapid duplicate SMS don't stack workers; KEEP
+            // preserves the first queued proof.
+            WorkManager.getInstance(context.applicationContext).enqueueUniqueWork(
+                "proof-${phone.takeLast(10)}-${utr.ifEmpty { "no-utr" }}-${amount.toInt()}",
+                ExistingWorkPolicy.KEEP, work
+            )
+        } catch (e: Exception) { Log.d(TAG, "enqueue retry skipped: ${e.message}") }
 
     /** Pull the server's human-readable reason out of an error body. */
     private fun rejectionReason(body: String): String = try {
@@ -310,10 +305,21 @@ class SmsReceiver : BroadcastReceiver() {
     }
 
     private fun configuredPhone(context: Context, prefs: android.content.SharedPreferences): String {
-        val manual = prefs.getString("phone", "").orEmpty().trim().replace(Regex("\\D"), "")
-        val digits = manual.ifEmpty { localNumber(context).replace(Regex("\\D"), "") }
-        val bare = if (digits.startsWith("91")) digits.substring(2) else digits
-        return "+91" + bare.takeLast(10)
+        return normalizeIndianMobile(
+            prefs.getString("phone", "").orEmpty().ifBlank { localNumber(context) }
+        )
+    }
+
+    companion object {
+        /** Single Indian-mobile normalizer shared by SMS + test paths.
+         * Returns "" when unusable so callers never POST a bare "+91". */
+        fun normalizeIndianMobile(raw: String): String {
+            var digits = raw.filter { it.isDigit() }
+            if (digits.startsWith("91") && digits.length == 12) digits = digits.substring(2)
+            if (digits.startsWith("0") && digits.length == 11) digits = digits.substring(1)
+            if (digits.length != 10 || digits[0] !in "6789") return ""
+            return "+91$digits"
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -325,15 +331,17 @@ class SmsReceiver : BroadcastReceiver() {
     }
 
     private fun notifySent(context: Context, preview: String) {
-        postNotification(context, "Payment proof sent ✓", preview)
+        postNotification(context, "Payment proof sent ✓", preview, idFor(preview))
     }
 
     /** A credit the bot could NOT settle — say so on the phone, not just in logcat. */
     private fun notifyRejected(context: Context, reason: String) {
-        postNotification(context, "Payment needs review", reason)
+        postNotification(context, "Payment needs review", reason, idFor(reason))
     }
 
-    private fun postNotification(context: Context, title: String, text: String) {
+    private fun idFor(seed: String): Int = (seed.hashCode() and 0x7fffffff) % 100000 + 1000
+
+    private fun postNotification(context: Context, title: String, text: String, id: Int = 1) {
         try {
             val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -348,7 +356,7 @@ class SmsReceiver : BroadcastReceiver() {
                 .setStyle(NotificationCompat.BigTextStyle().bigText(text))
                 .setAutoCancel(true)
                 .build()
-            nm.notify(1, n)
+            nm.notify(id, n)
         } catch (e: Exception) { Log.d(TAG, "notify skipped: ${e.message}") }
     }
 

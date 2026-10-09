@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import logging
 import os
-import secrets
+import queue
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
-
 
 # Asia/Kolkata fixed offset (works even without the tzdata package)
 _KOLKATA_TZ = timezone(timedelta(hours=5, minutes=30))
@@ -24,10 +24,22 @@ _KOLKATA_TZ = timezone(timedelta(hours=5, minutes=30))
 def _now_kolkata() -> datetime:
     return datetime.now(_KOLKATA_TZ)
 
+
+def _day_key() -> str:
+    """Today's date in IST as YYYY-MM-DD (matches local_demo_db)."""
+    return _now_kolkata().strftime("%Y-%m-%d")
+
+
+def _day_key_compact() -> str:
+    """Today's date in IST as YYYYMMDD (used in order ids like p20240320-18)."""
+    return _now_kolkata().strftime("%Y%m%d")
+
+
 import psycopg2
 import psycopg2.extras
 from psycopg2 import pool as _pg_pool
 
+from app.core import ttl_cache
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -44,12 +56,7 @@ _CONN_QUERY_PARAMS = (
 
 
 def _with_conn_params(dsn: str) -> str:
-    """Attach fast-fail connect settings to a Postgres DSN.
-
-    Without an explicit ``connect_timeout`` psycopg2/libpq blocks for minutes on
-    an unreachable host, which made requests (and even startup) hang when the
-    Supabase pooler was down. TCP keepalives also let the pool notice half-open
-    connections the pooler recycled instead of failing on the first query."""
+    """Attach fast-fail connect settings to a Postgres DSN."""
     if not dsn or "connect_timeout" in dsn:
         return dsn
     sep = "&" if "?" in dsn else "?"
@@ -67,50 +74,18 @@ def _connection_string() -> str:
 
 
 # ─── Connection pool ───────────────────────────────────────────────────────
-# Opening a brand-new Postgres connection for every request is slow (each one
-# needs a TCP + TLS handshake across regions). We keep a small pool of warm
-# connections and reuse them, which makes the site feel much snappier.
 _pool: Any = None
 
 # How long a request may wait for a busy pool slot before giving up.
-#
-# Deliberately SHORTER than the server-side ``statement_timeout`` (20 s). A
-# request that waited 8 s for a slot and then queued behind Supabase's own
-# pooler still had its query cancelled at 20 s — that is what produced the
-# production 500s (psycopg2 raises QueryCanceled, a subclass of
-# OperationalError). Failing fast at 3 s instead means the client gets a
-# retryable 503 while the request is still cheap, rather than burning 20 s of a
-# serverless invocation to be told nothing.
-#
-# A slot frees in milliseconds under normal load, so 3 s is generous; it only
-# matters when the pool is genuinely saturated, which is exactly when waiting
-# longer is pointless.
 _POOL_WAIT_SECONDS = 3.0
 
-# Pool size.
-#
-# Deliberately SMALL, and the opposite of the instinct to make it bigger. The
-# real limit is the DATABASE's: Supabase allows 60 connections here, and that
-# budget is shared by every Vercel instance of this backend plus Supabase's own
-# PostgREST, pg_cron and pg_net sessions. A pool of 25 per instance means two
-# warm instances can exhaust the whole database on their own.
-#
-# The correct shape for a serverless deployment is therefore a small per-process
-# pool: it covers real concurrency, recycles slots promptly, and leaves the rest
-# of the database's budget for the other instances. Overridable for a host that
-# is genuinely single-instance and wants more.
+# Pool size (overridable via DB_POOL_MAX).
+_POOL_MIN = int(os.environ.get("DB_POOL_MIN", "5"))
 _POOL_MAX = int(os.environ.get("DB_POOL_MAX", "10"))
 
 
 def _dsn_options(dsn: str) -> str:
-    """Best-effort read of an ``options=`` setting already in the DSN.
-
-    ``psycopg2.extensions.parse_dsn`` cannot be used here: it rejects a URI whose
-    ``options`` value itself contains ``=`` (which every ``-c foo=bar`` does), and
-    silently losing an operator's ``options`` — a custom ``search_path``, say —
-    would change how their queries run. So the query string is read directly, for
-    both the URI and the ``key=value`` DSN form.
-    """
+    """Best-effort read of an ``options=`` setting already in the DSN."""
     if not dsn:
         return ""
     value = ""
@@ -121,8 +96,6 @@ def _dsn_options(dsn: str) -> str:
             if key == "options":
                 value = val
     else:
-        # libpq's key=value form quotes a value that contains spaces, so split
-        # with quote handling rather than on bare whitespace.
         import shlex
 
         try:
@@ -136,154 +109,223 @@ def _dsn_options(dsn: str) -> str:
 
 
 def _pool_connect_kwargs() -> dict:
-    """Connect-time kwargs that make a stalled Postgres fail fast.
-
-    ``connect_timeout`` is already in the DSN, but it is repeated here because a
-    caller-supplied DSN may omit it and libpq would otherwise block for minutes.
-    ``statement_timeout`` is the one that matters most: it is a *server-side*
-    cap, so a query that wedges (pooler queue, row lock, a backend that stops
-    responding) is aborted by Postgres itself instead of holding a pooled
-    connection — and every request queued behind it — forever.
-    """
+    """Connect-time kwargs that make a stalled Postgres fail fast."""
     kwargs: dict = {"connect_timeout": 10}
     budget_ms = max(1000, int(getattr(settings, "DB_STATEMENT_TIMEOUT_MS", 20000)))
     cap = f"-c statement_timeout={budget_ms}"
-    # Keep whatever the operator already set and add the cap, rather than
-    # dropping it.
     existing = _dsn_options(_connection_string())
     kwargs["options"] = f"{existing} {cap}".strip() if existing else cap
     return kwargs
+
+
+class FastConnectionPool:
+    """High-performance thread-safe connection pool for WAN/serverless databases."""
+
+    def __init__(self, minconn: int = 5, maxconn: int = 15):
+        self.minconn = max(1, minconn)
+        self.maxconn = max(self.minconn, maxconn)
+        self._pool: queue.LifoQueue = queue.LifoQueue()
+        self._allocated = 0
+        self._lock = threading.Lock()
+        self.closed = False
+        self._prewarm()
+
+    def _prewarm(self) -> None:
+        """Eagerly open warm connections on startup without blocking sequentially."""
+        conn = self._create_connection()
+        if conn:
+            self._pool.put(conn)
+
+        remaining = self.minconn - 1
+        if remaining > 0:
+            def _warm():
+                for _ in range(remaining):
+                    c = self._create_connection()
+                    if c:
+                        self._pool.put(c)
+            threading.Thread(target=_warm, daemon=True, name="db-pool-warm").start()
+
+    def _create_connection(self) -> Any | None:
+        try:
+            conn = psycopg2.connect(
+                _connection_string(),
+                cursor_factory=psycopg2.extras.RealDictCursor,
+                **_pool_connect_kwargs(),
+            )
+            with self._lock:
+                self._allocated += 1
+            return conn
+        except Exception as e:
+            logger.warning("DB pool connection creation failed (%s)", e)
+            return None
+
+    def getconn(self, key: Any = None, timeout: float = _POOL_WAIT_SECONDS) -> Any:
+        if self.closed:
+            raise _pg_pool.PoolError("connection pool is closed")
+
+        deadline = time.monotonic() + timeout
+        # 1. Try to pop an existing warm connection from the LIFO queue
+        while True:
+            try:
+                conn = self._pool.get_nowait()
+                if getattr(conn, "closed", 1) == 0:
+                    return conn
+                with self._lock:
+                    self._allocated = max(0, self._allocated - 1)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            except queue.Empty:
+                break
+
+        # 2. If under maxconn, create a new connection WITHOUT holding pool lock
+        can_create = False
+        with self._lock:
+            if self._allocated < self.maxconn:
+                self._allocated += 1
+                can_create = True
+
+        if can_create:
+            try:
+                conn = psycopg2.connect(
+                    _connection_string(),
+                    cursor_factory=psycopg2.extras.RealDictCursor,
+                    **_pool_connect_kwargs(),
+                )
+                return conn
+            except Exception:
+                with self._lock:
+                    self._allocated = max(0, self._allocated - 1)
+                raise
+
+        # 3. Pool is at capacity: wait for an in-use connection to be returned
+        remaining = max(0.01, deadline - time.monotonic())
+        try:
+            conn = self._pool.get(timeout=remaining)
+            if getattr(conn, "closed", 1) == 0:
+                return conn
+            with self._lock:
+                self._allocated = max(0, self._allocated - 1)
+            return self.getconn(key=key, timeout=max(0.1, deadline - time.monotonic()))
+        except queue.Empty:
+            raise _pg_pool.PoolError("connection pool exhausted")
+
+    def putconn(self, conn: Any, key: Any = None, close: bool = False) -> None:
+        if conn is None:
+            return
+        if close or getattr(conn, "closed", 1) != 0 or self.closed:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._lock:
+                self._allocated = max(0, self._allocated - 1)
+            return
+
+        # Ensure no abandoned transaction remains open
+        try:
+            status = getattr(conn, "get_transaction_status", lambda: 0)()
+            if status != 0:
+                conn.rollback()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._lock:
+                self._allocated = max(0, self._allocated - 1)
+            return
+
+        self._pool.put(conn)
+
+    def size(self) -> int:
+        return self._allocated
+
+    def idle_count(self) -> int:
+        return self._pool.qsize()
+
+    def ping_all(self) -> None:
+        """Keep-alive ping on idle connections in the pool without draining the pool."""
+        count = self._pool.qsize()
+        for _ in range(count):
+            try:
+                c = self._pool.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if getattr(c, "closed", 1) == 0:
+                    with c.cursor() as cur:
+                        cur.execute("SELECT 1")
+                    self._pool.put(c)
+                else:
+                    with self._lock:
+                        self._allocated = max(0, self._allocated - 1)
+            except Exception:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+                with self._lock:
+                    self._allocated = max(0, self._allocated - 1)
+
+    def closeall(self) -> None:
+        self.closed = True
+        while True:
+            try:
+                c = self._pool.get_nowait()
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            except queue.Empty:
+                break
+        with self._lock:
+            self._allocated = 0
 
 
 def _get_pool() -> Any:
     """Lazily create the shared connection pool (thread-safe)."""
     global _pool
     if _pool is None:
-        _pool = _pg_pool.ThreadedConnectionPool(
-            1, _POOL_MAX, _connection_string(),
-            cursor_factory=psycopg2.extras.RealDictCursor,
-            **_pool_connect_kwargs(),
+        _pool = FastConnectionPool(
+            minconn=_POOL_MIN,
+            maxconn=_POOL_MAX,
         )
     return _pool
 
 
 def _connect() -> Any:
-    """Get a pooled Postgres connection with dict-row support.
-
-    PENTEST/RELIABILITY FIX (production 500s under load). ``getconn()`` raises
-    ``PoolError("connection pool exhausted")`` the moment all 15 slots are
-    checked out — it does NOT wait. Nothing here caught that, so it propagated
-    as an HTTP 500.
-
-    Reproduced live: 20 simultaneous requests to /checkout-data returned
-    **13 × 200 and 7 × 500**. That is the "Could not load the live prices for
-    your cart" message, and it was intermittent, which is why it looked like a
-    flaky connection rather than a hard limit. It hits the busiest page exactly
-    when several students check out at once.
-
-    A pool slot is a resource that is *momentarily* busy, not missing, so the
-    right behaviour is to wait a moment for one to come back. The wait is short
-    and bounded: a checkout is a handful of quick queries, so a slot frees up
-    almost immediately. Anything that is genuinely stuck is already capped by
-    the server-side ``statement_timeout``, so this cannot queue forever.
-    """
+    """Get a pooled Postgres connection with dict-row support."""
     pool = _get_pool()
-    deadline = time.monotonic() + _POOL_WAIT_SECONDS
-    delay = 0.02
-    while True:
-        try:
-            conn = pool.getconn()
-        except _pg_pool.PoolError:
-            if time.monotonic() >= deadline:
-                # Out of patience. This is a real capacity problem, so say so
-                # rather than pretending — but it is still a server-side fault,
-                # and the middleware turns this into a 503, not a 500.
-                logger.error("Postgres pool exhausted after %.1fs", _POOL_WAIT_SECONDS)
-                raise
-            # Contention, not failure: back off gently and try again.
-            time.sleep(delay)
-            delay = min(delay * 1.6, 0.25)
-            continue
-
-        if getattr(conn, "closed", 0) != 0:
-            # Stale pooled connection — return its slot (rebuilds the pool) and
-            # ask for a fresh one, so the slot is never leaked.
-            _release(conn, discard=True)
-            continue
-        return conn
+    t0 = time.perf_counter()
+    conn = pool.getconn(timeout=_POOL_WAIT_SECONDS)
+    from app.core.timing import record_timing
+    record_timing("db_conn", (time.perf_counter() - t0) * 1000)
+    return conn
 
 
 def _release(conn: Any, discard: bool = False) -> None:
-    """Return a connection to the pool. If it broke (or ``discard=True``),
-    close that one connection rather than tearing the pool down.
-
-    Rebuilding the whole pool on a single bad connection was a stampede: every
-    in-flight request then had to open a fresh TLS connection to Supabase, so
-    one dead socket turned a blip into tens of seconds of latency across the
-    instance. Dropping just the broken connection keeps the healthy ones warm;
-    the next checkout opens a replacement if the pool needs one.
-
-    BUG FIX (backend connection leak). ``pool.putconn()`` does NOT commit or
-    roll back — it just hands the connection to the next caller. So any code
-    path that returned a connection still inside a transaction leaked a real
-    Postgres backend for the life of the process, and the database showed it as
-    ``idle in transaction`` (observed: two Supavisor sessions stuck that way
-    for over seven minutes).
-
-    There were several such paths, all shaped like::
-
-        if row:
-            connection.commit()      # skipped when no row came back
-        return row
-    ...
-    finally:
-        _release(connection)
-
-    A read or an update that matched no row commits nothing, so the transaction
-    stayed open forever. That is a hard ceiling on capacity: the database's
-    60-connection limit was being eaten a few at a time until checkout — and
-    every other read — failed with 500s.
-
-    Fixing each call site would be whack-a-mole, so the guarantee is enforced
-    here, once, for every caller: never hand back a connection that is not
-    idle. An in-flight transaction is by definition uncommitted work that the
-    caller has abandoned, so rolling it back is the only correct action.
-    """
+    """Return a connection to the pool. If it broke (or discard=True), close it."""
+    if conn is None:
+        return
+    is_dead = bool(discard or getattr(conn, "closed", 0))
+    if not is_dead and _in_transaction(conn):
+        try:
+            conn.rollback()
+        except Exception:
+            is_dead = True
     pool = _get_pool()
-    if discard:
+    pool.putconn(conn, close=is_dead)
+    if is_dead:
         try:
             conn.close()
         except Exception:
             pass
-        _putconn_discarding(pool, conn)
-        return
-    try:
-        if getattr(conn, "closed", 1) == 0:
-            # Never return a connection mid-transaction. IDLE == 0 means no
-            # transaction is open, which is the only safe state to reuse.
-            if _in_transaction(conn):
-                try:
-                    conn.rollback()
-                except Exception:
-                    # Rollback failed → the connection is no longer trustworthy.
-                    _putconn_discarding(pool, conn)
-                    return
-            pool.putconn(conn)
-            return
-    except Exception:
-        pass
-    # Connection is dead — drop just this one so the rest of the pool survives.
-    _putconn_discarding(pool, conn)
 
 
 def _in_transaction(conn: Any) -> bool:
-    """True when ``conn`` is inside an open transaction.
-
-    Uses the DBAPI transaction status so this works with psycopg2 (0 = IDLE)
-    and degrades safely for any other driver, including the fakes used in
-    tests. An unknown status is treated as "not in a transaction" so this can
-    never be the thing that breaks an otherwise healthy request.
-    """
+    """True when ``conn`` is inside an open transaction."""
     try:
         status_fn = getattr(conn, "get_transaction_status", None)
         if status_fn is None:
@@ -294,21 +336,7 @@ def _in_transaction(conn: Any) -> bool:
 
 
 def _next_suffixed_id(cursor: Any, table: str, prefix: str) -> str:
-    """Propose the next ``<prefix><n>`` primary key for ``table``.
-
-    PENTEST/RELIABILITY FIX — mirrors ``local_demo_db._next_suffixed_id``. The
-    original code read MAX(id) and then INSERTed that id as a second statement.
-    Nothing serialised the gap, so two concurrent writers derived the SAME id and
-    the loser's INSERT died on the primary key. The callers catch and log, so the
-    app looked healthy while the row was silently gone.
-
-    For ``notifications`` that meant a real, paid order never reached the admin's
-    "confirm this order" queue and was therefore never approved. MAX (rather than
-    COUNT) only protects against DELETED rows, never against concurrency.
-
-    This only PROPOSES an id; the caller must INSERT it through
-    :func:`_insert_with_suffixed_id`, which retries on the real UNIQUE violation.
-    """
+    """Propose the next ``<prefix><n>`` primary key for ``table``."""
     cursor.execute(
         f"SELECT COALESCE(MAX(CAST(SUBSTRING(id FROM {len(prefix) + 1}) AS INTEGER)), 0) + 1 AS next FROM {table}"
     )
@@ -323,22 +351,12 @@ def _insert_with_suffixed_id(
     params_for,
     attempts: int = 25,
 ) -> str:
-    """INSERT a row with a generated id, retrying on a primary-key collision.
-
-    The candidate id and the INSERT are attempted together, so a collision costs
-    one extra MAX read instead of losing the write. After a UNIQUE violation the
-    transaction is rolled back to a clean state (``ROLLBACK TO SAVEPOINT``) before
-    retrying, since Postgres aborts the whole transaction on a constraint error.
-
-    ``params_for(row_id)`` builds the parameter tuple for ``insert_sql``.
-    """
+    """INSERT a row with a generated id, retrying on a primary-key collision."""
     last_error: Exception | None = None
     for attempt in range(attempts):
         row_id = _next_suffixed_id(cursor, table, prefix)
         try:
             if attempt:
-                # A constraint violation poisoned the transaction; unwind just our
-                # own work so the retry starts clean.
                 cursor.execute("ROLLBACK TO SAVEPOINT suffixed_id_insert")
             cursor.execute("SAVEPOINT suffixed_id_insert")
             cursor.execute(insert_sql, params_for(row_id))
@@ -356,12 +374,7 @@ def _insert_with_suffixed_id(
 
 
 def _putconn_discarding(pool: Any, conn: Any) -> None:
-    """Hand a dead connection back so the pool forgets its slot.
-
-    ``putconn(close=True)`` is the pool's own supported way to do this. If the
-    pool itself has since been swapped out from under us, fall back to dropping
-    the reference so nothing leaks.
-    """
+    """Hand a dead connection back so the pool forgets its slot."""
     try:
         pool.putconn(conn, close=True)
     except Exception:
@@ -372,11 +385,10 @@ def _putconn_discarding(pool: Any, conn: Any) -> None:
 
 
 def _rebuild_pool() -> None:
-    """Close and drop the current pool (if any). New connections
-    will be created lazily by the next ``_get_pool()`` call."""
+    """Close and drop the current pool (if any)."""
     global _pool
     old_pool = _pool
-    _pool = None  # clear first so concurrent callers build a fresh pool
+    _pool = None
     try:
         if old_pool is not None:
             old_pool.closeall()
@@ -385,57 +397,56 @@ def _rebuild_pool() -> None:
 
 
 class _DBContext:
-    """Context manager: commits on success, rolls back on error, returns the
-    connection to the pool on exit.
+    """Context manager: commits on success, rolls back on error, returns connection to pool."""
 
-    BUG FIX (connection leak). The success path used to be::
-
-        self._connection.commit()
-        _release(self._connection)
-
-    so a ``commit()`` that raised skipped ``_release`` entirely and the pooled
-    connection was never handed back. Nothing would ever free it: the pool slot
-    stayed checked out for the life of the process, so every such failure
-    permanently shrank capacity by one. A burst that tripped it a few times
-    drained the pool and every later request — including unrelated, read-only
-    ones — failed with "connection pool exhausted", which surfaced as the
-    checkout page's "Could not load the live prices" and as every portal
-    feeling slow.
-
-    The release is now in a ``finally``, so the connection is returned on every
-    path: commit succeeded, commit raised, or the body raised. A connection that
-    cannot be rolled back is still discarded rather than reused.
-    """
-
-    def __init__(self, connection: Any):
+    def __init__(self, connection: Any, readonly: bool = False):
         self._connection = connection
+        self._readonly = readonly
 
     def __enter__(self) -> Any:
+        self._t0 = time.perf_counter()
+        if self._readonly:
+            try:
+                self._connection.autocommit = True
+            except Exception:
+                pass
         return self._connection
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
-        if exc_type is None:
+        dur = (time.perf_counter() - getattr(self, "_t0", time.perf_counter())) * 1000
+        from app.core.timing import record_timing
+        record_timing("db_query", dur)
+        if self._readonly:
             try:
-                self._connection.commit()
+                if getattr(self._connection, "closed", 1) == 0:
+                    self._connection.autocommit = False
             except Exception:
-                # The commit failed, so the connection's state is unknown. Close
-                # it rather than hand it to the next caller. Nothing is left
-                # checked out: _release(..., discard=True) puts the slot back.
                 _release(self._connection, discard=True)
                 return False
             _release(self._connection)
             return False
 
-        # The body raised: undo the partial work, then return the connection.
+        if exc_type is None:
+            try:
+                self._connection.commit()
+            except Exception:
+                _release(self._connection, discard=True)
+                return False
+            _release(self._connection)
+            return False
+
         try:
             self._connection.rollback()
         except Exception:
-            # Rollback failed → the connection itself is broken. Discard it so
-            # the pool rebuilds with healthy connections.
             _release(self._connection, discard=True)
             return False
         _release(self._connection)
         return False
+
+
+def _DBReadContext(connection: Any = None) -> _DBContext:
+    """Read-only context manager: autocommit=True, avoids COMMIT WAN roundtrip."""
+    return _DBContext(connection or _connect(), readonly=True)
 
 
 def _rows_to_dicts(rows: list) -> list[dict[str, Any]]:
@@ -453,14 +464,7 @@ def cursor_row_as_dict(cursor) -> dict[str, Any] | None:
     return cursor_row(cursor)
 
 
-
-
-
 def _shop_is_orderable(shop: dict[str, Any]) -> bool:
-    # The vendor's Start/Stop toggle (present + status) is the single source of
-    # truth for whether a shop accepts orders. opening/closing hours are shown
-    # to students as information only and do NOT block ordering — otherwise a
-    # vendor who presses "Start" outside the default hours would stay closed.
     return (
         shop["approval_status"] == "Approved"
         and bool(shop["present"])
@@ -469,192 +473,12 @@ def _shop_is_orderable(shop: dict[str, Any]) -> bool:
 
 
 # ─── Auto-migrations ─────────────────────────────────────────────────────
-# New columns added to the schema after the database was first created.
-# Re-applied on every startup AND re-applied automatically if a query ever
-# fails with a missing-column error (self-healing) — so the app never breaks
-# on a database that hasn't had the latest schema.sql run against it.
-_MIGRATIONS = [
-    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS owner_user_id text NOT NULL DEFAULT ''",
-    "ALTER TABLE parent_orders ADD COLUMN IF NOT EXISTS owner_user_id text NOT NULL DEFAULT ''",
-    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method text NOT NULL DEFAULT 'UPI'",
-    # Checkout idempotency key. The student portal retries the order POST when
-    # the serverless host is slow to answer, and each retry used to INSERT a
-    # fresh order. Two same-amount UNPAID orders at one shop is precisely the
-    # ambiguity tier-2 bank matching refuses to resolve, so a student who had
-    # already paid could still never get "Place Order" to unlock. Scoped lookups
-    # are by (client_ref, owner_user_id) — never by ref alone, because the value
-    # is client-chosen and guessable.
-    "ALTER TABLE orders ADD COLUMN IF NOT EXISTS client_ref text",
-    "CREATE INDEX IF NOT EXISTS idx_orders_client_ref ON orders (client_ref)",
-    # WhatsApp auto-send: a durable claim stamp.
-    #
-    # The phone bot de-duplicates in MEMORY only, so a message it delivered but
-    # failed to confirm (mark-sent lost to a network blip, or the service simply
-    # restarted) came back on the next poll and the shopkeeper received the same
-    # order over and over. claimed_at lets the SERVER remember that a row has
-    # already been handed to the bot, so it is offered exactly once. A row stuck
-    # in 'Sending' (bot killed mid-send) becomes eligible again after the
-    # staleness window, so nothing is lost — it just can't be re-sent instantly.
-    "ALTER TABLE whatsapp_logs ADD COLUMN IF NOT EXISTS claimed_at timestamptz",
-    "ALTER TABLE shops ADD COLUMN IF NOT EXISTS is_removed boolean NOT NULL DEFAULT false",
-    "ALTER TABLE shops ADD COLUMN IF NOT EXISTS admin_dues_balance integer NOT NULL DEFAULT 0",
-    "ALTER TABLE shops ADD COLUMN IF NOT EXISTS admin_dues_last_paid_at timestamptz",
-    "ALTER TABLE shops ADD COLUMN IF NOT EXISTS upi_enabled boolean NOT NULL DEFAULT true",
-    "ALTER TABLE shops ADD COLUMN IF NOT EXISTS cod_enabled boolean NOT NULL DEFAULT true",
-    # Multi-shop parent payments: payments.order_id still references `orders`
-    # (FK), so a parent order's ONE bill is anchored on its first sub-order id
-    # and the parent id is kept in this column for verification flows.
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS parent_order_id text",
-    # Parent (multi-shop) orders keep their ONE payment proof here (the
-    # `payments` table's order_id FK only accepts `orders` rows).
-    "ALTER TABLE parent_orders ADD COLUMN IF NOT EXISTS utr_number text",
-    "ALTER TABLE parent_orders ADD COLUMN IF NOT EXISTS screenshot_name text",
-    # Older product tables may be missing the pending_price column — without this
-    # the vendor's "Add Product" fails in production (500) while local SQLite
-    # works (local auto-creates the schema on startup).
-    "ALTER TABLE products ADD COLUMN IF NOT EXISTS pending_price integer",
-    # Combo products: ONE price for MANY items (Biryani + Fast Food + drink =
-    # one combo row). is_combo marks it; combo_items stores the item list text.
-    "ALTER TABLE products ADD COLUMN IF NOT EXISTS is_combo boolean NOT NULL DEFAULT false",
-    "ALTER TABLE products ADD COLUMN IF NOT EXISTS combo_items text NOT NULL DEFAULT ''",
-    # Remove the sold column from product_stock — we now track stock by directly
-    # decrementing/incrementing total_stock instead of maintaining a separate sold counter.
-    "ALTER TABLE product_stock DROP COLUMN IF EXISTS sold",
-    "ALTER TABLE products ADD COLUMN IF NOT EXISTS prep_time integer NOT NULL DEFAULT 10",
-    "ALTER TABLE products ADD COLUMN IF NOT EXISTS available boolean NOT NULL DEFAULT true",
-    # Track the ₹10-per-order shares vendors pay to the admin (UPI → recorded as Pending,
-    # admin marks Received once the money lands in their bank account).
-    """
-    CREATE TABLE IF NOT EXISTS share_payments (
-        id text PRIMARY KEY,
-        shop_id text NOT NULL,
-        shop_name text NOT NULL DEFAULT '',
-        amount integer NOT NULL DEFAULT 0,
-        status text NOT NULL DEFAULT 'Pending',
-        created_at timestamptz NOT NULL DEFAULT now(),
-        paid_at timestamptz
-    )
-    """,
-    # Admin approval queue. A notification can carry ONE inline action the admin
-    # can take straight from the bell (today: "confirm" a freshly placed order).
-    #   action       — '' | 'confirm_order'
-    #   action_state — 'none' | 'pending' | 'done' | 'dismissed'
-    # Keeping the action ON the notification (instead of a side table) means the
-    # bell, the Approvals page and the confirm endpoint all read the same row, so
-    # a button can never point at an order that was never queued.
-    "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS action text NOT NULL DEFAULT ''",
-    "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS action_state text NOT NULL DEFAULT 'none'",
-    "CREATE INDEX IF NOT EXISTS idx_notifications_action ON notifications (action, action_state)",
-    # Browser push subscriptions for vendor order notifications.
-    """
-    CREATE TABLE IF NOT EXISTS push_subscriptions (
-        endpoint text PRIMARY KEY,
-        shop_id text NOT NULL,
-        p256dh text NOT NULL,
-        auth text NOT NULL,
-        created_at timestamptz NOT NULL DEFAULT now()
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_push_subscriptions_shop_id ON push_subscriptions (shop_id)",
-    # Forgot-password double OTP verification (mirrors local_demo_db).
-    """
-    CREATE TABLE IF NOT EXISTS password_resets (
-        id bigserial PRIMARY KEY,
-        username text NOT NULL,
-        otp text NOT NULL,
-        step integer NOT NULL DEFAULT 1,
-        expires_at timestamptz NOT NULL,
-        used boolean NOT NULL DEFAULT false,
-        attempts integer NOT NULL DEFAULT 0,
-        created_at timestamptz NOT NULL DEFAULT now()
-    )
-    """,
-    "ALTER TABLE password_resets ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0",
-    "CREATE INDEX IF NOT EXISTS idx_password_resets_username ON password_resets (username, used)",
-    # Site feedback / bug reports — students test the site and contribute
-    # bugs + improvement ideas; admins review them on the Feedback page.
-    """
-    CREATE TABLE IF NOT EXISTS site_feedback (
-        id text PRIMARY KEY,
-        user_id bigint,
-        username text NOT NULL DEFAULT '',
-        name text NOT NULL DEFAULT '',
-        email text NOT NULL DEFAULT '',
-        category text NOT NULL DEFAULT 'Bug',
-        subject text NOT NULL DEFAULT '',
-        message text NOT NULL DEFAULT '',
-        page text NOT NULL DEFAULT '',
-        status text NOT NULL DEFAULT 'Open',
-        -- Where the contribution came from: 'User' = submitted by a real
-        -- student through the portal; 'ATS' = generated by the automated
-        -- test suite. The admin Feedback page filters on this.
-        source text NOT NULL DEFAULT 'User',
-        created_at timestamptz NOT NULL DEFAULT now()
-    )
-    """,
-    "ALTER TABLE site_feedback ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'User'",
-    "CREATE INDEX IF NOT EXISTS idx_site_feedback_status ON site_feedback (status)",
-    "CREATE INDEX IF NOT EXISTS idx_site_feedback_user ON site_feedback (user_id)",
-    "CREATE INDEX IF NOT EXISTS idx_site_feedback_source ON site_feedback (source)",
-    # Every vendor endpoint looks up their shop with LOWER(shopkeeper_email); a
-    # functional index serves that query without a full-table scan.
-    "CREATE INDEX IF NOT EXISTS idx_shops_shopkeeper_email_lower ON shops (LOWER(shopkeeper_email))",
-    "CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders (created_at)",
-    # One account per email — case-insensitive, non-empty only (legacy rows
-    # with a blank email are left alone). The app-level check in register_user
-    # reports the friendly error; this index is the race-safe backstop.
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users (LOWER(email)) WHERE email <> ''",
-    # Shop reviews
-    """
-    CREATE TABLE IF NOT EXISTS reviews (
-        id text PRIMARY KEY,
-        user_id bigint,
-        username text NOT NULL DEFAULT '',
-        student_name text NOT NULL DEFAULT '',
-        shop_id text NOT NULL DEFAULT '',
-        shop_name text NOT NULL DEFAULT '',
-        rating integer NOT NULL DEFAULT 5,
-        comment text NOT NULL DEFAULT '',
-        created_at timestamptz NOT NULL DEFAULT now()
-    )
-    """,
-    "CREATE INDEX IF NOT EXISTS idx_reviews_shop_id ON reviews (shop_id)",
-]
+from app.core.supabase.migrations import _MIGRATIONS, _apply_migrations
 
-
-def _apply_migrations() -> None:
-    """Run the idempotent ALTER TABLE statements (no-op when already applied).
-    Safe to call at any time — startup, or lazily after a missing-column error.
-
-    Each statement runs inside its own SAVEPOINT. Without this, a single
-    failing migration (e.g. a duplicate-key index on legacy data) would abort
-    the whole transaction and Postgres' COMMIT would silently roll back every
-    OTHER migration in the same run — which is how new tables/columns could
-    end up missing even though migrations "ran" with no error."""
-    try:
-        with _DBContext(_connect()) as connection:
-            with connection.cursor() as cursor:
-                for statement in _MIGRATIONS:
-                    cursor.execute("SAVEPOINT migration_step")
-                    try:
-                        cursor.execute(statement)
-                    except Exception as migration_error:
-                        # A failed statement marks the transaction aborted —
-                        # jump back to the savepoint so the remaining
-                        # migrations can still run and be committed.
-                        cursor.execute("ROLLBACK TO SAVEPOINT migration_step")
-                        logger.warning(f"Auto-migration skipped ({statement}): {migration_error}")
-                    else:
-                        cursor.execute("RELEASE SAVEPOINT migration_step")
-    except Exception as e:
-        logger.error(f"Auto-migrations failed: {e}")
 
 
 def init_supabase_db() -> bool:
-    """Verify connectivity and auto-apply any missing columns (idempotent).
-    Returns True when reachable. The full schema lives in backend/supabase/schema.sql,
-    but the small ALTERs below are re-run on every startup so the app never
-    breaks if a new column hasn't been applied to an existing database yet."""
+    """Verify connectivity and auto-apply any missing columns (idempotent)."""
     try:
         with _DBContext(_connect()) as connection:
             with connection.cursor() as cursor:
@@ -669,13 +493,7 @@ def init_supabase_db() -> bool:
 
 
 def ensure_admin_user() -> None:
-    """Seed the super admin as a real DB user (role='admin') so the admin
-    portal login AND forgot-password flow work end-to-end. The DB email is a
-    unique placeholder because DEFAULT_SUPER_ADMIN_EMAIL is often already
-    claimed by a shopkeeper/student account (one email = one account) — the
-    reset OTP is delivered to DEFAULT_SUPER_ADMIN_EMAIL instead (see
-    users.py)._send_reset_otp). Idempotent: an existing account is left
-    untouched so a password reset or role change is never overwritten on boot."""
+    """Seed the super admin as a real DB user (role='admin')."""
     email = (settings.DEFAULT_SUPER_ADMIN_EMAIL or "").strip()
     password = settings.DEFAULT_SUPER_ADMIN_PASSWORD or ""
     if not email or not password:
@@ -699,3120 +517,10 @@ def ensure_admin_user() -> None:
         logger.warning(f"ensure_admin_user: could not create admin ({conflict}) — {username} may be in use")
 
 
-# ─── Users ───
-
-
-def register_user(
-    username: str,
-    password_hash: str,
-    name: str,
-    role: str,
-    email: str = "",
-    phone: str = "",
-) -> tuple[dict[str, Any] | None, str | None]:
-    """Register a new user. Returns ``(user, None)`` on success, or
-    ``(None, 'username')`` / ``(None, 'email')`` when that field is already
-    taken. Email uniqueness is case-insensitive and applies across ALL roles —
-    one email can only ever own one account (mirrored by the
-    ``idx_users_email_unique`` partial index, which is the race-safe backstop)."""
-    normalized_email = (email or "").strip()
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT id FROM users WHERE username = %s", (username.lower(),))
-            if cursor.fetchone():
-                return None, "username"
-
-            if normalized_email:
-                cursor.execute(
-                    "SELECT id FROM users WHERE LOWER(email) = %s AND email <> ''",
-                    (normalized_email.lower(),),
-                )
-                if cursor.fetchone():
-                    return None, "email"
-
-            try:
-                cursor.execute(
-                    """
-                    INSERT INTO users (username, password_hash, name, email, phone, role)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    RETURNING id, username, name, email, phone, role, created_at
-                    """,
-                    (username.lower(), password_hash, name, normalized_email, phone, role),
-                )
-            except psycopg2.errors.UniqueViolation:
-                # Race backstop: another request inserted the same email/username
-                # between our checks and the insert — the unique index guarantees
-                # consistency. Re-check to report the RIGHT conflict.
-                # NOTE: the failed INSERT aborted the whole transaction, so
-                # roll back before running the re-check SELECT (Postgres would
-                # otherwise raise InFailedSqlTransaction).
-                connection.rollback()
-                if normalized_email:
-                    cursor.execute(
-                        "SELECT id FROM users WHERE LOWER(email) = %s AND email <> ''",
-                        (normalized_email.lower(),),
-                    )
-                    if cursor.fetchone():
-                        return None, "email"
-                return None, "username"
-            row = cursor.fetchone()
-            return (dict(row) if row else None), None
-
-
-def get_user_by_username(username: str) -> dict[str, Any] | None:
-    """Get full user record (including password_hash) by username."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM users WHERE username = %s", (username.lower(),))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-def get_user_by_id(user_id: int) -> dict[str, Any] | None:
-    """Get user by id (without password_hash)."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT id, username, name, email, phone, role, created_at FROM users WHERE id = %s",
-                (user_id,),
-            )
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-def save_session(email: str, name: str, role: str) -> dict[str, Any]:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT id FROM sessions WHERE email = %s AND role = %s ORDER BY id DESC LIMIT 1",
-                (email, role),
-            )
-            existing = cursor.fetchone()
-            if existing:
-                cursor.execute(
-                    "UPDATE sessions SET name = %s, created_at = now() WHERE id = %s RETURNING id, email, name, role, created_at",
-                    (name, existing["id"]),
-                )
-                row = cursor.fetchone()
-                return dict(row)
-            cursor.execute(
-                "INSERT INTO sessions (email, name, role) VALUES (%s, %s, %s) RETURNING id, email, name, role, created_at",
-                (email, name, role),
-            )
-            row = cursor.fetchone()
-            return dict(row)
-
-
-# ─── Shops ───
-
-
-def list_shops(public_only: bool = False) -> list[dict[str, Any]]:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM shops ORDER BY rating DESC")
-            shops = _rows_to_dicts(cursor.fetchall())
-        if public_only:
-            # Students see every APPROVED shop (open or closed) so they can browse
-            # menus and see opening hours. Ordering is still blocked server-side
-            # for shops that are closed / not accepting orders.
-            return [shop for shop in shops if shop["approval_status"] == "Approved"]
-        return shops
-
-
-def get_shop(shop_id: str) -> dict[str, Any] | None:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM shops WHERE id = %s", (shop_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-def get_shop_by_phone(phone: str) -> dict[str, Any] | None:
-    """Find a shop by its phone number (the bank-linked number whose SMS the
-    agent forwards). Matches on digits only so '+919876543210' == '9876543210'."""
-    import re as _re
-    digits = _re.sub(r'\D', '', phone or '')
-    if not digits:
-        return None
-    if len(digits) == 10:
-        digits = '91' + digits
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM shops WHERE approval_status = 'Approved'")
-            for row in cursor.fetchall():
-                shop = dict(row)
-                shop_digits = _re.sub(r'\D', '', shop.get('phone') or '')
-                if len(shop_digits) == 10:
-                    shop_digits = '91' + shop_digits
-                if shop_digits == digits:
-                    return shop
-    return None
-
-
-def get_shop_by_shopkeeper_email(email: str) -> dict[str, Any] | None:
-    """Get a vendor's shop by shopkeeper email (used by every vendor endpoint —
-    avoids scanning the whole shops table on each request)."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM shops WHERE LOWER(shopkeeper_email) = %s ORDER BY created_at LIMIT 1",
-                (email.lower(),),
-            )
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-def create_shop(values: dict[str, Any]) -> dict[str, Any]:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) + 1 AS next FROM shops")
-            next_id = cursor.fetchone()["next"]
-            shop_id = f"s{next_id}"
-            cursor.execute(
-                """
-                INSERT INTO shops (
-                    id, name, category, description, rating, opening_time,
-                    closing_time, present, status, approval_status, shopkeeper_email,
-                    shopkeeper_name, phone, upi_id, orders_today, revenue_today, current_token,
-                    upi_enabled, cod_enabled, whatsapp_number
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    shop_id,
-                    values["name"],
-                    values["category"],
-                    values.get("description", ""),
-                    0,
-                    values.get("opening_time", "09:00 AM"),
-                    values.get("closing_time", "09:00 PM"),
-                    False,
-                    "Closed",
-                    "Pending Approval",
-                    values.get("shopkeeper_email", ""),
-                    values["shopkeeper_name"],
-                    values["phone"],
-                    values.get("upi_id", ""),
-                    0,
-                    0,
-                    18,
-                    values.get("upi_enabled", True),
-                    values.get("cod_enabled", True),
-                    values.get("whatsapp_number", ""),
-                ),
-            )
-            cursor.execute("SELECT * FROM shops WHERE id = %s", (shop_id,))
-            row = cursor.fetchone()
-            return dict(row)
-
-
-def update_shop(shop_id: str, values: dict[str, Any]) -> dict[str, Any] | None:
-    """Update a shop. Self-healing: if a newer column (e.g. ``is_removed`` or
-    ``admin_dues_balance``) is missing from the database, it is added
-    automatically and the update is retried once."""
-    try:
-        return _update_shop_impl(shop_id, values)
-    except psycopg2.errors.UndefinedColumn:
-        logger.warning("Missing column in shops table — applying auto-migrations and retrying")
-        _apply_migrations()
-        return _update_shop_impl(shop_id, values)
-
-
-def _update_shop_impl(shop_id: str, values: dict[str, Any]) -> dict[str, Any] | None:
-    allowed_fields = {
-        "name",
-        "category",
-        "description",
-        "opening_time",
-        "closing_time",
-        "present",
-        "status",
-        "approval_status",
-        "shopkeeper_email",
-        "shopkeeper_name",
-        "phone",
-        "upi_id",
-        "upi_enabled",
-        "cod_enabled",
-        "is_removed",
-        "admin_dues_balance",
-        "admin_dues_last_paid_at",
-        "whatsapp_number",
-        "ordering_position",
-        "is_featured",
-        "shop_image",
-    }
-    updates = {key: value for key, value in values.items() if key in allowed_fields and value is not None}
-    if not updates:
-        return get_shop(shop_id)
-
-    if "present" in updates:
-        updates["present"] = bool(updates["present"])
-        # Keep the separate ``status`` field in sync (vendor UI has a single
-        # Start/Stop toggle, but orderability requires status == 'Open').
-        if "status" not in updates:
-            updates["status"] = "Open" if updates["present"] else "Closed"
-
-    if "approval_status" in updates and updates["approval_status"] in {"Suspended", "Removed"}:
-        updates["present"] = False
-        updates["status"] = "Closed"
-
-    assignments = ", ".join(f"{field} = %s" for field in updates)
-    params = [*updates.values(), shop_id]
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(f"UPDATE shops SET {assignments} WHERE id = %s", params)
-            cursor.execute("SELECT * FROM shops WHERE id = %s", (shop_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-# ─── Products ───
-
-
-def list_products(shop_id: str | None = None) -> list[dict[str, Any]]:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            if shop_id:
-                cursor.execute(
-                    "SELECT * FROM products WHERE shop_id = %s ORDER BY category, name",
-                    (shop_id,),
-                )
-            else:
-                cursor.execute("SELECT * FROM products ORDER BY category, name")
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def create_product(values: dict[str, Any]) -> dict[str, Any]:
-    """Create a product. Self-healing: if the database is missing a newer
-    column (e.g. ``pending_price``), the migration is applied automatically
-    and the insert is retried once — so vendors never hit a generic failure
-    on an out-of-date Supabase schema."""
-    try:
-        return _create_product_impl(values)
-    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
-        logger.warning("Missing table/column in products — applying auto-migrations and retrying")
-        _apply_migrations()
-        return _create_product_impl(values)
-
-
-def _create_product_impl(values: dict[str, Any]) -> dict[str, Any]:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            _product_sql = """
-                INSERT INTO products (
-                    id, shop_id, name, description, price, pending_price,
-                    category, inventory, prep_time, available, is_combo, combo_items
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """
-
-            def _product_params(rid):
-                return (
-                    rid,
-                    values["shop_id"],
-                    values["name"],
-                    values.get("description", ""),
-                    values["price"],
-                    values.get("pending_price"),
-                    "Combo" if values.get("is_combo") else values["category"],
-                    values.get("inventory", 0),
-                    values.get("prep_time", 10),
-                    bool(values.get("available", True)),
-                    bool(values.get("is_combo", False)),
-                    str(values.get("combo_items", "") or ""),
-                )
-
-            product_id = values.get("id")
-            if product_id:
-                # Caller-supplied id: honour it verbatim (imports / fixtures).
-                cursor.execute(_product_sql, _product_params(product_id))
-            else:
-                # MAX (not COUNT) so deletes can never reuse an id, AND a retry on
-                # a concurrent collision (see _insert_with_suffixed_id).
-                product_id = _insert_with_suffixed_id(
-                    cursor, "products", "p", _product_sql, _product_params,
-                )
-            cursor.execute("SELECT * FROM products WHERE id = %s", (product_id,))
-            row = cursor.fetchone()
-            return dict(row)
-
-
-def update_product(product_id: str, values: dict[str, Any]) -> dict[str, Any] | None:
-    allowed_fields = {
-        "name",
-        "description",
-        "price",
-        "pending_price",
-        "category",
-        "inventory",
-        "prep_time",
-        "available",
-        "is_combo",
-        "combo_items",
-    }
-    updates = {key: value for key, value in values.items() if key in allowed_fields and (value is not None or key == "pending_price")}
-    if not updates:
-        return get_product(product_id)
-
-    if "available" in updates:
-        updates["available"] = bool(updates["available"])
-    if "is_combo" in updates:
-        updates["is_combo"] = bool(updates["is_combo"])
-        if updates["is_combo"] and "category" not in updates:
-            updates["category"] = "Combo"
-
-    assignments = ", ".join(f"{field} = %s" for field in updates)
-    params = [*updates.values(), product_id]
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(f"UPDATE products SET {assignments} WHERE id = %s", params)
-            cursor.execute("SELECT * FROM products WHERE id = %s", (product_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-def get_product(product_id: str) -> dict[str, Any] | None:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM products WHERE id = %s", (product_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-def delete_product(product_id: str) -> bool:
-    """Permanently remove a product row. Returns True when a row was deleted."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM products WHERE id = %s", (product_id,))
-            return cursor.rowcount > 0
-
-
-def suspend_shop(shop_id: str) -> dict[str, Any] | None:
-    return update_shop(shop_id, {"approval_status": "Suspended", "present": False, "status": "Closed"})
-
-
-def remove_shop(shop_id: str) -> dict[str, Any] | None:
-    return update_shop(shop_id, {"approval_status": "Removed", "present": False, "status": "Closed", "is_removed": True})
-
-
-def pay_admin_dues(shop_id: str, amount: int | None = None) -> dict[str, Any] | None:
-    """Mark part or all of the shop's admin dues as paid."""
-    shop = get_shop(shop_id)
-    if not shop:
-        return None
-    current_balance = int(shop.get("admin_dues_balance", 0) or 0)
-    pay_amount = amount if amount is not None else current_balance
-    new_balance = max(0, current_balance - pay_amount)
-    return update_shop(
-        shop_id,
-        {
-            "admin_dues_balance": new_balance,
-            "admin_dues_last_paid_at": datetime.now().isoformat(),
-        },
-    )
-
-
-# ─── Admin share payments (₹10 per order → admin) ───
-
-
-def record_share_payment(shop_id: str, amount: int) -> dict[str, Any] | None:
-    """Record a vendor's share payment to the admin.
-
-    When the vendor taps Pay, the UPI app opens to the admin's UPI ID. We log a
-    Pending record here; the admin marks it Received once the money actually
-    lands in their bank account. Returns an existing pending payment for today
-    if one already exists (so tapping Pay twice doesn't double-log)."""
-    try:
-        return _record_share_payment_impl(shop_id, amount)
-    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
-        logger.warning("Missing share_payments table/columns — applying auto-migrations and retrying")
-        _apply_migrations()
-        return _record_share_payment_impl(shop_id, amount)
-
-
-def _record_share_payment_impl(shop_id: str, amount: int) -> dict[str, Any] | None:
-    shop = get_shop(shop_id)
-    if not shop:
-        return None
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT * FROM share_payments
-                WHERE shop_id = %s AND status = 'Pending'
-                  AND (created_at AT TIME ZONE 'Asia/Kolkata')::date = CURRENT_DATE
-                ORDER BY created_at DESC LIMIT 1
-                """,
-                (shop_id,),
-            )
-            existing = cursor.fetchone()
-            if existing:
-                return dict(existing)
-            cursor.execute("SELECT COUNT(*) + 1 AS next FROM share_payments")
-            payment_id = f"sp{cursor.fetchone()['next']}"
-            cursor.execute(
-                """
-                INSERT INTO share_payments (id, shop_id, shop_name, amount, status)
-                VALUES (%s, %s, %s, %s, 'Pending')
-                """,
-                (payment_id, shop_id, shop.get("name", ""), int(amount)),
-            )
-            cursor.execute(
-                "UPDATE shops SET admin_dues_last_paid_at = now() WHERE id = %s",
-                (shop_id,),
-            )
-            cursor.execute("SELECT * FROM share_payments WHERE id = %s", (payment_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-def list_share_payments() -> list[dict[str, Any]]:
-    """All vendor→admin share payments, newest first."""
-    try:
-        return _list_share_payments_impl()
-    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
-        _apply_migrations()
-        return _list_share_payments_impl()
-
-
-def list_share_payments_by_shop(shop_id: str) -> list[dict[str, Any]]:
-    """Share payments for one shop only (vendor dashboard hot path)."""
-    try:
-        with _DBContext(_connect()) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT * FROM share_payments WHERE shop_id = %s ORDER BY created_at DESC",
-                    (shop_id,),
-                )
-                return _rows_to_dicts(cursor.fetchall())
-    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
-        _apply_migrations()
-        with _DBContext(_connect()) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT * FROM share_payments WHERE shop_id = %s ORDER BY created_at DESC",
-                    (shop_id,),
-                )
-                return _rows_to_dicts(cursor.fetchall())
-
-
-def _list_share_payments_impl() -> list[dict[str, Any]]:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM share_payments ORDER BY created_at DESC")
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def update_share_payment_status(payment_id: str, status: str) -> dict[str, Any] | None:
-    """Mark a share payment Received (Completed) or Rejected. Sets paid_at on completion."""
-    try:
-        return _update_share_payment_status_impl(payment_id, status)
-    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
-        _apply_migrations()
-        return _update_share_payment_status_impl(payment_id, status)
-
-
-def _update_share_payment_status_impl(payment_id: str, status: str) -> dict[str, Any] | None:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            if status == "Completed":
-                cursor.execute(
-                    "UPDATE share_payments SET status = %s, paid_at = now() WHERE id = %s",
-                    (status, payment_id),
-                )
-            else:
-                cursor.execute(
-                    "UPDATE share_payments SET status = %s WHERE id = %s",
-                    (status, payment_id),
-                )
-            cursor.execute("SELECT * FROM share_payments WHERE id = %s", (payment_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-# ─── Orders ───
-
-
-def list_orders(limit: int | None = None) -> list[dict[str, Any]]:
-    """All orders, newest first. ``limit`` bounds the payload — callers that
-    only need the latest rows (admin dashboard, orders page) pass it so the
-    response never ships the shop's entire history on every poll."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            # Newest first — created_at desc puts today's orders on top even
-            # though tokens restart every day (tokens alone mix days together).
-            sql = "SELECT * FROM orders ORDER BY created_at DESC, token DESC"
-            params: tuple = ()
-            if limit:
-                sql += " LIMIT %s"
-                params = (limit,)
-            cursor.execute(sql, params)
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def list_orders_by_shop(shop_id: str) -> list[dict[str, Any]]:
-    """Orders for one shop only — the vendor dashboard/history hot path. Uses
-    the ``idx_orders_shop_id`` index instead of shipping every order to Python."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM orders WHERE shop_id = %s ORDER BY token DESC",
-                (shop_id,),
-            )
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def find_order_by_client_ref(client_ref: str, owner_user_id: str = "") -> dict[str, Any] | None:
-    """Find a student's own order by the checkout idempotency key.
-
-    ALWAYS scoped to the owning account when one is supplied: the ref is chosen
-    by the client, so student B could otherwise send student A's ref and receive
-    A's order (and its id) back from their own checkout.
-    """
-    ref = (client_ref or "").strip()
-    if not ref:
-        return None
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            if owner_user_id:
-                cursor.execute(
-                    "SELECT * FROM orders WHERE client_ref = %s AND owner_user_id = %s"
-                    " ORDER BY created_at DESC LIMIT 1",
-                    (ref, str(owner_user_id)),
-                )
-            else:
-                cursor.execute(
-                    "SELECT * FROM orders WHERE client_ref = %s"
-                    " ORDER BY created_at DESC LIMIT 1",
-                    (ref,),
-                )
-                return cursor_row(cursor)
-            return cursor_row(cursor)
-
-
-def list_recent_orders_by_shop(shop_id: str, limit: int = 250) -> list[dict[str, Any]]:
-    """Latest orders for one shop (newest first) — the live feed shown in the
-    vendor app. Bounded so the 30s auto-refresh never ships the shop's entire
-    order history (that payload grew with every order and made the vendor app
-    feel slow). Stats are still computed from the full list via
-    ``list_orders_by_shop``."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM orders WHERE shop_id = %s ORDER BY created_at DESC LIMIT %s",
-                (shop_id, limit),
-            )
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def get_order(order_id: str) -> dict[str, Any] | None:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-def update_order_status(order_id: str, status: str) -> dict[str, Any] | None:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("UPDATE orders SET status = %s WHERE id = %s", (status, order_id))
-            cursor.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
-            row = cursor.fetchone()
-            if row:
-                status_messages = {
-                    "Accepted": "The shop accepted your order.",
-                    "Confirmed": "Your order has been confirmed.",
-                    "Preparing": "Your food is being prepared.",
-                    "Ready": "Your order is ready.",
-                    "Completed": "Order completed successfully.",
-                    "Cancelled": "Order cancelled.",
-                    "Failed": "Payment failed.",
-                    "Refunded": "Order refunded.",
-                }
-                create_notification(
-                    title="Order completed" if status == "Completed" else "Order status updated",
-                    message=f"Token {row['token']}: {status_messages.get(status, f'Order is now {status}.')}",
-                    order_id=order_id,
-                    status=status,
-                    target_role="student",
-                )
-            return dict(row) if row else None
-
-
-def create_order(values: dict[str, Any]) -> dict[str, Any] | None:
-    """Create an order. Self-healing: if the database is missing a newer
-    column (e.g. ``payment_method``), the migration is applied automatically
-    and the insert is retried once — so COD/UPI orders never fail on an
-    out-of-date Supabase schema."""
-    try:
-        return _create_order_impl(values)
-    except psycopg2.errors.UndefinedColumn:
-        logger.warning("Missing column in orders table — applying auto-migrations and retrying")
-        _apply_migrations()
-        return _create_order_impl(values)
-
-
-def _create_order_impl(values: dict[str, Any]) -> dict[str, Any] | None:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM shops WHERE id = %s", (values["shop_id"],))
-            shop = cursor.fetchone()
-            if not shop:
-                return None
-            if not _shop_is_orderable(dict(shop)):
-                return None
-
-            product_ids = [item["product_id"] for item in values["items"]]
-            products_by_id = {}
-            for product_id in product_ids:
-                # PENTEST FIX: scope to this shop and require the item to still be
-                # orderable. Looking up by id alone let a student post shop A with
-                # shop B's product_id (bill, kitchen and per-shop payment scoping
-                # then disagreed), and let sold-out items be ordered at all.
-                cursor.execute(
-                    "SELECT * FROM products WHERE id = %s AND shop_id = %s",
-                    (product_id, values["shop_id"]),
-                )
-                row = cursor.fetchone()
-                if row and dict(row).get("available", 1):
-                    products_by_id[product_id] = dict(row)
-
-            subtotal = 0
-            item_labels = []
-            for item in values["items"]:
-                product = products_by_id.get(item["product_id"])
-                if not product:
-                    continue
-                # Quantity system removed — each cart line is one unit, so older
-                # callers that send only {"product_id"} still work (default 1).
-                quantity = int(item.get("quantity", 1) or 1)
-                subtotal += int(product["price"]) * quantity
-                # Quantity system removed — a single item reads "Masala Dosa",
-                # not "1x Masala Dosa". Multi-quantity callers keep the prefix.
-                item_labels.append(product["name"] if quantity <= 1 else f"{quantity}x {product['name']}")
-
-            if not item_labels:
-                return None
-
-            # ─── Fees: the customer pays only the subtotal. The admin's ₹10 per order is
-            # taken from the vendor's single-day earnings, never added to the
-            # student's bill. ───
-            service_fee = 0
-            tax = 0
-            delivery_fee = 0
-            total = subtotal
-
-            # Payment method drives the initial order status:
-            #   COD     → awaiting shop acceptance
-            #   UPI     → awaiting the customer's UPI payment (vendor confirms)
-            #   Razorpay → paid instantly, awaiting acceptance
-            payment_method = str(values.get("payment_method", "") or "").strip().upper()
-            if payment_method == "COD":
-                initial_status = "Pending Acceptance"
-            elif payment_method == "UPI":
-                initial_status = "Pending Payment"
-            elif payment_method == "RAZORPAY":
-                # SECURITY: a Razorpay order is only PAID once
-                # ``/payments/verify-razorpay`` has verified the gateway
-                # signature AND the captured amount. Starting it at
-                # "Pending Acceptance" let any authenticated student POST
-                # payment_method="Razorpay" and receive a fulfilled order they
-                # never paid for (the vendor is SMSed the moment the order is
-                # created). It must start unpaid — verification promotes it.
-                initial_status = "Pending Payment"
-            else:
-                # Legacy callers without a payment method keep old behavior
-                initial_status = "Pending Payment" if values.get("pending_payment") else "Pending Acceptance"
-                payment_method = "UPI" if initial_status == "Pending Payment" else "COD"
-
-            # ─── Order IDs: o<IST date>-<daily token> ───
-            # The token restarts daily in India time (Asia/Kolkata), so the
-            # "today" boundary must be IST too — using the server's CURRENT_DATE
-            # (usually UTC) lets orders placed between 12:00–5:30 AM IST share a
-            # token bucket with the previous day and collide on the same ID.
-            today_key = _now_kolkata().strftime("%Y%m%d")
-            ist_day_start = _now_kolkata().replace(hour=0, minute=0, second=0, microsecond=0)
-            ist_day_end = ist_day_start + timedelta(days=1)
-
-            # MAX(token)+1 read-then-insert is NOT atomic — two students placing
-            # orders in the same instant can both read the same MAX and build
-            # the same order id, so the second INSERT fails with the
-            # "orders_pkey" unique violation. Recompute the token and retry on
-            # a collision (the failed INSERT aborts the transaction, so roll
-            # back before re-reading).
-            row = None
-            for _attempt in range(5):
-                cursor.execute(
-                    "SELECT COALESCE(MAX(token), 17) + 1 AS next FROM orders WHERE created_at >= %s AND created_at < %s",
-                    (ist_day_start.astimezone(timezone.utc), ist_day_end.astimezone(timezone.utc)),
-                )
-                next_token = cursor.fetchone()["next"]
-                order_id = f"o{today_key}-{next_token}"
-                try:
-                    cursor.execute(
-                        """
-                        INSERT INTO orders (
-                            id, token, owner_user_id, student_name, student_phone, shop_id, shop_name,
-                            items, subtotal, service_fee, tax, delivery_fee, total,
-                            delivery_location, delivery_slot, status, payment_method, client_ref,
-                            created_at
-                        )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
-                        """,
-                        (
-                            order_id,
-                            next_token,
-                            values.get("owner_user_id", ""),
-                            values.get("student_name", "Student"),
-                            values.get("student_phone", ""),
-                            values["shop_id"],
-                            shop["name"],
-                            ", ".join(item_labels),
-                            subtotal,
-                            service_fee,
-                            tax,
-                            delivery_fee,
-                            total,
-                            values["delivery_location"],
-                            values["delivery_slot"],
-                            initial_status,
-                            payment_method,
-                            values.get("client_ref") or None,
-                        ),
-                    )
-                except psycopg2.errors.UniqueViolation:
-                    # Another order claimed this token/id a moment ago — roll
-                    # back the aborted transaction and try the next token.
-                    connection.rollback()
-                    if _attempt == 4:
-                        raise
-                    continue
-                cursor.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
-                row = cursor.fetchone()
-                break
-            if row:
-                cursor.execute(
-                    """
-                    UPDATE shops
-                    SET orders_today = orders_today + 1,
-                        revenue_today = revenue_today + %s,
-                        current_token = %s
-                    WHERE id = %s
-                    """,
-                    (total, next_token, values["shop_id"]),
-                )
-                create_notification(
-                    title="Order placed",
-                    message=f"Token {row['token']} is pending shop acceptance.",
-                    order_id=order_id,
-                    status=row["status"],
-                    target_role="student",
-                    connection=connection,
-                )
-                cursor.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
-                row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-# ─── Payments ───
-
-
-def create_payment(
-    order_id: str,
-    amount: int,
-    method: str,
-    utr_number: str | None = None,
-    screenshot_name: str | None = None,
-    allow_unknown_order: bool = False,
-) -> dict[str, Any] | None:
-    """Record a payment. ``order_id`` is normally a row in ``orders`` — multi-
-    shop parents are recorded via ``record_parent_payment`` instead (the
-    ``payments.order_id`` FK only accepts ``orders`` rows, so parent orders can
-    never live here)."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            if not allow_unknown_order:
-                cursor.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
-                if not cursor.fetchone():
-                    return None
-            # COUNT(*)+1 read-then-insert is not atomic under concurrency — if
-            # another payment claimed the same id a moment ago, retry with a
-            # freshly computed one instead of failing with a duplicate key.
-            status = "Pending" if method in ("Manual UTR", "UPI") else "Success"
-            row = None
-            for _attempt in range(5):
-                cursor.execute("SELECT COUNT(*) + 1 AS next FROM payments")
-                payment_id = f"pay{cursor.fetchone()['next']}"
-                try:
-                    cursor.execute(
-                        """
-                        INSERT INTO payments (id, order_id, amount, method, status, utr_number, screenshot_name)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        (payment_id, order_id, amount, method, status, utr_number, screenshot_name),
-                    )
-                except psycopg2.errors.UniqueViolation:
-                    connection.rollback()
-                    if _attempt == 4:
-                        raise
-                    continue
-                cursor.execute("SELECT * FROM payments WHERE id = %s", (payment_id,))
-                row = cursor.fetchone()
-                break
-            return dict(row) if row else None
-
-
-def list_payments() -> list[dict[str, Any]]:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM payments ORDER BY created_at DESC")
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def get_payment_by_id(payment_id: str) -> dict[str, Any] | None:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM payments WHERE id = %s", (payment_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-# ─── Parent (multi-shop) payments ────────────────────────────────────
-# A multi-shop parent pays ONE bill as a group. The ``payments`` table's
-# ``order_id`` FK only accepts ``orders`` rows (sub-order ids belong to
-# ``shop_sub_orders``), so parent payments live directly on the
-# ``parent_orders`` row — these helpers read/write them there.
-
-
-def _parent_payment_shape(row: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": row["id"],
-        "order_id": row["id"],
-        "amount": row["total"],
-        "method": row["payment_method"],
-        "status": "Success" if str(row.get("payment_status") or "").upper() == "PAID" else row.get("payment_status", "Pending"),
-        "utr_number": row.get("utr_number"),
-        "screenshot_name": row.get("screenshot_name"),
-        "created_at": str(row.get("created_at") or ""),
-        "is_parent": True,
-    }
-
-
-def record_parent_payment(
-    parent_order_id: str,
-    amount: int,
-    method: str,
-    utr_number: str | None = None,
-    screenshot_name: str | None = None,
-) -> dict[str, Any] | None:
-    """Create/refresh the payment proof (UTR + screenshot) for a parent order."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM parent_orders WHERE id = %s", (parent_order_id,))
-            parent = cursor_row(cursor)
-            if not parent:
-                return None
-            cursor.execute(
-                """UPDATE parent_orders
-                   SET payment_method = COALESCE(%s, payment_method),
-                       utr_number = COALESCE(%s, utr_number),
-                       screenshot_name = COALESCE(%s, screenshot_name)
-                   WHERE id = %s""",
-                (method, utr_number, screenshot_name, parent_order_id),
-            )
-            cursor.execute("SELECT * FROM parent_orders WHERE id = %s", (parent_order_id,))
-            parent = cursor_row(cursor)
-            return _parent_payment_shape(parent) if parent else None
-
-
-def get_parent_payment(parent_order_id: str) -> dict[str, Any] | None:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM parent_orders WHERE id = %s", (parent_order_id,))
-            row = cursor_row(cursor)
-            return _parent_payment_shape(row) if row else None
-
-
-def list_parent_payments() -> list[dict[str, Any]]:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM parent_orders ORDER BY created_at DESC")
-            return [_parent_payment_shape(dict(r)) for r in cursor.fetchall()]
-
-
-def verify_parent_payment(parent_order_id: str, status: str) -> dict[str, Any] | None:
-    """Verify/reject a parent group's UPI/UTR proof. On success the whole group
-    moves to Pending Acceptance and every pending sub-order is Accepted."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            if str(status).lower() in ("success", "verified", "received"):
-                cursor.execute("SELECT token, status FROM parent_orders WHERE id = %s", (parent_order_id,))
-                prow = cursor_row(cursor)
-                if not prow:
-                    return None
-                cursor.execute("UPDATE parent_orders SET payment_status = 'Paid' WHERE id = %s", (parent_order_id,))
-                if prow["status"] == "Pending":
-                    cursor.execute("UPDATE parent_orders SET status = 'Pending Acceptance' WHERE id = %s", (parent_order_id,))
-                cursor.execute(
-                    "UPDATE shop_sub_orders SET status = 'Accepted' WHERE parent_order_id = %s AND status = 'Pending'",
-                    (parent_order_id,),
-                )
-                create_notification(
-                    title="Payment confirmed",
-                    message=f"Payment for token {prow['token']} confirmed — the shops will accept your order soon.",
-                    order_id=None,  # notifications.order_id FK only accepts `orders` ids
-                    status="Pending Acceptance",
-                    target_role="student",
-                    connection=connection,
-                )
-            else:
-                cursor.execute("SELECT id FROM parent_orders WHERE id = %s", (parent_order_id,))
-                if not cursor_row(cursor):
-                    return None
-                cursor.execute("UPDATE parent_orders SET payment_status = 'Failed' WHERE id = %s", (parent_order_id,))
-            cursor.execute("SELECT * FROM parent_orders WHERE id = %s", (parent_order_id,))
-            row = cursor_row(cursor)
-            return _parent_payment_shape(row) if row else None
-
-
-def update_payment_status(payment_id: str, status: str) -> dict[str, Any] | None:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("UPDATE payments SET status = %s WHERE id = %s", (status, payment_id))
-            cursor.execute("SELECT * FROM payments WHERE id = %s", (payment_id,))
-            row = cursor.fetchone()
-            if row and status in ("Success", "Failed"):
-                is_parent = bool(row.get("parent_order_id"))
-                if is_parent:
-                    # Multi-shop: ONE bill → entire group moves together.
-                    parent_id = row["parent_order_id"]
-                    if status == "Success":
-                        cursor.execute(
-                            "UPDATE parent_orders SET payment_status = 'Paid' WHERE id = %s",
-                            (parent_id,),
-                        )
-                        cursor.execute("SELECT token, status FROM parent_orders WHERE id = %s", (parent_id,))
-                        p_row = cursor.fetchone()
-                        if p_row and p_row["status"] == "Pending":
-                            cursor.execute(
-                                "UPDATE parent_orders SET status = 'Pending Acceptance' WHERE id = %s",
-                                (parent_id,),
-                            )
-                        cursor.execute(
-                            "UPDATE shop_sub_orders SET status = 'Accepted' WHERE parent_order_id = %s AND status = 'Pending'",
-                            (parent_id,),
-                        )
-                        create_notification(
-                            title="Payment confirmed",
-                            message=f"Payment for token {p_row['token'] if p_row else parent_id} confirmed — the shops will accept your order soon.",
-                            order_id=None,  # notifications.order_id FK only accepts `orders` ids
-                            status="Pending Acceptance",
-                            target_role="student",
-                            connection=connection,
-                        )
-                    else:
-                        cursor.execute(
-                            "UPDATE parent_orders SET payment_status = 'Failed' WHERE id = %s",
-                            (parent_id,),
-                        )
-                else:
-                    order_id = row["order_id"]
-                    cursor.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
-                    order_row = cursor.fetchone()
-                    if order_row:
-                        if status == "Success":
-                            cursor.execute("UPDATE orders SET status = %s WHERE id = %s", ("Pending Acceptance", order_row["id"]))
-                            create_notification(
-                                title="Payment confirmed",
-                                message=f"Payment for token {order_row['token']} confirmed — the shop will accept your order soon.",
-                                order_id=order_row["id"],
-                                status="Pending Acceptance",
-                                target_role="student",
-                                connection=connection,
-                            )
-                        else:
-                            cursor.execute("UPDATE orders SET status = %s WHERE id = %s", ("Failed", order_row["id"]))
-            return dict(row) if row else None
-
-
-def get_payment_by_order_id(order_id: str) -> dict[str, Any] | None:
-    """Get the most recent payment record for an order. For multi-shop parents
-    the payment is anchored on a sub-order id but keeps ``parent_order_id`` —
-    so lookups by the parent id match too."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM payments WHERE order_id = %s ORDER BY created_at DESC, id DESC LIMIT 1",
-                (order_id,),
-            )
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-def set_payment_utr(order_id: str, utr_number: str) -> dict[str, Any] | None:
-    """Stamp the student-provided UTR on the latest payment for an order."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM payments WHERE order_id = %s ORDER BY created_at DESC, id DESC LIMIT 1",
-                (order_id,),
-            )
-            row = cursor.fetchone()
-            if not row:
-                return None
-            cursor.execute(
-                "UPDATE payments SET utr_number = %s WHERE id = %s",
-                (utr_number, row["id"]),
-            )
-            cursor.execute("SELECT * FROM payments WHERE id = %s", (row["id"],))
-            updated = cursor.fetchone()
-            return dict(updated) if updated else None
-
-
-def get_payment_by_utr(utr_number: str) -> dict[str, Any] | None:
-    """Find the most recent payment record carrying this UTR (student-entered)."""
-    if not utr_number:
-        return None
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM payments WHERE utr_number = %s ORDER BY created_at DESC, id DESC LIMIT 1",
-                (utr_number,),
-            )
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-def get_payment_settings() -> dict[str, Any]:
-    defaults = {
-        "manual_enabled": False,
-        "upi_id": "",
-        "receiver_name": "",
-        "instructions": "",
-        "razorpay_enabled": False,
-    }
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT key, value FROM app_settings")
-            values = {row["key"]: row["value"] for row in cursor.fetchall()}
-    return {
-        "manual_enabled": values.get("manual_enabled", "false") == "true",
-        "upi_id": values.get("upi_id", defaults["upi_id"]),
-        "receiver_name": values.get("receiver_name", defaults["receiver_name"]),
-        "instructions": values.get("instructions", defaults["instructions"]),
-        "razorpay_enabled": values.get("razorpay_enabled", "false") == "true",
-    }
-
-
-def update_payment_settings(values: dict[str, Any]) -> dict[str, Any]:
-    allowed = {"manual_enabled", "upi_id", "receiver_name", "instructions", "razorpay_enabled"}
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            for key, value in values.items():
-                if key not in allowed or value is None:
-                    continue
-                stored_value = str(value).lower() if isinstance(value, bool) else str(value)
-                cursor.execute(
-                    "INSERT INTO app_settings (key, value) VALUES (%s, %s) "
-                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-                    (key, stored_value),
-                )
-    return get_payment_settings()
-
-
-# ─── Student info notice (site-wide banner on the student home page) ───
-
-
-def get_student_notice() -> dict[str, Any]:
-    """The info block students see on their home page, edited from the Admin
-    Centre. Stored in the shared ``app_settings`` key/value table so no new
-    table (or migration) is needed:
-
-    * ``student_notice_enabled`` — "true" / "false"
-    * ``student_notice_text``    — the message the student reads
-
-    An empty message can never render, so ``enabled`` is reported as False
-    whenever the text is blank — the admin can't leave a blank green block on
-    the student app by accident.
-    """
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT key, value FROM app_settings "
-                "WHERE key IN ('student_notice_text', 'student_notice_enabled')"
-            )
-            values = {row["key"]: row["value"] for row in cursor.fetchall()}
-    text = str(values.get("student_notice_text", "") or "").strip()
-    return {
-        "enabled": values.get("student_notice_enabled", "false") == "true" and bool(text),
-        "text": text,
-    }
-
-
-def update_student_notice(values: dict[str, Any]) -> dict[str, Any]:
-    """Save the student info notice (admin only — see the local API routes)."""
-    columns = {"enabled": "student_notice_enabled", "text": "student_notice_text"}
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            for field, key in columns.items():
-                if field not in values or values[field] is None:
-                    continue
-                value = values[field]
-                stored_value = ("true" if value else "false") if isinstance(value, bool) else str(value)
-                cursor.execute(
-                    "INSERT INTO app_settings (key, value) VALUES (%s, %s) "
-                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
-                    (key, stored_value),
-                )
-    return get_student_notice()
-
-
-# ─── Tickets ───
-
-
-def create_ticket(values: dict[str, Any]) -> dict[str, Any]:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) + 1 AS next FROM tickets")
-            next_id = cursor.fetchone()["next"]
-            ticket_id = f"t{next_id}"
-            ticket_number = f"TKT-{1000 + next_id}"
-            cursor.execute(
-                """
-                INSERT INTO tickets (
-                    id, ticket_number, name, email, phone_number, category,
-                    title, description, status
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    ticket_id,
-                    ticket_number,
-                    values["name"],
-                    values["email"],
-                    values["phone_number"],
-                    values["category"],
-                    values["title"],
-                    values["description"],
-                    "Open",
-                ),
-            )
-            cursor.execute("SELECT * FROM tickets WHERE id = %s", (ticket_id,))
-            row = cursor.fetchone()
-            return dict(row)
-
-
-def list_tickets() -> list[dict[str, Any]]:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM tickets ORDER BY created_at DESC")
-            return _rows_to_dicts(cursor.fetchall())
-
-
-# ─── Notifications ───
-
-
-def create_notification(
-    title: str,
-    message: str,
-    order_id: str | None = None,
-    status: str | None = None,
-    target_role: str | None = None,
-    action: str = "",
-    action_state: str = "none",
-    connection: Any | None = None,
-) -> dict[str, Any] | None:
-    """Insert one notification.
-
-    ``action``/``action_state`` carry an INLINE admin action for the notification
-    bell (e.g. ``action="confirm_order"``, ``action_state="pending"``). They are
-    keyword-only in practice and default to "no action", so every existing caller
-    keeps working untouched.
-    """
-    owns_connection = connection is None
-    active_connection = connection or _connect()
-    cursor = None
-    try:
-        cursor = active_connection.cursor()
-        # MAX (not COUNT) so deletes can never reuse an id, AND a retry on a
-        # concurrent collision so a lost insert can never drop the admin's
-        # "confirm this order" queue row (see _insert_with_suffixed_id).
-        notification_id = _insert_with_suffixed_id(
-            cursor, "notifications", "n",
-            """INSERT INTO notifications (id, title, message, order_id, status, target_role, action, action_state)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-            lambda rid: (rid, title, message, order_id, status, target_role, action or "", action_state or "none"),
-        )
-        cursor.execute("SELECT * FROM notifications WHERE id = %s", (notification_id,))
-        row = cursor.fetchone()
-        if owns_connection:
-            active_connection.commit()
-        return dict(row) if row else None
-    except (psycopg2.errors.UndefinedColumn,):
-        # A deployment whose notifications table predates the inline-action
-        # columns. Apply the migrations and retry once so the bell never 500s.
-        logger.warning("Missing notification action columns — applying auto-migrations and retrying")
-        if owns_connection:
-            _release(active_connection)
-            active_connection = None
-        _apply_migrations()
-        return create_notification(
-            title, message, order_id, status, target_role, action, action_state, connection=None
-        )
-    finally:
-        if cursor is not None:
-            try:
-                cursor.close()
-            except Exception:
-                pass
-        if owns_connection and active_connection is not None:
-            _release(active_connection)
-
-
-# How many rows the bell renders. 20 was small enough that a busy lunch rush
-# pushed a still-actionable "confirm this order" row off the end of the list
-# while the admin was looking at it — the order then silently never got
-# confirmed. 60 keeps a full service's worth of history visible.
-NOTIFICATION_LIST_LIMIT = 60
-
-
-def list_notifications(role: str | None = None) -> list[dict[str, Any]]:
-    """List notifications. When ``role`` is given, only notifications targeted at
-    that exact role are returned (strict role separation).
-
-    Rows that still carry a PENDING admin action are always kept at the top (and
-    never truncated away) so an un-confirmed order can't fall off the bell.
-    """
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            if role:
-                cursor.execute(
-                    """SELECT * FROM notifications
-                       WHERE target_role = %s
-                       ORDER BY (CASE WHEN action <> '' AND action_state = 'pending' THEN 0 ELSE 1 END),
-                                created_at DESC
-                       LIMIT %s""",
-                    (role, NOTIFICATION_LIST_LIMIT),
-                )
-            else:
-                cursor.execute(
-                    """SELECT * FROM notifications
-                       ORDER BY (CASE WHEN action <> '' AND action_state = 'pending' THEN 0 ELSE 1 END),
-                                created_at DESC
-                       LIMIT %s""",
-                    (NOTIFICATION_LIST_LIMIT,),
-                )
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def list_actionable_notifications(action: str, action_state: str = "pending") -> list[dict[str, Any]]:
-    """Every notification carrying a given inline action in a given state.
-
-    Powers the admin "Approvals" queue — a narrow, indexed read (no scan of the
-    whole table) so the page stays instant even with a long notification history.
-    """
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """SELECT * FROM notifications
-                   WHERE action = %s AND action_state = %s
-                   ORDER BY created_at DESC
-                   LIMIT 50""",
-                (action, action_state),
-            )
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def set_notification_action_state(
-    notification_id: str, action_state: str
-) -> dict[str, Any] | None:
-    """Move a notification's inline action to a new state (pending → done).
-
-    Returns the updated row, or ``None`` when the id doesn't exist. A row whose
-    action was already settled returns that row unchanged, which is what makes
-    the confirm button safe to double-tap.
-    """
-    try:
-        return _set_notification_action_state_impl(notification_id, action_state)
-    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
-        logger.warning("Missing notification action columns — applying auto-migrations and retrying")
-        _apply_migrations()
-        return _set_notification_action_state_impl(notification_id, action_state)
-
-
-def _set_notification_action_state_impl(
-    notification_id: str, action_state: str
-) -> dict[str, Any] | None:
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                """UPDATE notifications SET action_state = %s
-                   WHERE id = %s
-                   RETURNING *""",
-                (action_state, notification_id),
-            )
-            row = _rows_to_dicts(cur.fetchall())[0] if cur.rowcount else None
-            if row:
-                connection.commit()
-            return row
-    except Exception:
-        connection.rollback()
-        return None
-    finally:
-        _release(connection)
-
-
-# ─── Web push subscriptions (vendor order notifications) ───
-
-
-def save_push_subscription(
-    shop_id: str,
-    endpoint: str,
-    p256dh: str,
-    auth: str,
-) -> dict[str, Any] | None:
-    """Save (or refresh) a browser push subscription for a vendor's shop.
-    ``endpoint`` is unique per device+browser, so it's the natural key."""
-    try:
-        return _save_push_subscription_impl(shop_id, endpoint, p256dh, auth)
-    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
-        logger.warning("Missing push_subscriptions table — applying auto-migrations and retrying")
-        _apply_migrations()
-        return _save_push_subscription_impl(shop_id, endpoint, p256dh, auth)
-
-
-def _save_push_subscription_impl(
-    shop_id: str,
-    endpoint: str,
-    p256dh: str,
-    auth: str,
-) -> dict[str, Any] | None:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO push_subscriptions (endpoint, shop_id, p256dh, auth)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (endpoint) DO UPDATE SET
-                    shop_id = EXCLUDED.shop_id,
-                    p256dh = EXCLUDED.p256dh,
-                    auth = EXCLUDED.auth
-                """,
-                (endpoint, shop_id, p256dh, auth),
-            )
-            cursor.execute(
-                "SELECT * FROM push_subscriptions WHERE endpoint = %s",
-                (endpoint,),
-            )
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-def list_push_subscriptions(shop_id: str) -> list[dict[str, Any]]:
-    """All push subscriptions registered for a shop (used to deliver pushes)."""
-    try:
-        return _list_push_subscriptions_impl(shop_id)
-    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
-        _apply_migrations()
-        return _list_push_subscriptions_impl(shop_id)
-
-
-def _list_push_subscriptions_impl(shop_id: str) -> list[dict[str, Any]]:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM push_subscriptions WHERE shop_id = %s ORDER BY created_at",
-                (shop_id,),
-            )
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def remove_push_subscription(shop_id: str, endpoint: str) -> bool:
-    """Remove a push subscription (e.g. when the browser reports it's dead)."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "DELETE FROM push_subscriptions WHERE endpoint = %s AND shop_id = %s",
-                (endpoint, shop_id),
-            )
-            return cursor.rowcount > 0
-
-
-# ─── Admin helpers ───
-
-
-def list_users() -> list[dict[str, Any]]:
-    """List all registered users (without password_hash)."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT id, username, name, email, phone, role, created_at FROM users ORDER BY created_at DESC"
-            )
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def list_users_by_role(role: str) -> list[dict[str, Any]]:
-    """List users filtered by role."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT id, username, name, email, phone, role, created_at FROM users WHERE role = %s ORDER BY created_at DESC",
-                (role,),
-            )
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def record_registration(user: dict[str, Any]) -> None:
-    """Record a user registration for admin notifications."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "INSERT INTO user_registrations (username, name, email, phone, role) VALUES (%s, %s, %s, %s, %s)",
-                (user.get("username", ""), user.get("name", ""), user.get("email", ""), user.get("phone", ""), user.get("role", "")),
-            )
-
-
-def list_registrations() -> list[dict[str, Any]]:
-    """List all user registrations for admin."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM user_registrations ORDER BY created_at DESC")
-            return _rows_to_dicts(cursor.fetchall())
-
-
-# ─── Forgot password (double email OTP verification) ───
-
-
-def get_user_by_email(email: str) -> dict[str, Any] | None:
-    """Find a user by their registered email (case-insensitive)."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM users WHERE LOWER(email) = %s LIMIT 1",
-                (email.lower(),),
-            )
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-def create_password_reset(username: str, otp: str, step: int) -> dict[str, Any] | None:
-    """Store an OTP for a password-reset step (1 or 2) for the given user.
-    Older unused codes for the same user are cleared so only the newest counts."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "DELETE FROM password_resets WHERE username = %s",
-                (username.lower(),),
-            )
-            cursor.execute(
-                "INSERT INTO password_resets (username, otp, step, expires_at) "
-                "VALUES (%s, %s, %s, now() + make_interval(mins => %s)) RETURNING *",
-                (username.lower(), otp, step, int(settings.RESET_OTP_EXPIRE_MINUTES)),
-            )
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-def get_password_reset(username: str, otp: str, step: int) -> dict[str, Any] | None:
-    """Return the valid, unused, unexpired reset code for this user/step.
-    Codes are locked out after 5 wrong attempts (brute-force protection)."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT * FROM password_resets
-                WHERE username = %s AND otp = %s AND step = %s AND used = false
-                  AND attempts < 5
-                  AND expires_at > now()
-                ORDER BY id DESC LIMIT 1
-                """,
-                (username.lower(), otp, step),
-            )
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-def bump_password_reset_attempts(username: str) -> None:
-    """Count one wrong OTP guess for this user's pending reset."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "UPDATE password_resets SET attempts = attempts + 1 WHERE username = %s AND used = false",
-                (username.lower(),),
-            )
-
-
-def invalidate_password_resets(username: str) -> None:
-    """Mark every pending reset code for this user as used."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "UPDATE password_resets SET used = true WHERE username = %s",
-                (username.lower(),),
-            )
-
-
-def update_user_password(username: str, new_password_hash: str) -> bool:
-    """Set a new password hash for a user (by username)."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "UPDATE users SET password_hash = %s WHERE username = %s",
-                (new_password_hash, username.lower()),
-            )
-            return cursor.rowcount > 0
-
-
-def update_user_profile(user_id: int, name: str | None = None, email: str | None = None, phone: str | None = None) -> dict[str, Any] | None:
-    """Update a user's editable profile fields (name, email, phone) by id.
-    Returns the full clean user row (without password_hash) or None if the
-    user doesn't exist. Email is left untouched when not provided so a caller
-    can't accidentally blank it."""
-    updates: list[str] = []
-    params: list[Any] = []
-    if name is not None:
-        updates.append("name = %s")
-        params.append(name.strip() or "")
-    if email is not None:
-        updates.append("email = %s")
-        params.append(email.strip())
-    if phone is not None:
-        updates.append("phone = %s")
-        params.append(phone.strip())
-    if not updates:
-        return get_user_by_id(user_id)
-    params.append(user_id)
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = %s", params)
-            cursor.execute(
-                "SELECT id, username, name, email, phone, role, created_at FROM users WHERE id = %s",
-                (user_id,),
-            )
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-# ─── Site feedback / bug reports (students → admin) ───
-
-
-def create_site_feedback(values: dict[str, Any]) -> dict[str, Any] | None:
-    """Store a student's bug report / improvement contribution.
-
-    The admin is notified through the notifications bell (target_role='admin')
-    so new contributions surface immediately on the admin Feedback page."""
-    try:
-        return _create_site_feedback_impl(values)
-    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
-        logger.warning("Missing site_feedback table/columns — applying auto-migrations and retrying")
-        _apply_migrations()
-        return _create_site_feedback_impl(values)
-
-
-def _create_site_feedback_impl(values: dict[str, Any]) -> dict[str, Any] | None:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            # MAX (not COUNT) so deletes can never reuse an id, AND a retry on a
-            # concurrent collision (see _insert_with_suffixed_id).
-            _fb_sql = """
-                INSERT INTO site_feedback (
-                    id, user_id, username, name, email, category,
-                    subject, message, page, status, source
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'Open', %s)
-                """
-            feedback_id = _insert_with_suffixed_id(
-                cursor, "site_feedback", "fb", _fb_sql,
-                lambda rid: (
-                    rid,
-                    values.get("user_id"),
-                    values.get("username", ""),
-                    values.get("name", ""),
-                    values.get("email", ""),
-                    values.get("category", "Bug"),
-                    values.get("subject", ""),
-                    values.get("message", ""),
-                    values.get("page", ""),
-                    values.get("source", "User"),
-                ),
-            )
-            cursor.execute("SELECT * FROM site_feedback WHERE id = %s", (feedback_id,))
-            row = cursor.fetchone()
-            if row:
-                create_notification(
-                    title=f"New {row['category'].lower()} reported",
-                    message=f"{row['name'] or row['username'] or 'A user'}: {row['subject'] or row['message'][:60]}",
-                    target_role="admin",
-                    connection=connection,
-                )
-            return dict(row) if row else None
-
-
-def list_site_feedback(source: str | None = None) -> list[dict[str, Any]]:
-    """All site feedback, newest first (admin Feedback page).
-    Pass ``source`` = 'User' or 'ATS' to see only real students or only
-    automated-test contributions."""
-    try:
-        return _list_site_feedback_impl(source)
-    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
-        _apply_migrations()
-        return _list_site_feedback_impl(source)
-
-
-def _list_site_feedback_impl(source: str | None = None) -> list[dict[str, Any]]:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            if source:
-                cursor.execute(
-                    "SELECT * FROM site_feedback WHERE source = %s ORDER BY created_at DESC",
-                    (source,),
-                )
-            else:
-                cursor.execute("SELECT * FROM site_feedback ORDER BY created_at DESC")
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def list_site_feedback_by_user(user_id: int) -> list[dict[str, Any]]:
-    """A student's own submissions (student portal "my contributions")."""
-    try:
-        return _list_site_feedback_by_user_impl(user_id)
-    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
-        _apply_migrations()
-        return _list_site_feedback_by_user_impl(user_id)
-
-
-def _list_site_feedback_by_user_impl(user_id: int) -> list[dict[str, Any]]:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM site_feedback WHERE user_id = %s ORDER BY created_at DESC",
-                (user_id,),
-            )
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def update_site_feedback_status(feedback_id: str, status: str) -> dict[str, Any] | None:
-    """Admin marks a contribution as Open / In Review / Fixed / Won't Fix."""
-    allowed = {"Open", "In Review", "Fixed", "Won't Fix"}
-    if status not in allowed:
-        return None
-    try:
-        return _update_site_feedback_status_impl(feedback_id, status)
-    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
-        _apply_migrations()
-        return _update_site_feedback_status_impl(feedback_id, status)
-
-
-def _update_site_feedback_status_impl(feedback_id: str, status: str) -> dict[str, Any] | None:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "UPDATE site_feedback SET status = %s WHERE id = %s",
-                (status, feedback_id),
-            )
-            cursor.execute("SELECT * FROM site_feedback WHERE id = %s", (feedback_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-def delete_site_feedback(source: str | None = None) -> int:
-    """Permanently delete feedback rows.
-
-    Pass ``source='ATS'`` to clear automated-test contributions, ``'User'`` to
-    clear real reports, or ``None`` for everything. Returns how many rows were
-    removed — the admin Feedback page uses this to purge test data so the page
-    shows ONLY real student feedback."""
-    try:
-        return _delete_site_feedback_impl(source)
-    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
-        _apply_migrations()
-        return _delete_site_feedback_impl(source)
-
-
-def _delete_site_feedback_impl(source: str | None = None) -> int:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            if source:
-                cursor.execute(
-                    "DELETE FROM site_feedback WHERE source = %s",
-                    (source,),
-                )
-            else:
-                cursor.execute("DELETE FROM site_feedback")
-            return cursor.rowcount
-
-
-# --- Shop reviews ---
-
-
-def create_review(values: dict[str, Any]) -> dict[str, Any] | None:
-    try:
-        return _create_review_impl(values)
-    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
-        _apply_migrations()
-        return _create_review_impl(values)
-
-
-def _create_review_impl(values: dict[str, Any]) -> dict[str, Any] | None:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            shop_name = values.get("shop_name", "")
-            if not shop_name and values.get("shop_id"):
-                try:
-                    cursor.execute("SELECT name FROM shops WHERE id = %s", (values["shop_id"],))
-                    row = cursor.fetchone()
-                    if row:
-                        shop_name = row["name"]
-                except Exception:
-                    pass
-            # MAX (not COUNT) so deletes can never reuse an id, AND a retry on a
-            # concurrent collision (see _insert_with_suffixed_id).
-            review_id = _insert_with_suffixed_id(
-                cursor, "reviews", "rv",
-                """INSERT INTO reviews (id, user_id, username, student_name, shop_id, shop_name, rating, comment)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                lambda rid: (
-                    rid,
-                    values.get("user_id"),
-                    values.get("username", ""),
-                    values.get("student_name", ""),
-                    values.get("shop_id", ""),
-                    shop_name,
-                    values.get("rating", 5),
-                    values.get("comment", ""),
-                ),
-            )
-            cursor.execute("SELECT * FROM reviews WHERE id = %s", (review_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-
-def list_reviews(shop_id: str | None = None) -> list[dict[str, Any]]:
-    try:
-        return _list_reviews_impl(shop_id)
-    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
-        _apply_migrations()
-        return _list_reviews_impl(shop_id)
-
-
-def _list_reviews_impl(shop_id: str | None = None) -> list[dict[str, Any]]:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            if shop_id:
-                cursor.execute("SELECT * FROM reviews WHERE shop_id = %s ORDER BY created_at DESC", (shop_id,))
-            else:
-                cursor.execute("SELECT * FROM reviews ORDER BY created_at DESC")
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def list_reviews_by_user(user_id: int) -> list[dict[str, Any]]:
-    try:
-        return _list_reviews_by_user_impl(user_id)
-    except (psycopg2.errors.UndefinedTable, psycopg2.errors.UndefinedColumn):
-        _apply_migrations()
-        return _list_reviews_by_user_impl(user_id)
-
-
-def _list_reviews_by_user_impl(user_id: int) -> list[dict[str, Any]]:
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM reviews WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def delete_user(user_id: int) -> bool:
-    """Permanently delete a user and EVERY record that references them, so a
-    deleted account's username/email become re-registrable immediately and no
-    stale rows keep the old data around.
-
-    Cascades: sessions (by email), user_registrations (by username),
-    site_feedback (by user_id), password_resets (by username), and a
-    shopkeeper's linked shop (soft-removed so orders keep their history).
-    Each cleanup is guarded so a missing/legacy table can never block the
-    delete of the user row itself."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-            user = cursor.fetchone()
-            if not user:
-                return False
-
-            username = str(user["username"])
-            email = str(user.get("email") or "").strip().lower()
-            if email:
-                try:
-                    cursor.execute(
-                        "DELETE FROM sessions WHERE LOWER(email) = %s",
-                        (email,),
-                    )
-                except psycopg2.Error:
-                    connection.rollback()
-            for table, column, value in (
-                ("user_registrations", "username", username),
-                ("password_resets", "username", username),
-                ("site_feedback", "user_id", user_id),
-            ):
-                try:
-                    cursor.execute(
-                        f"DELETE FROM {table} WHERE {column} = %s",
-                        (value,),
-                    )
-                except psycopg2.Error:
-                    connection.rollback()
-            if str(user.get("role") or "") == "shopkeeper" and email:
-                try:
-                    cursor.execute(
-                        "UPDATE shops SET is_removed = true, present = false, status = 'Closed', "
-                        "approval_status = 'Removed' WHERE LOWER(shopkeeper_email) = %s",
-                        (email,),
-                    )
-                except psycopg2.Error:
-                    connection.rollback()
-            cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
-            return cursor.rowcount > 0
-
-
-def get_admin_dashboard_stats(today: str) -> dict[str, Any]:
-    """Admin dashboard numbers computed in SQL (COUNT/SUM subqueries) instead
-    of loading every row into Python. The old approach pulled the entire
-    orders/payments/products tables on every 15s poll and aggregated them in
-    Python, which is what made the admin panel feel slow as data grew.
-    ``today`` is the Asia/Kolkata date string (YYYY-MM-DD)."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT
-                  (SELECT COUNT(*) FROM shops) AS total_shops,
-                  (SELECT COUNT(*) FROM shops WHERE approval_status = 'Approved') AS approved_shops,
-                  (SELECT COUNT(*) FROM shops WHERE approval_status = 'Pending Approval') AS pending_approvals,
-                  (SELECT COUNT(*) FROM orders) AS total_orders,
-                  (SELECT COUNT(*) FROM orders WHERE status NOT IN ('Completed', 'Cancelled')) AS active_orders,
-                  (SELECT COALESCE(SUM(total), 0) FROM orders) AS total_revenue,
-                  (SELECT COUNT(*) FROM orders WHERE (created_at AT TIME ZONE 'Asia/Kolkata')::date = %s::date) AS today_orders,
-                  (SELECT COALESCE(SUM(total), 0) FROM orders WHERE (created_at AT TIME ZONE 'Asia/Kolkata')::date = %s::date) AS today_revenue,
-                  (SELECT COUNT(*) FROM products) AS total_products,
-                  (SELECT COUNT(*) FROM payments WHERE status = 'Pending Verification') AS pending_payments
-                """,
-                (today, today),
-            )
-            row = cursor.fetchone()
-            return dict(row) if row else {}
-
-
-def get_orders_grouped_by_date() -> list[dict[str, Any]]:
-    """Get orders grouped by date for revenue tracking."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT created_at::date::text AS created_at, COUNT(*) AS count, SUM(total) AS revenue, "
-                "SUM(subtotal) AS subtotal, COUNT(*) * 10 AS service_fee, "
-                "SUM(tax) AS tax, SUM(delivery_fee) AS delivery_fee, "
-                "STRING_AGG(id, ',') AS ids FROM orders GROUP BY created_at::date ORDER BY created_at::date DESC"
-            )
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def get_orders_by_date(date_key: str) -> list[dict[str, Any]]:
-    """Get orders for a specific date (YYYY-MM-DD) for daily log filtering."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM orders WHERE created_at::date = %s::date ORDER BY token DESC",
-                (date_key,),
-            )
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def get_payments_by_date(date_key: str) -> list[dict[str, Any]]:
-    """Get payments for a specific date (YYYY-MM-DD) for daily log filtering."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM payments WHERE created_at::date = %s::date ORDER BY created_at DESC",
-                (date_key,),
-            )
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def get_daily_stats() -> dict[str, Any]:
-    """Get today's statistics."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT COUNT(*) AS count, COALESCE(SUM(total), 0) AS revenue, "
-                "COUNT(*) * 10 AS service_fee FROM orders WHERE created_at::date = CURRENT_DATE"
-            )
-            today_orders = cursor.fetchone()
-            cursor.execute("SELECT COUNT(*) AS count FROM users")
-            total_users = cursor.fetchone()
-            cursor.execute("SELECT COUNT(*) AS count FROM shops WHERE approval_status = 'Approved'")
-            total_shops = cursor.fetchone()
-            cursor.execute("SELECT COUNT(*) AS count FROM orders")
-            total_orders = cursor.fetchone()
-            cursor.execute("SELECT COUNT(*) * 10 AS total FROM orders")
-            total_service_fee = cursor.fetchone()
-            return {
-                "today_orders": dict(today_orders) if today_orders else {"count": 0, "revenue": 0, "service_fee": 0},
-                "total_users": dict(total_users)["count"] if total_users else 0,
-                "approved_shops": dict(total_shops)["count"] if total_shops else 0,
-                "total_orders": dict(total_orders)["count"] if total_orders else 0,
-                "total_service_fee": dict(total_service_fee)["total"] if total_service_fee else 0,
-            }
-
-
-def get_vendor_daily_logs(shop_id: str) -> list[dict[str, Any]]:
-    """Per-day earnings + order counts for one shop (admin vendor logs)."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT created_at::date::text AS created_at, COUNT(*) AS count,
-                       SUM(total) AS revenue, COUNT(*) * 10 AS admin_fee
-                FROM orders WHERE shop_id = %s
-                GROUP BY created_at::date ORDER BY created_at::date DESC
-                """,
-                (shop_id,),
-            )
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def get_vendor_orders(shop_id: str) -> list[dict[str, Any]]:
-    """All orders for one shop (admin vendor logs)."""
-    with _DBContext(_connect()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT * FROM orders WHERE shop_id = %s ORDER BY created_at DESC",
-                (shop_id,),
-            )
-            return _rows_to_dicts(cursor.fetchall())
-
-
-def get_summary() -> dict[str, Any]:
-    """Aggregate summary computed with COUNT/SUM SQL so the DB ships a single
-    tiny row instead of every shop/product/order row across the wire.
-
-    The old version loaded ``shops``, ``orders`` and ``products`` in full, then
-    counted in Python — ~800 ms of cold latency on a live Supabase project.
-    This version runs three COUNT/SUM queries and returns immediately."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                "SELECT COUNT(*) AS n, COUNT(*) FILTER (WHERE status = 'Open') AS open_n "
-                "FROM shops"
-            )
-            row = cursor_row(cur)
-            shop_count = row["n"] if row else 0
-            open_shop_count = row["open_n"] if row else 0
-
-            cur.execute(
-                "SELECT COUNT(*) AS active, COALESCE(SUM(total), 0) AS revenue "
-                "FROM orders WHERE status != 'Completed'"
-            )
-            row = cursor_row(cur)
-            active_orders = row["active"] if row else 0
-            revenue = row["revenue"] if row else 0
-
-            # The alias is NOT cosmetic: psycopg2 reports an unaliased COUNT(*)
-            # under the column name "count", so reading row["COUNT(*)"] raised
-            # KeyError and the endpoint answered 500 (an admin-only route, and
-            # the pentest sweep asserts it answers an admin). The SQLite demo
-            # store used by the tests keeps the literal "COUNT(*)" name and reads
-            # it positionally, so only the production Supabase path could fail.
-            cur.execute("SELECT COUNT(*) AS n FROM products")
-            row = cursor_row(cur)
-            product_count = row["n"] if row else 0
-
-        return {
-            "shops": shop_count,
-            "orderable_shops": open_shop_count,
-            "products": product_count,
-            "active_orders": active_orders,
-            "revenue": revenue,
-            "token_starts_at": 18,
-        }
-    finally:
-        _release(connection)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  MULTI-SHOP ORDERING — parent orders, sub-orders, batch stock, tokens
-#  Signatures mirror app/core/local_demo_db.py exactly so the API layer
-#  (app/api/v1/local.py) works against either store via the `store` facade.
-# ═══════════════════════════════════════════════════════════════════════
-
-def _day_key() -> str:
-    """Today's date in IST as YYYY-MM-DD (matches local_demo_db)."""
-    return _now_kolkata().strftime("%Y-%m-%d")
-
-
-def _day_key_compact() -> str:
-    """Today's date in IST as YYYYMMDD (used in order ids like p20240320-18)."""
-    return _now_kolkata().strftime("%Y%m%d")
-
-
-def get_current_batch(now: str | None = None) -> str:
-    """Return the active delivery batch name ('Afternoon' or 'Night')."""
-    hour = _now_kolkata().hour
-    return "Afternoon" if hour < 15 else "Night"
-
-
-def get_next_token() -> int:
-    """Next parent-order token for today. Tokens start at 18 each day."""
-    dk = _day_key()
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                "SELECT COALESCE(MAX(token), 17) + 1 AS next_token FROM parent_orders WHERE date_key = %s",
-                (dk,),
-            )
-            row = cursor_row(cur)
-            return int(row["next_token"]) if row else 18
-    finally:
-        _release(connection)
-
-
-def consume_token() -> int:
-    """Reserve the next token number and return it."""
-    return get_next_token()
-
-
-def get_product_stock(product_id: str, batch_type: str, date_key: str | None = None) -> int:
-    """Remaining stock for a product in the given batch."""
-    dk = date_key or _day_key()
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                "SELECT total_stock FROM product_stock WHERE product_id = %s AND date_key = %s AND batch_type = %s",
-                (product_id, dk, batch_type),
-            )
-            row = cursor_row(cur)
-            if row:
-                return max(0, int(row["total_stock"]))
-            cur.execute("SELECT inventory FROM products WHERE id = %s", (product_id,))
-            prow = cursor_row(cur)
-            return int(prow["inventory"]) if prow else 0
-    finally:
-        _release(connection)
-
-
-def get_product_stocks(batch_type: str, date_key: str | None = None) -> dict[str, int]:
-    """Remaining stock for EVERY product in the given batch — one query, not
-    one per product. Falls back to the product's ``inventory`` when no explicit
-    ``product_stock`` row exists, mirroring :func:`get_product_stock`."""
-    dk = date_key or _day_key()
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                """SELECT p.id AS pid,
-                          COALESCE(ps.total_stock, p.inventory) AS stock_left
-                     FROM products p
-                     LEFT JOIN product_stock ps
-                       ON ps.product_id = p.id AND ps.date_key = %s AND ps.batch_type = %s""",
-                (dk, batch_type),
-            )
-            return {r["pid"]: max(0, int(r["stock_left"])) for r in cur.fetchall()}
-    finally:
-        _release(connection)
-
-
-def init_batch_stock(product_id: str, batch_type: str, default_stock: int, date_key: str | None = None) -> None:
-    """Insert a default stock row for a product in a batch (no-op if present)."""
-    dk = date_key or _day_key()
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                """INSERT INTO product_stock (product_id, date_key, batch_type, total_stock)
-                   VALUES (%s, %s, %s, %s)
-                   ON CONFLICT (product_id, date_key, batch_type) DO NOTHING""",
-                (product_id, dk, batch_type, default_stock),
-            )
-            connection.commit()
-    except Exception:
-        connection.rollback()
-    finally:
-        _release(connection)
-
-
-def consume_batch_stock(product_id: str, batch_type: str, qty: int, date_key: str | None = None) -> bool:
-    """Consume qty from a batch. Returns False when insufficient stock."""
-    dk = date_key or _day_key()
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                "SELECT id, total_stock FROM product_stock WHERE product_id = %s AND date_key = %s AND batch_type = %s",
-                (product_id, dk, batch_type),
-            )
-            row = cursor_row(cur)
-            if row:
-                if int(row["total_stock"]) < qty:
-                    return False
-                cur.execute(
-                    "UPDATE product_stock SET total_stock = total_stock - %s WHERE id = %s",
-                    (qty, row["id"]),
-                )
-                connection.commit()
-                return True
-            # No stock row for this product/batch/date yet — the shop has no
-            # explicit batch inventory tracked, so allow the order (matching the
-            # single-shop flow, which never enforces inventory). Only block when
-            # an explicit product_stock row exists AND has insufficient stock;
-            # this keeps combo/multi-shop orders from spuriously failing on
-            # shops that simply haven't configured batch stock rows.
-            return True
-    except Exception:
-        connection.rollback()
-        return False
-    finally:
-        _release(connection)
-
-
-def release_batch_stock(product_id: str, batch_type: str, qty: int, date_key: str | None = None) -> None:
-    """Give back stock (e.g. cancellation)."""
-    dk = date_key or _day_key()
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                "UPDATE product_stock SET total_stock = total_stock + %s WHERE product_id = %s AND date_key = %s AND batch_type = %s",
-                (qty, product_id, dk, batch_type),
-            )
-            connection.commit()
-    except Exception:
-        connection.rollback()
-    finally:
-        _release(connection)
-
-
-def create_parent_order(
-    student_name: str,
-    student_phone: str,
-    delivery_location: str,
-    payment_method: str,
-    shops: list[dict[str, Any]],
-    student_email: str = "",
-    student_id: str = "",
-    owner_user_id: str = "",
-) -> dict[str, Any] | None:
-    """Create a multi-shop parent order with per-shop sub-orders.
-
-    ``shops`` is a list like::
-
-        [{"shop_id": "...", "items": [{"product_id": "...", "quantity": 2}]}, ...]
-
-    Returns the parent order dict (with nested ``sub_orders``) or raises
-    ``ValueError`` when no valid sub-order can be created. One token is shared
-    across ALL sub-orders. The student pays ONE bill (sum of sub-order
-    subtotals); each shop's flat ₹10-per-order commission is recorded per sub-order but never
-    charged to the student.
-    """
-    token = consume_token()
-    today_key = _day_key_compact()
-    parent_id = f"p{today_key}-{token}"
-    batch_type = get_current_batch()
-
-    sub_orders: list[dict[str, Any]] = []
-    grand_total = 0
-    pending_subs: list[tuple[dict[str, Any], list[tuple], int, int, str, str]] = []
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            for group in shops:
-                cur.execute("SELECT * FROM shops WHERE id = %s", (group["shop_id"],))
-                shop = cursor_row(cur)
-                if not shop or not _shop_is_orderable(shop):
-                    continue
-
-                product_ids = [item["product_id"] for item in group.get("items", [])]
-                products_by_id: dict[str, Any] = {}
-                for pid in product_ids:
-                    # PENTEST FIX: same shop-scoping + availability rule as
-                    # create_order — a product from another shop (or a sold-out
-                    # one) must never be priced into a sub-order.
-                    cur.execute(
-                        "SELECT * FROM products WHERE id = %s AND shop_id = %s",
-                        (pid, group["shop_id"]),
-                    )
-                    prow = cursor_row(cur)
-                    if prow and prow.get("available", 1):
-                        products_by_id[pid] = prow
-
-                subtotal = 0
-                order_item_rows: list[tuple] = []
-                for item in group.get("items", []):
-                    product = products_by_id.get(item["product_id"])
-                    if not product:
-                        continue
-                    quantity = int(item.get("quantity", 1) or 1)
-                    if quantity <= 0:
-                        continue
-                    if not consume_batch_stock(product["id"], batch_type, quantity):
-                        raise ValueError(f"Insufficient stock for {product['name']}")
-                    subtotal += int(product["price"]) * quantity
-                    order_item_rows.append(
-                        (
-                            product["id"],
-                            product["name"],
-                            int(product["price"]),
-                            quantity,
-                            int(product["price"]) * quantity,
-                        )
-                    )
-
-                if not order_item_rows:
-                    continue
-
-                commission = 10  # flat ₹10 per order (admin's cut)
-                shop_whatsapp = str(shop.get("whatsapp_number") or "").strip()
-                shop_phone = str(shop.get("phone") or "").strip()
-                grand_total += subtotal
-                pending_subs.append((dict(shop), order_item_rows, subtotal, commission, shop_phone, shop_whatsapp))
-
-            if not pending_subs:
-                raise ValueError("No valid shops or items in order")
-
-            # The parent row MUST exist before its sub-orders (FK constraint in
-            # PostgreSQL is checked immediately, not at commit).
-            #
-            # PENTEST/RELIABILITY FIX. ``consume_token()`` read MAX(token)+1 on a
-            # SEPARATE, already-released connection, so between that read and this
-            # INSERT another student can claim the same token. The single-order
-            # path (``create_order``) already retries on UniqueViolation; this one
-            # did not, so a collision raised out of the endpoint as a 500 and the
-            # student's order was lost — AFTER ``consume_batch_stock`` had already
-            # decremented stock for every line, leaving the shop's inventory short
-            # for an order that does not exist.
-            #
-            # A SAVEPOINT (not a full rollback) is used so the batch stock already
-            # consumed in THIS transaction survives the retry.
-            parent_row = None
-            for _attempt in range(5):
-                try:
-                    cur.execute("SAVEPOINT parent_order_insert")
-                    cur.execute(
-                        """INSERT INTO parent_orders (
-                           id, token, date_key, student_name, student_phone, student_email,
-                           student_id, owner_user_id, total, payment_method, payment_status,
-                           delivery_location, status, created_at)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Pending', %s, 'Pending', NOW())""",
-                        (
-                            parent_id,
-                            token,
-                            _day_key(),
-                            student_name,
-                            student_phone,
-                            student_email,
-                            student_id,
-                            owner_user_id,
-                            grand_total,
-                            payment_method,
-                            delivery_location,
-                        ),
-                    )
-                    parent_row = True
-                    break
-                except psycopg2.errors.UniqueViolation:
-                    # Another parent order took this token a moment ago. Undo only
-                    # the failed INSERT, then re-read the next free token.
-                    cur.execute("ROLLBACK TO SAVEPOINT parent_order_insert")
-                    if _attempt == 4:
-                        raise
-                    token = consume_token()
-                    parent_id = f"{today_key}-{token}"
-            if parent_row is None:  # pragma: no cover - the loop raises instead
-                raise RuntimeError("Could not allocate a unique parent-order token")
-
-            for idx, (shop, order_item_rows, subtotal, commission, shop_phone, shop_whatsapp) in enumerate(pending_subs, start=1):
-                sub_order_id = f"{parent_id}-{idx}"
-
-                cur.execute(
-                    """INSERT INTO shop_sub_orders (
-                           id, parent_order_id, shop_id, shop_name, shop_phone,
-                           shop_whatsapp, token, subtotal, commission_5pct, status,
-                           batch_type, created_at)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'Pending', %s, NOW())""",
-                    (
-                        sub_order_id,
-                        parent_id,
-                        shop["id"],
-                        shop["name"],
-                        shop_phone,
-                        shop_whatsapp,
-                        token,
-                        subtotal,
-                        commission,
-                        batch_type,
-                    ),
-                )
-                for product_id, name, price, qty, line_total in order_item_rows:
-                    cur.execute(
-                        """INSERT INTO order_items (sub_order_id, product_id, product_name, price, quantity, total)
-                           VALUES (%s, %s, %s, %s, %s, %s)""",
-                        (sub_order_id, product_id, name, price, qty, line_total),
-                    )
-
-                item_labels = [f"{q}x {n}" for _, n, _, q, _ in order_item_rows]
-
-                sub_orders.append({
-                    "id": sub_order_id,
-                    "shop_id": shop["id"],
-                    "shop_name": shop["name"],
-                    "shop_phone": shop_phone,
-                    "shop_whatsapp": shop_whatsapp,
-                    "token": token,
-                    "items_summary": ", ".join(item_labels),
-                    "subtotal": subtotal,
-                    "commission_5pct": commission,
-                    "status": "Pending",
-                    "batch_type": batch_type,
-                })
-
-                cur.execute(
-                    """UPDATE shops SET orders_today = orders_today + 1,
-                           revenue_today = revenue_today + %s, current_token = %s
-                       WHERE id = %s""",
-                    (subtotal, token, shop["id"]),
-                )
-
-            connection.commit()
-
-            cur.execute("SELECT * FROM parent_orders WHERE id = %s", (parent_id,))
-            parent = cursor_row(cur)
-            if parent:
-                parent["sub_orders"] = sub_orders
-            return parent
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        _release(connection)
-
-
-# ─── Parent (multi-shop) orders ────────────────────────────────────
-
-
-def get_parent_order(parent_order_id: str, with_items: bool = True) -> dict[str, Any] | None:
-    """Parent order with its shop sub-orders and their items.
-
-    Batched: the old loop ran one ``order_items`` query per sub-order; we now
-    pull all items + parents in two queries total (1 + 2N → 3 round trips)."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute("SELECT * FROM parent_orders WHERE id = %s", (parent_order_id,))
-            parent = cursor_row(cur)
-            if not parent:
-                return None
-            cur.execute(
-                "SELECT * FROM shop_sub_orders WHERE parent_order_id = %s ORDER BY id",
-                (parent_order_id,),
-            )
-            subs = [dict(row) for row in cur.fetchall()]
-            if not subs:
-                parent["sub_orders"] = []
-                return parent
-            sub_ids = [s["id"] for s in subs]
-            if with_items:
-                cur.execute(
-                    "SELECT * FROM order_items WHERE sub_order_id = ANY(%s) ORDER BY id",
-                    (sub_ids,),
-                )
-                items: dict[str, list[dict[str, Any]]] = {}
-                for row in cur.fetchall():
-                    items.setdefault(row["sub_order_id"], []).append(dict(row))
-            for sub in subs:
-                sub["items"] = (items or {}).get(sub["id"], [])
-                sub["items_summary"] = ", ".join(
-                    f"{int(i['quantity'])}x {i['product_name']}" for i in sub["items"]
-                )
-            parent["sub_orders"] = subs
-            return parent
-    finally:
-        _release(connection)
-
-
-def list_parent_orders(limit: int = 200, status: str | None = None) -> list[dict[str, Any]]:
-    """List parent orders, newest first, optional status filter."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            if status:
-                cur.execute(
-                    "SELECT * FROM parent_orders WHERE status = %s ORDER BY created_at DESC LIMIT %s",
-                    (status, limit),
-                )
-            else:
-                cur.execute("SELECT * FROM parent_orders ORDER BY created_at DESC LIMIT %s", (limit,))
-            return _rows_to_dicts(cur.fetchall())
-    finally:
-        _release(connection)
-
-
-def get_shop_sub_orders(shop_id: str, status: str | None = None) -> list[dict[str, Any]]:
-    """All sub-orders for a shop (shopkeeper portal). Only this shop's items.
-
-    Batched: items + parent rows are pulled in two queries for ALL sub-orders
-    instead of two queries per sub-order (1 + 2N → 3 round trips)."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            if status:
-                cur.execute(
-                    "SELECT * FROM shop_sub_orders WHERE shop_id = %s AND status = %s ORDER BY id",
-                    (shop_id, status),
-                )
-            else:
-                cur.execute(
-                    "SELECT * FROM shop_sub_orders WHERE shop_id = %s ORDER BY id",
-                    (shop_id,),
-                )
-            subs = [dict(row) for row in cur.fetchall()]
-            if not subs:
-                return []
-            sub_ids = [s["id"] for s in subs]
-            parent_ids = list({s["parent_order_id"] for s in subs if s.get("parent_order_id")})
-            cur.execute(
-                "SELECT * FROM order_items WHERE sub_order_id = ANY(%s) ORDER BY id",
-                (sub_ids,),
-            )
-            items: dict[str, list[dict[str, Any]]] = {}
-            for row in cur.fetchall():
-                items.setdefault(row["sub_order_id"], []).append(dict(row))
-            parents: dict[str, dict[str, Any]] = {}
-            if parent_ids:
-                cur.execute(
-                    "SELECT id, student_name, student_phone, delivery_location, total, payment_method, created_at FROM parent_orders WHERE id = ANY(%s)",
-                    (parent_ids,),
-                )
-                parents = {row["id"]: dict(row) for row in cur.fetchall()}
-            for s in subs:
-                s["items"] = items.get(s["id"], [])
-                s["parent"] = parents.get(s.get("parent_order_id", "")) or {}
-            return subs
-    finally:
-        _release(connection)
-
-
-def list_all_sub_orders(limit: int = 300) -> list[dict[str, Any]]:
-    """Recent sub-orders across ALL shops (admin orders view), newest first.
-
-    The admin orders endpoint used to loop over every shop and call
-    ``get_shop_sub_orders`` once per shop — 3 round trips per shop, all
-    sequential, which made the admin orders page crawl as shops grew. This
-    batches it: one query for the sub-orders plus two follow-ups for items
-    and parents, regardless of shop count."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM shop_sub_orders ORDER BY created_at DESC LIMIT %s",
-                (limit,),
-            )
-            subs = [dict(row) for row in cur.fetchall()]
-            if not subs:
-                return []
-            sub_ids = [s["id"] for s in subs]
-            parent_ids = list({s["parent_order_id"] for s in subs if s.get("parent_order_id")})
-            cur.execute(
-                "SELECT * FROM order_items WHERE sub_order_id = ANY(%s) ORDER BY id",
-                (sub_ids,),
-            )
-            items: dict[str, list[dict[str, Any]]] = {}
-            for row in cur.fetchall():
-                items.setdefault(row["sub_order_id"], []).append(dict(row))
-            parents: dict[str, dict[str, Any]] = {}
-            if parent_ids:
-                cur.execute(
-                    "SELECT id, student_name, student_phone, delivery_location, total, payment_method, created_at FROM parent_orders WHERE id = ANY(%s)",
-                    (parent_ids,),
-                )
-                parents = {row["id"]: dict(row) for row in cur.fetchall()}
-            for s in subs:
-                s["items"] = items.get(s["id"], [])
-                s["parent"] = parents.get(s.get("parent_order_id", "")) or {}
-            return subs
-    finally:
-        _release(connection)
-
-
-def get_sub_order(sub_order_id: str) -> dict[str, Any] | None:
-    """Find one shop sub-order with its parent + shop context attached.
-
-    Used to enrich WhatsApp logs whose ``sub_order_id`` is a multi-shop
-    sub-order id (those don't live in the plain ``orders`` table). Returns the
-    sub-order dict plus ``parent`` (student/phone/location/total/payment) and
-    ``shop`` context, or ``None`` when it's not a sub-order id at all.
-    """
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute("SELECT * FROM shop_sub_orders WHERE id = %s", (sub_order_id,))
-            sub = cursor_row(cur)
-            if not sub:
-                return None
-            cur.execute(
-                "SELECT student_name, student_phone, delivery_location, total, payment_method, created_at FROM parent_orders WHERE id = %s",
-                (sub["parent_order_id"],),
-            )
-            parent = cursor_row(cur)
-            sub["parent"] = parent or {}
-            cur.execute(
-                "SELECT id, name, phone, whatsapp_number FROM shops WHERE id = %s",
-                (sub["shop_id"],),
-            )
-            shop = cursor_row(cur)
-            sub["shop"] = shop or {}
-            return sub
-    finally:
-        _release(connection)
-
-
-def update_sub_order_status(
-    sub_order_id: str, status: str, notes: str = ""
-) -> dict[str, Any] | None:
-    """Update a shop sub-order's status + transition timestamp."""
-    ts_col = {
-        "Accepted": "accepted_at",
-        "Preparing": "prepared_at",
-        "Ready": "ready_at",
-        "Delivered": "delivered_at",
-        "Completed": "completed_at",
-    }.get(status)
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            if ts_col:
-                cur.execute(
-                    f"""UPDATE shop_sub_orders SET status = %s, {ts_col} = NOW(),
-                        rejection_reason = CASE WHEN %s = 'Rejected' THEN %s ELSE rejection_reason END
-                        WHERE id = %s RETURNING *""",
-                    (status, status, notes, sub_order_id),
-                )
-            elif status == "Rejected":
-                cur.execute(
-                    "UPDATE shop_sub_orders SET status = %s, rejection_reason = %s WHERE id = %s RETURNING *",
-                    (status, notes, sub_order_id),
-                )
-            else:
-                cur.execute("UPDATE shop_sub_orders SET status = %s WHERE id = %s RETURNING *", (status, sub_order_id))
-            connection.commit()
-            return cursor_row(cur)
-    except Exception:
-        connection.rollback()
-        return None
-    finally:
-        _release(connection)
-
-
-def update_parent_order_status(parent_order_id: str, status: str) -> dict[str, Any] | None:
-    """Update a parent (multi-shop) order's status (Accepted/Preparing/…/Cancelled)."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                "UPDATE parent_orders SET status = %s WHERE id = %s RETURNING *",
-                (status, parent_order_id),
-            )
-            connection.commit()
-            return cursor_row(cur)
-    except Exception:
-        connection.rollback()
-        return None
-    finally:
-        _release(connection)
-
-
-def cancel_parent_order(parent_order_id: str) -> dict[str, Any] | None:
-    """Cancel a parent order and every sub-order that is still open."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                "UPDATE shop_sub_orders SET status = 'Cancelled' "
-                "WHERE parent_order_id = %s AND status NOT IN ('Completed', 'Delivered', 'Cancelled')",
-                (parent_order_id,),
-            )
-            cur.execute(
-                "UPDATE parent_orders SET status = 'Cancelled' WHERE id = %s RETURNING *",
-                (parent_order_id,),
-            )
-            connection.commit()
-            return cursor_row(cur)
-    except Exception:
-        connection.rollback()
-        return None
-    finally:
-        _release(connection)
-
-
-def get_daily_token_count(date_key: str | None = None) -> int:
-    """Number of parent orders today."""
-    dk = date_key or _day_key()
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS cnt FROM parent_orders WHERE date_key = %s", (dk,))
-            row = cursor_row(cur)
-            return int(row["cnt"]) if row else 0
-    finally:
-        _release(connection)
-
-
-def auto_complete_expired_deliveries() -> int:
-    """Auto-complete sub-orders delivered more than 30 minutes ago.
-
-    Per spec section 36: after the 30-minute problem window the order is
-    auto-confirmed, and the parent order completes once every sub-order is
-    terminal. Idempotent + fast, so it is safe to call on every request —
-    this makes it work on serverless hosts (Vercel) with no background loop.
-    Returns the number of sub-orders completed just now.
-    """
-    completed_now = 0
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                """SELECT id, parent_order_id, delivered_at
-                   FROM shop_sub_orders
-                   WHERE status = 'Delivered' AND delivered_at IS NOT NULL"""
-            )
-            rows = cur.fetchall()
-            from datetime import datetime, timedelta
-
-            now = datetime.utcnow()
-            for row in rows:
-                try:
-                    dt_str = str(row["delivered_at"] or "")
-                    dt_str_clean = dt_str.replace("+05:30", "").replace("+00:00", "").replace("T", " ")
-                    delivered = datetime.strptime(dt_str_clean[:19], "%Y-%m-%d %H:%M:%S")
-                    if (now - delivered) < timedelta(minutes=30):
-                        continue
-                    cur.execute(
-                        """UPDATE shop_sub_orders SET status = 'Completed', completed_at = NOW()
-                           WHERE id = %s""",
-                        (row["id"],),
-                    )
-                    completed_now += 1
-                    cur.execute(
-                        "SELECT status FROM shop_sub_orders WHERE parent_order_id = %s",
-                        (row["parent_order_id"],),
-                    )
-                    statuses = [r["status"] for r in cur.fetchall()]
-                    if statuses and all(s in ("Delivered", "Completed") for s in statuses):
-                        cur.execute(
-                            "UPDATE parent_orders SET status = 'Completed' WHERE id = %s",
-                            (row["parent_order_id"],),
-                        )
-                except Exception:
-                    continue
-            connection.commit()
-    except Exception:
-        connection.rollback()
-        return 0
-    finally:
-        _release(connection)
-    return completed_now
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  SHOP ANNOUNCEMENTS
-# ═══════════════════════════════════════════════════════════════════════
-
-def create_shop_announcement(shop_id: str, message: str) -> dict[str, Any] | None:
-    """Create a shop announcement (shown as notification bar on student page)."""
-    aid = f"ann_{secrets.token_hex(8)}"
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                """INSERT INTO shop_announcements (id, shop_id, message, is_active)
-                   VALUES (%s, %s, %s, true) RETURNING *""",
-                (aid, shop_id, message),
-            )
-            connection.commit()
-            return cursor_row(cur)
-    except Exception:
-        connection.rollback()
-        return None
-    finally:
-        _release(connection)
-
-
-def list_shop_announcements(shop_id: str | None = None, active_only: bool = True) -> list[dict[str, Any]]:
-    """All active (or shop-filtered) announcements."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            if shop_id:
-                cur.execute(
-                    "SELECT * FROM shop_announcements WHERE shop_id = %s ORDER BY created_at DESC",
-                    (shop_id,),
-                )
-            else:
-                if active_only:
-                    cur.execute("SELECT * FROM shop_announcements WHERE is_active = true ORDER BY created_at DESC")
-                else:
-                    cur.execute("SELECT * FROM shop_announcements ORDER BY created_at DESC")
-            return _rows_to_dicts(cur.fetchall())
-    finally:
-        _release(connection)
-
-
-def toggle_shop_announcement(ann_id: str, is_active: bool) -> dict[str, Any] | None:
-    """Toggle an announcement on/off."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                "UPDATE shop_announcements SET is_active = %s WHERE id = %s RETURNING *",
-                (is_active, ann_id),
-            )
-            connection.commit()
-            return cursor_row(cur)
-    except Exception:
-        connection.rollback()
-        return None
-    finally:
-        _release(connection)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  COMPLAINTS
-# ═══════════════════════════════════════════════════════════════════════
-
-def create_complaint(
-    parent_order_id: str,
-    student_name: str,
-    student_phone: str,
-    shop_id: str,
-    shop_name: str,
-    subject: str,
-    message: str,
-    sub_order_id: str = "",
-    proof_url: str = "",
-) -> dict[str, Any] | None:
-    """File a student complaint against an order."""
-    cid = f"cmp_{secrets.token_hex(8)}"
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                """INSERT INTO complaints (
-                       id, parent_order_id, sub_order_id, student_name, student_phone,
-                       shop_id, shop_name, subject, message, proof_url, status)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Open') RETURNING *""",
-                (
-                    cid, parent_order_id, sub_order_id, student_name, student_phone,
-                    shop_id, shop_name, subject, message, proof_url,
-                ),
-            )
-            connection.commit()
-            return cursor_row(cur)
-    except Exception:
-        connection.rollback()
-        return None
-    finally:
-        _release(connection)
-
-
-def list_complaints(status: str | None = None) -> list[dict[str, Any]]:
-    """All complaints (optional status filter)."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            if status:
-                cur.execute("SELECT * FROM complaints WHERE status = %s ORDER BY created_at DESC", (status,))
-            else:
-                cur.execute("SELECT * FROM complaints ORDER BY created_at DESC")
-            return _rows_to_dicts(cur.fetchall())
-    finally:
-        _release(connection)
-
-
-def update_complaint(complaint_id: str, status: str, admin_notes: str = "") -> dict[str, Any] | None:
-    """Update a complaint's status + admin note."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                "UPDATE complaints SET status = %s, admin_notes = %s WHERE id = %s RETURNING *",
-                (status, admin_notes, complaint_id),
-            )
-            connection.commit()
-            return cursor_row(cur)
-    except Exception:
-        connection.rollback()
-        return None
-    finally:
-        _release(connection)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  REFUNDS
-# ═══════════════════════════════════════════════════════════════════════
-
-def create_refund(
-    parent_order_id: str,
-    student_name: str,
-    shop_name: str,
-    original_amount: int,
-    refund_amount: int,
-    refund_type: str = "Full",
-    sub_order_id: str = "",
-    shop_id: str = "",
-) -> dict[str, Any] | None:
-    """Create a refund request."""
-    rid = f"ref_{secrets.token_hex(8)}"
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                """INSERT INTO refunds (
-                       id, parent_order_id, sub_order_id, student_name, shop_name,
-                       original_amount, refund_amount, refund_type, status)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'Pending') RETURNING *""",
-                (
-                    rid, parent_order_id, sub_order_id, student_name, shop_name,
-                    original_amount, refund_amount, refund_type,
-                ),
-            )
-            connection.commit()
-            return cursor_row(cur)
-    except Exception:
-        connection.rollback()
-        return None
-    finally:
-        _release(connection)
-
-
-def list_refunds(status: str | None = None) -> list[dict[str, Any]]:
-    """All refunds (optional status filter)."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            if status:
-                cur.execute("SELECT * FROM refunds WHERE status = %s ORDER BY created_at DESC", (status,))
-            else:
-                cur.execute("SELECT * FROM refunds ORDER BY created_at DESC")
-            return _rows_to_dicts(cur.fetchall())
-    finally:
-        _release(connection)
-
-
-def update_refund(
-    refund_id: str, status: str, refund_utr: str = "", admin_notes: str = ""
-) -> dict[str, Any] | None:
-    """Update a refund's status (mark processed/completed etc.)."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            completion_sql = (
-                ", completed_at = NOW()" if status in ("Processed", "Completed") else ""
-            )
-            cur.execute(
-                f"UPDATE refunds SET status = %s, refund_utr = %s, admin_notes = %s{completion_sql} WHERE id = %s RETURNING *",
-                (status, refund_utr, admin_notes, refund_id),
-            )
-            connection.commit()
-            return cursor_row(cur)
-    except Exception:
-        connection.rollback()
-        return None
-    finally:
-        _release(connection)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  SETTLEMENTS
-# ═══════════════════════════════════════════════════════════════════════
-
-def list_settlements(status: str | None = None) -> list[dict[str, Any]]:
-    """All settlements (optional status filter)."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            if status:
-                cur.execute("SELECT * FROM settlements WHERE status = %s ORDER BY created_at DESC", (status,))
-            else:
-                cur.execute("SELECT * FROM settlements ORDER BY created_at DESC")
-            return _rows_to_dicts(cur.fetchall())
-    finally:
-        _release(connection)
-
-
-def run_daily_settlements() -> list[dict[str, Any]]:
-    """Process 9 PM settlements for all shops for today's delivered sub-orders."""
-    dk = _day_key()
-    connection = _connect()
-    results: list[dict[str, Any]] = []
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                "SELECT DISTINCT shop_id, shop_name FROM shop_sub_orders WHERE status IN ('Delivered', 'Completed') AND created_at::date = %s::date",
-                (dk,),
-            )
-            shop_rows = _rows_to_dicts(cur.fetchall())
-            for shop in shop_rows:
-                sid = shop["shop_id"]
-                cur.execute(
-                    "SELECT COALESCE(SUM(subtotal), 0) AS gross, COUNT(*) AS cnt FROM shop_sub_orders WHERE shop_id = %s AND status IN ('Delivered', 'Completed') AND created_at::date = %s::date",
-                    (sid, dk),
-                )
-                _row = cursor_row(cur)
-                gross = int(_row["gross"])
-                commission = int(_row["cnt"] or 0) * 10
-                settlement_id = f"set_{sid}_{dk}"
-                cur.execute(
-                    """INSERT INTO settlements (
-                           id, shop_id, shop_name, date_key, gross_sales, commission_5pct,
-                           refunds_adjusted, net_payable, cod_collected, status)
-                       VALUES (%s, %s, %s, %s, %s, %s, 0, %s, 0, 'Pending')
-                       ON CONFLICT (id) DO UPDATE SET
-                           gross_sales = EXCLUDED.gross_sales,
-                           commission_5pct = EXCLUDED.commission_5pct,
-                           net_payable = EXCLUDED.net_payable
-                       RETURNING *""",
-                    (settlement_id, sid, shop["shop_name"], dk, gross, commission, gross - commission),
-                )
-                results.append(cursor_row(cur))
-            connection.commit()
-            return results
-    except Exception:
-        connection.rollback()
-        return results
-    finally:
-        _release(connection)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  MENU CHANGE REQUESTS
-# ═══════════════════════════════════════════════════════════════════════
-
-def create_menu_change_request(
-    shop_id: str,
-    product_id: str,
-    change_type: str,
-    old_value: str,
-    new_value: str,
-    field_name: str = "",
-) -> dict[str, Any] | None:
-    """A shop asks admin to change a menu field (price, availability...)."""
-    mid = f"mcr_{secrets.token_hex(8)}"
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                """INSERT INTO menu_change_requests (
-                       id, shop_id, product_id, change_type, field_name, old_value, new_value, status)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, 'Pending') RETURNING *""",
-                (mid, shop_id, product_id, change_type, field_name, old_value, new_value),
-            )
-            connection.commit()
-            return cursor_row(cur)
-    except Exception:
-        connection.rollback()
-        return None
-    finally:
-        _release(connection)
-
-
-def list_menu_change_requests(status: str | None = None) -> list[dict[str, Any]]:
-    """Menu change requests (optional status filter)."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            if status:
-                cur.execute("SELECT * FROM menu_change_requests WHERE status = %s ORDER BY created_at DESC", (status,))
-            else:
-                cur.execute("SELECT * FROM menu_change_requests ORDER BY created_at DESC")
-            return _rows_to_dicts(cur.fetchall())
-    finally:
-        _release(connection)
-
-
-def update_menu_change_request(req_id: str, status: str, admin_notes: str = "") -> dict[str, Any] | None:
-    """Approve/reject a menu change request."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                "UPDATE menu_change_requests SET status = %s, admin_notes = %s, reviewed_at = NOW() WHERE id = %s RETURNING *",
-                (status, admin_notes, req_id),
-            )
-            connection.commit()
-            return cursor_row(cur)
-    except Exception:
-        connection.rollback()
-        return None
-    finally:
-        _release(connection)
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  AUDIT + WHATSAPP LOGS
-# ═══════════════════════════════════════════════════════════════════════
-
-def add_audit_log(
-    actor: str,
-    actor_role: str,
-    action: str,
-    target_type: str = "",
-    target_id: str = "",
-    details: str = "",
-) -> None:
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                """INSERT INTO audit_logs (actor, actor_role, action, target_type, target_id, details)
-                   VALUES (%s, %s, %s, %s, %s, %s)""",
-                (actor, actor_role, action, target_type, target_id, details),
-            )
-            connection.commit()
-    except Exception:
-        connection.rollback()
-    finally:
-        _release(connection)
-
-
-def list_audit_logs(limit: int = 200) -> list[dict[str, Any]]:
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute("SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT %s", (limit,))
-            return _rows_to_dicts(cur.fetchall())
-    finally:
-        _release(connection)
-
-
 def claim_next_whatsapp_log(
     log_ids: list[str], stale_minutes: int = 5
 ) -> dict[str, Any] | None:
-    """Atomically claim the single next DELIVERABLE row, or None.
-
-    This picks the newest row that is genuinely claimable — ``Pending``, or
-    ``Sending`` but claimed long enough ago (the bot died mid-send, so it truly
-    never went out and must be retried).
-
-    Picking "newest candidate then try to claim it" is a head-of-line blocking
-    bug: the newest candidate is often one that is already ``Sending`` and not
-    yet stale, so the claim fails and the feed returns NOTHING while perfectly
-    deliverable messages sit behind it. One stuck row then stalls every other
-    shop's order message, over and over, until it goes stale — which is exactly
-    "the order shows in the shopkeeper app but no WhatsApp ever arrives".
-
-    Selecting the claimable row INSIDE the statement removes the race between
-    choosing and claiming, so exactly one row is ever marked in-flight.
-    """
+    """Atomically claim the single next DELIVERABLE row, or None."""
     ids = [str(i) for i in (log_ids or []) if str(i).strip()]
     if not ids:
         return None
@@ -3824,25 +532,6 @@ def claim_next_whatsapp_log(
                    SET status = 'Sending', claimed_at = NOW()
                  WHERE id = (
                        SELECT id FROM whatsapp_logs
-                        -- BUG FIX (this was what blocked every shop message).
-                        -- `whatsapp_logs.id` is a bigint, and psycopg2 renders a
-                        -- Python list of strings as a text[] array, so Postgres
-                        -- raised `operator does not exist: bigint = text` on
-                        -- EVERY call. The queue feed therefore 500'd whenever the
-                        -- bot polled it, and no shop ever received a WhatsApp
-                        -- message - while the orders table looked perfectly
-                        -- healthy, which is why it presented as "the bot does
-                        -- nothing".
-                        --
-                        -- Comparing the id as text works whether the column is
-                        -- bigint or text, so this does not care how the column
-                        -- was created. The cast is inside the subquery only; the
-                        -- outer comparison still matches like with like.
-                        --
-                        -- NOTE: never write a literal placeholder in a comment
-                        -- inside these strings. psycopg2 counts every one of
-                        -- them, comment or not, and the mismatch surfaces as a
-                        -- baffling "IndexError: tuple index out of range".
                         WHERE id::text = ANY(%s)
                           AND (
                                status = 'Pending'
@@ -3861,125 +550,157 @@ def claim_next_whatsapp_log(
             return dict(row) if row else None
 
 
-def list_whatsapp_logs(limit: int = 100) -> list[dict[str, Any]]:
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute("SELECT * FROM whatsapp_logs ORDER BY created_at DESC LIMIT %s", (limit,))
-            return _rows_to_dicts(cur.fetchall())
-    finally:
-        _release(connection)
-
-
-def log_whatsapp(
-    sub_order_id: str = "",
-    phone: str = "",
-    message: str = "",
-    url: str = "",
-    status: str = "Pending",
-) -> dict[str, Any] | None:
-    """Persist one WhatsApp notification (link generated, ready to send).
-
-    Note: the Supabase ``whatsapp_logs`` table stores the order reference in
-    ``order_id`` (there is no ``sub_order_id``/``url`` column there), so the
-    ``url`` is dropped at rest and rebuilt by the API when serving it."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                """INSERT INTO whatsapp_logs (order_id, phone, message, message_type, status)
-                   VALUES (%s, %s, %s, %s, %s) RETURNING *""",
-                (sub_order_id or "", phone or "", message or "", "shop_order", status),
-            )
-            row = _rows_to_dicts(cur.fetchall())[0]
-            connection.commit()  # without this the RETURNING row is rolled back
-            return row
-    finally:
-        _release(connection)
-
-
-def mark_whatsapp_sent(whatsapp_id: str) -> dict[str, Any] | None:
-    """Mark a WhatsApp notification as sent."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                "UPDATE whatsapp_logs SET status = 'Sent' WHERE id = %s RETURNING *",
-                (whatsapp_id,),
-            )
-            row = _rows_to_dicts(cur.fetchall())[0]
-            connection.commit()  # without this the update is rolled back
-            return row
-    finally:
-        _release(connection)
-
-
-def update_whatsapp_message(whatsapp_id: str, message: str, url: str = "") -> dict[str, Any] | None:
-    """Refresh a pending WhatsApp notification (e.g. payment flipped to paid)."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                "UPDATE whatsapp_logs SET message = %s WHERE id = %s RETURNING *",
-                (message or "", whatsapp_id),
-            )
-            row = cur.fetchall()
-            result = _rows_to_dicts(row)[0] if row else None
-            if result:
-                connection.commit()  # freshness only lands when committed
-            return result
-    finally:
-        _release(connection)
-
-
-def log_sms(
-    sub_order_id: str = "",
-    phone: str = "",
-    message: str = "",
-    status: str = "Sent",
-    direction: str = "out",
-) -> dict[str, Any] | None:
-    """Persist one SMS (out = sent to a phone, in = received from a phone)."""
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                """INSERT INTO sms_logs (sub_order_id, phone, message, direction, status)
-                   VALUES (%s, %s, %s, %s, %s) RETURNING *""",
-                (sub_order_id, phone or "", message or "", direction, status),
-            )
-            row = _rows_to_dicts(cur.fetchall())[0]
-            connection.commit()  # without this the RETURNING row is rolled back
-            return row
-    finally:
-        _release(connection)
-
-
-def list_sms_logs(limit: int = 100) -> list[dict[str, Any]]:
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute("SELECT * FROM sms_logs ORDER BY created_at DESC LIMIT %s", (limit,))
-            return _rows_to_dicts(cur.fetchall())
-    finally:
-        _release(connection)
-
-
-def bank_sms_seen(utr: str) -> bool:
-    """True when a bank credit SMS containing this UTR was already logged inbound.
-
-    This is the security anchor for the double-confirm flow: an order only
-    auto-confirms via a student-entered UTR if the bank's SMS (proving the
-    money actually arrived) was received too.
-    """
-    connection = _connect()
-    try:
-        with connection.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM sms_logs WHERE direction = 'in' AND status = 'UTR Received' "
-                "AND UPPER(message) LIKE %s LIMIT 1",
-                (f"%{utr}%",),
-            )
-            return cur.fetchone() is not None
-    finally:
-        _release(connection)
+# ─── Domain operations (re-exported from app.core.supabase modules) ─────────
+from app.core.supabase.analytics import (
+    get_admin_dashboard_stats,
+    get_daily_stats,
+    get_orders_by_date,
+    get_orders_grouped_by_date,
+    get_payments_by_date,
+    get_summary,
+    get_vendor_daily_logs,
+    get_vendor_orders,
+)
+from app.core.supabase.notifications import (
+    NOTIFICATION_LIST_LIMIT,
+    create_notification,
+    list_actionable_notifications,
+    list_notifications,
+    list_push_subscriptions,
+    list_student_notifications,
+    remove_push_subscription,
+    save_push_subscription,
+    set_notification_action_state,
+)
+from app.core.supabase.orders import (
+    create_order,
+    find_order_by_client_ref,
+    get_order,
+    list_orders,
+    list_orders_by_shop,
+    list_orders_by_user_id,
+    list_recent_orders_by_shop,
+    update_order_status,
+)
+from app.core.supabase.parent_orders import (
+    auto_complete_expired_deliveries,
+    cancel_parent_order,
+    consume_batch_stock,
+    consume_token,
+    create_parent_order,
+    get_current_batch,
+    get_daily_token_count,
+    get_next_token,
+    get_parent_order,
+    get_product_stock,
+    get_product_stocks,
+    get_shop_sub_orders,
+    get_sub_order,
+    init_batch_stock,
+    list_all_sub_orders,
+    list_parent_orders,
+    release_batch_stock,
+    update_parent_order_status,
+    update_sub_order_status,
+)
+from app.core.supabase.payments import (
+    bank_sms_seen,
+    create_payment,
+    get_payment_by_id,
+    get_payment_by_order_id,
+    get_payment_by_utr,
+    get_payment_settings,
+    get_payments_map_by_order_ids,
+    get_student_notice,
+    list_parent_payments,
+    list_payments,
+    list_payments_by_utr,
+    record_parent_payment,
+    save_parent_payment_proof,
+    save_single_payment_proof,
+    settle_payment_if_open,
+    set_payment_utr,
+    update_payment_settings,
+    update_payment_status,
+    update_student_notice,
+    verify_parent_payment,
+    verify_parent_payment_proof,
+    verify_single_payment_proof,
+)
+from app.core.supabase.shops import (
+    create_product,
+    create_shop,
+    delete_product,
+    get_product,
+    get_shop,
+    get_shop_by_phone,
+    get_shop_by_shopkeeper_email,
+    list_products,
+    list_share_payments,
+    list_share_payments_by_shop,
+    list_shops,
+    menu_summary,
+    pay_admin_dues,
+    record_share_payment,
+    remove_shop,
+    suspend_shop,
+    update_product,
+    update_share_payment_status,
+    update_shop,
+)
+from app.core.supabase.support import (
+    add_audit_log,
+    create_complaint,
+    create_menu_change_request,
+    create_refund,
+    create_review,
+    create_shop_announcement,
+    create_site_feedback,
+    create_ticket,
+    delete_site_feedback,
+    list_audit_logs,
+    list_complaints,
+    list_menu_change_requests,
+    list_refunds,
+    list_reviews,
+    list_reviews_by_user,
+    list_settlements,
+    list_shop_announcements,
+    list_site_feedback,
+    list_site_feedback_by_user,
+    list_sms_logs,
+    list_tickets,
+    list_tickets_for_user,
+    list_whatsapp_logs,
+    log_sms,
+    log_whatsapp,
+    mark_whatsapp_sent,
+    run_daily_settlements,
+    toggle_shop_announcement,
+    update_complaint,
+    update_menu_change_request,
+    update_refund,
+    update_site_feedback_status,
+    update_whatsapp_message,
+)
+from app.core.supabase.users import (
+    bump_password_reset_attempts,
+    create_password_reset,
+    delete_user,
+    get_password_reset,
+    get_user_by_email,
+    get_user_by_id,
+    get_user_by_username,
+    get_user_overview,
+    invalidate_password_resets,
+    list_registrations,
+    list_users,
+    list_users_by_role,
+    record_registration,
+    register_user,
+    save_session,
+    set_user_status,
+    update_user_admin,
+    update_user_password,
+    update_user_profile,
+)

@@ -1,16 +1,19 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { getCartByShop, StoredCartItem, setProductQuantity, removeProductFromCart } from '../utils/cart'
+import { getCartByShop, setProductQuantity, removeProductFromCart } from '../utils/cart'
 import { getBillBreakdown } from '../utils/billing'
 
 export function CartPage() {
   const navigate = useNavigate()
-  const [_items, setItems] = useState<StoredCartItem[]>(() => getCartByShop().flatMap(g => g.items))
-  const groups = getCartByShop()
-  const bill = getBillBreakdown(groups.flatMap(g => g.items))
+  // Version counter re-renders the page when any cart util writes; the groups
+  // themselves are derived fresh each render (single source of truth stays in
+  // localStorage, never duplicated in state).
+  const [cartVersion, setCartVersion] = useState(0)
+  const groups = useMemo(() => getCartByShop(), [cartVersion])
+  const bill = useMemo(() => getBillBreakdown(groups.flatMap(g => g.items)), [groups])
 
   useEffect(() => {
-    const sync = () => setItems(getCartByShop().flatMap(g => g.items))
+    const sync = () => setCartVersion(v => v + 1)
     window.addEventListener('detomsite-cart-updated', sync)
     return () => window.removeEventListener('detomsite-cart-updated', sync)
   }, [])

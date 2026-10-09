@@ -22,10 +22,12 @@ import hashlib
 import inspect
 import logging
 import threading
+import time
 from typing import Any
 
 from app.core import redis_cache, shared_cache, ttl_cache
 from app.core.config import settings
+from app.core.db_executor import run_db
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +80,9 @@ async def _cached_lookup(coro, what: str) -> Any:
     return None
 
 
+_inflight: dict[str, asyncio.Future] = {}
+
+
 async def cached_read(ttl: float, key: str, loader, *args, **kwargs) -> Any:
     """Return ``loader(*args, **kwargs)``, serving it from a warm cache if possible.
 
@@ -88,40 +93,85 @@ async def cached_read(ttl: float, key: str, loader, *args, **kwargs) -> Any:
     """
     store_key = cache_key(key, args, kwargs)
 
+    t_c0 = time.perf_counter()
     value = ttl_cache.get(store_key)
     if value is not None:
+        from app.core.timing import record_timing
+        record_timing("cache", (time.perf_counter() - t_c0) * 1000)
         return value
 
-    value = await _cached_lookup(redis_cache.get(store_key), "redis")
-    if value is not None:
-        # Promote the shared entry into this instance's memory for free hits.
-        ttl_cache.set(store_key, value, ttl)
-        return value
+    # In-flight request coalescing (single-flight) to prevent cache stampedes
+    loop = asyncio.get_running_loop()
+    leader = False
+    if store_key in _inflight:
+        join_fut = _inflight[store_key]
+    else:
+        leader = True
+        join_fut = loop.create_future()
+        _inflight[store_key] = join_fut
 
-    if shared_cache.enabled():
-        value = await _cached_lookup(
-            asyncio.to_thread(shared_cache.get, store_key), "postgres"
-        )
+    if not leader:
+        try:
+            return await join_fut
+        except Exception:
+            # If the leader failed, fall back to fetching ourselves
+            pass
+
+    try:
+        value = await _cached_lookup(redis_cache.get(store_key), "redis")
         if value is not None:
             ttl_cache.set(store_key, value, ttl)
-            redis_cache.set_pair_bg(store_key, value, ttl)
+            from app.core.timing import record_timing
+            record_timing("cache", (time.perf_counter() - t_c0) * 1000)
             return value
 
-    value = await asyncio.to_thread(loader, *args, **kwargs)
-    if inspect.isawaitable(value):
-        value = await value
+        if shared_cache.enabled():
+            value = await _cached_lookup(
+                run_db(shared_cache.get, store_key), "postgres"
+            )
+            if value is not None:
+                ttl_cache.set(store_key, value, ttl)
+                redis_cache.set_pair_bg(store_key, value, ttl)
+                from app.core.timing import record_timing
+                record_timing("cache", (time.perf_counter() - t_c0) * 1000)
+                return value
 
-    ttl_cache.set(store_key, value, ttl)
-    redis_cache.set_pair_bg(store_key, value, ttl)
-    if shared_cache.enabled():
-        # Fire-and-forget so a cold load never waits on the fallback layer.
-        try:
-            threading.Thread(
-                target=shared_cache.set_pair, args=(store_key, value, ttl), daemon=True
-            ).start()
-        except Exception as e:
-            logger.debug(f"shared cache write skipped: {e}")
-    return value
+        from app.core.timing import record_timing
+        record_timing("cache", (time.perf_counter() - t_c0) * 1000)
+
+        # Synchronous store loaders run on the dedicated db pool (never the
+        # shared default executor — see app.core.db_executor); an async loader
+        # that merges several sources is awaited directly on the loop.
+        if inspect.iscoroutinefunction(loader):
+            value = await loader(*args, **kwargs)
+        else:
+            value = await run_db(loader, *args, **kwargs)
+            if inspect.isawaitable(value):
+                value = await value
+
+        ttl_cache.set(store_key, value, ttl)
+        redis_cache.set_pair_bg(store_key, value, ttl)
+        if shared_cache.enabled():
+            # Fire-and-forget so a cold load never waits on the fallback layer.
+            try:
+                threading.Thread(
+                    target=shared_cache.set_pair, args=(store_key, value, ttl), daemon=True
+                ).start()
+            except Exception as e:
+                logger.debug(f"shared cache write skipped: {e}")
+        return value
+    except Exception as exc:
+        if leader:
+            fut = _inflight.pop(store_key, None)
+            if fut and not fut.done():
+                fut.set_exception(exc)
+        raise
+    finally:
+        if leader:
+            fut = _inflight.pop(store_key, None)
+            if fut and not fut.done():
+                if "value" in locals() and value is not None:
+                    fut.set_result(value)
 
 
 def clear_local() -> None:
@@ -131,6 +181,19 @@ def clear_local() -> None:
     shared layers can follow on their own (see ``redis_cache.spawn``).
     """
     ttl_cache.clear()
+    _inflight.clear()
+
+
+def clear_matching(*prefixes: str) -> int:
+    """Drop the in-process entries under ``prefixes`` (see
+    :func:`ttl_cache.clear_prefix`) and queue scoped Redis invalidation in bg.
+    """
+    if prefixes:
+        for k in list(_inflight.keys()):
+            if k.startswith(prefixes):
+                _inflight.pop(k, None)
+        redis_cache.clear_prefixes_bg(*prefixes)
+    return ttl_cache.clear_prefix(*prefixes)
 
 
 async def clear() -> None:

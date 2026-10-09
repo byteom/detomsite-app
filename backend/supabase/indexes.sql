@@ -24,6 +24,8 @@ create index if not exists idx_orders_shop_id_token on public.orders (shop_id, t
 create index if not exists idx_orders_shop_id on public.orders (shop_id);
 create index if not exists idx_orders_status on public.orders (status);
 create index if not exists idx_orders_created_at on public.orders (created_at);
+create index if not exists idx_orders_owner_user_id on public.orders (owner_user_id);
+create index if not exists idx_parent_orders_owner_user_id on public.parent_orders (owner_user_id);
 
 -- Products menu per shop.
 create index if not exists idx_products_shop_id on public.products (shop_id);
@@ -52,6 +54,8 @@ where schemaname = 'public'
     'idx_orders_shop_id',
     'idx_orders_status',
     'idx_orders_created_at',
+    'idx_orders_owner_user_id',
+    'idx_parent_orders_owner_user_id',
     'idx_products_shop_id',
     'idx_share_payments_shop_id',
     'idx_share_payments_status',

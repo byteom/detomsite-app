@@ -1,8 +1,10 @@
-import { FormEvent, useEffect, useState } from 'react'
+import type { FormEvent } from 'react'
+import { useEffect, useState } from 'react'
 import api from '../services/api'
 import { LocalTicket } from '../types/localApi'
 import { getLocalSession } from '../utils/session'
 import { PhoneInput } from '../components/PhoneInput'
+import { getErrorMessage } from '../utils/helpers'
 
 export function SupportPage() {
   const session = getLocalSession()
@@ -27,8 +29,8 @@ export function SupportPage() {
       const r = await api.post<LocalTicket>('/local/tickets', form)
       setTickets(curr => [r.data, ...curr]); setMessage(`Ticket ${r.data.ticket_number} created`)
       setForm(f => ({ ...f, phone_number: '', title: '', description: '' }))
-    } catch (err: any) {
-      setTicketError(err?.response?.data?.detail || 'Could not create the ticket — please try again.')
+    } catch (err: unknown) {
+      setTicketError(getErrorMessage(err, 'Could not create the ticket — please try again.'))
     } finally {
       setSubmitting(false)
     }

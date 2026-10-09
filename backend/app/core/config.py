@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     # Frontend / Supabase
     VITE_SUPABASE_URL: Optional[str] = None
     VITE_SUPABASE_ANON_KEY: Optional[str] = None
+    SUPABASE_URL: Optional[str] = None
+    SUPABASE_ANON_KEY: Optional[str] = None
+    SUPABASE_SERVICE_ROLE_KEY: Optional[str] = None
     
     # Server
     HOST: str = "0.0.0.0"
@@ -104,34 +107,6 @@ class Settings(BaseSettings):
     REDIS_BREAKER_FAILURES: int = 5
     REDIS_BREAKER_COOLDOWN_SECONDS: float = 30.0
 
-    # ─── Redis read cache (OPTIONAL — the portals run fine without it) ───
-    # Every portal polls read endpoints (orders, products, stock, batch) and on
-    # serverless hosts each poll can land on a *different* instance, so the
-    # in-process cache misses constantly. A shared Redis makes every instance
-    # serve the same warm data at single-digit-ms latency.
-    #
-    # Two ways to configure it (either one is enough):
-    #   1. Upstash / Vercel KV REST API (recommended on Vercel — HTTPS, no new
-    #      dependency, no TCP pool to leak):
-    #        KV_REST_API_URL / KV_REST_API_TOKEN
-    #        (or UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN)
-    #   2. Raw Redis protocol (Redis Cloud, Railway, Render Key Value, self-hosted):
-    #        REDIS_URL=rediss://default:<password>@<host>:<port>
-    KV_REST_API_URL: str = ""
-    KV_REST_API_TOKEN: str = ""
-    UPSTASH_REDIS_REST_URL: str = ""
-    UPSTASH_REDIS_REST_TOKEN: str = ""
-    REDIS_URL: str = ""
-    # Namespace for every key this app writes. ``clear()`` only ever deletes
-    # keys under this prefix, so a shared Redis instance is never wiped.
-    REDIS_KEY_PREFIX: str = "detomsite:"
-    # Per-call socket timeout. Kept short: a cache must never be slower than
-    # the query it is trying to avoid.
-    REDIS_TIMEOUT_SECONDS: float = 1.5
-    # Circuit breaker — after N consecutive failures the cache stops being
-    # tried for the cooldown, so an outage cannot add a timeout to every read.
-    REDIS_BREAKER_FAILURES: int = 5
-    REDIS_BREAKER_COOLDOWN_SECONDS: float = 30.0
 
     # ─── Bounded waits (a slow dependency must never pin a request) ───
     # Server-side cap on a single Postgres statement. Without it a query that
@@ -146,7 +121,7 @@ class Settings(BaseSettings):
     # through to the real loader. This enforces the rule this module already
     # documents: a cache must never take the portal down, nor be slower than
     # the query it exists to avoid.
-    CACHE_LOOKUP_TIMEOUT_SECONDS: float = 2.0
+    CACHE_LOOKUP_TIMEOUT_SECONDS: float = 0.2
 
     # SMS-forwarder agent auth. The Android app posts bank credit SMS to
     # ``/sms/incoming``; it must send ``X-Agent-Key: <SMS_FORWARD_KEY>`` so a
@@ -179,10 +154,35 @@ class Settings(BaseSettings):
     DEFAULT_SUPER_ADMIN_EMAIL: str = ""
     DEFAULT_SUPER_ADMIN_PASSWORD: str = ""
     
-    # Cloudinary
+    # Cloudinary — primary image/file storage. Secrets stay server-side;
+    # the frontend only ever receives secure delivery URLs.
     CLOUDINARY_CLOUD_NAME: str = ""
     CLOUDINARY_API_KEY: str = ""
     CLOUDINARY_API_SECRET: str = ""
+    # Folder prefix for every asset this app uploads (payment screenshots go
+    # to <prefix>/payments/<order_id>/).
+    CLOUDINARY_FOLDER_PREFIX: str = "detomsite"
+    # Payment screenshot upload guard (also enforced in the frontend).
+    PAYMENT_SCREENSHOT_MAX_MB: int = 5
+
+    # Telegram admin notifications — bot token and admin chat stay server-side.
+    # Created via BotFather; chat id from getUpdates after the admin messages
+    # the bot once.
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_ADMIN_CHAT_ID: str = ""
+    # Admin portal base URL for the Telegram "VIEW ORDER" button. The admin
+    # portal is a separate deployment from the student frontend, so this
+    # defaults to FRONTEND_URL only when unset. The button opens
+    # <base>/admin/orders/<orderId> on the legacy portal, or
+    # <base>/orders/<orderId> on the split admin portal (see ADMIN_ORDER_PATH).
+    ADMIN_PORTAL_URL: str = ""
+    # Path (under FRONTEND_URL) the Telegram "VIEW ORDER" button opens.
+    ADMIN_ORDER_PATH: str = "/admin/orders"
+    # Inbound Telegram webhook (lets the bot answer /start, /help, /status).
+    # Register with: setWebhook?url=<BACKEND_URL>/api/v1/local/telegram/webhook
+    # When set, Telegram must send it back as X-Telegram-Bot-Api-Secret-Token
+    # (pass secret_token=... in the setWebhook call) or updates are refused.
+    TELEGRAM_WEBHOOK_SECRET: str = ""
     
     # Razorpay
     RAZORPAY_KEY_ID: str = ""
@@ -211,6 +211,7 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     SMTP_FROM: str = "DETOMSITE <no-reply@detomsite.local>"
     SMTP_USE_TLS: bool = True
+    SMTP_TIMEOUT_SECONDS: int = 15
 
     # Resend (https://resend.com) — preferred delivery path for the OTP / reset
     # emails. When RESEND_API_KEY is set, the email service sends via the Resend

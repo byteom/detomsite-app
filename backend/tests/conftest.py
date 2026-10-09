@@ -99,15 +99,25 @@ _INTENTIONALLY_PUBLIC = (
     "/api/v1/local/student-notice",
     "/api/v1/local/announcements",
     "/api/v1/local/batch",
+    "/api/v1/local/home-feed",
+    "/api/v1/local/checkout-data",
     "/api/v1/local/feedback",
+    # Telegram inbound webhook: called by Telegram's servers (not portal
+    # users), authenticated by the shared webhook secret header instead of a
+    # JWT — same pattern as the payment gateway callbacks below.
+    "/api/v1/local/telegram/webhook",
     "/api/v1/users/login",
     "/api/v1/users/register",
     "/api/v1/users/forgot-password",
     "/api/v1/users/forgot-username",
     "/api/v1/users/reset-password",
     "/api/v1/admin/login",
+    "/api/v1/admin/forgot-password",
+    "/api/v1/admin/reset-password",
     "/api/v1/vendor/login",
     "/api/v1/vendor/register",
+    "/api/v1/vendor/forgot-password",
+    "/api/v1/vendor/reset-password",
     "/health",
     # Root is a liveness/welcome route: app name + version, no data. Keeping it
     # open is what lets a load balancer and a human "is it up?" check work.

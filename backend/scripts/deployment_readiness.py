@@ -38,7 +38,8 @@ def main() -> int:
     requirements = read("backend/requirements.txt")
     checks.append(("backend requirements include psycopg2 (Supabase)", "psycopg2" in requirements, "psycopg2 missing"))
     checks.append(("Supabase store exists", (ROOT / "backend/app/core/supabase_db.py").exists(), "supabase_db.py missing"))
-    checks.append(("Render config exists", (ROOT / "backend/render.yaml").exists(), "render.yaml missing"))
+    render_ok = (ROOT / "render.yaml").exists() or (ROOT / "backend/render.yaml").exists()
+    checks.append(("Render config exists", render_ok, "render.yaml missing (checked render.yaml and backend/render.yaml)"))
     checks.append(("Keep-alive script exists", (ROOT / "backend/scripts/keep_alive.py").exists(), "keep_alive.py missing"))
 
     # Each portal

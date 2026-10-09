@@ -88,7 +88,9 @@ export function CustomerDashboard() {
     // "Could not load your data" even on a perfectly good connection).
     // Failures still surface a notice (with a dismiss) instead of failing
     // silently and leaving a permanently empty orders list.
-    api.get<LocalParentOrder[]>('/local/orders/parent')
+    // Bounded to the 20 most recent orders — the dashboard renders recent
+    // activity, not full history (full history lives on /previous-orders).
+    api.get<LocalParentOrder[]>('/local/orders/parent', { params: { limit: 20 } })
       .then(o => { setOrders(cur => same(cur, o.data) ? cur : o.data); setNotice(null) })
       .catch(() => setNotice({ kind: 'error', text: 'Could not load your orders — check your connection and try again.' }))
     api.get<LocalTicket[]>('/local/tickets')
@@ -96,9 +98,11 @@ export function CustomerDashboard() {
       .catch(() => { /* tickets are secondary; orders notice already covers outages */ })
   }, [])
 
-  // Poll every 10s while this tab is visible; background tabs pause and refresh
+  // Poll every 15s while this tab is visible (was 10s — order status changes
+  // on the minute scale, and the server cache TTL is 10s, so 10s polling
+  // re-hit the DB on nearly every tick); background tabs pause and refresh
   // instantly when you switch back.
-  usePolling(load, 10000, [load])
+  usePolling(load, 15000, [load])
 
   // The backend returns account-owned orders; never guess ownership by contact details.
   const myOrders = orders

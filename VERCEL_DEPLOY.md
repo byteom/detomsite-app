@@ -20,9 +20,11 @@ detomsite/
 | Admin portal | `https://detomsite-admin.vercel.app` |
 | Shopkeeper portal | `https://detomsite-shopkeeper.vercel.app` |
 
-> All four projects are linked to this GitHub repo, so **pushing to `master`
-> deploys all four automatically**. The Render / OnRender host that older docs
-> mention (`*.onrender.com`) is retired — nothing should point at it.
+> Hybrid deploy (current): **backend on Render** (`https://<service>.onrender.com`,
+> kept awake by cron-job.org hitting `/health` every 3 min), **3 portals on
+> Vercel**. The `*.vercel.app` backend URL below is the no-sleep alternative —
+> either backend works, portals allow both (CSP `connect-src` covers
+> `vercel.app` + `*.onrender.com`; set `VITE_API_URL` to whichever you use).
 
 > The top-level `student/`, `admin/`, `shopkeeper/` folders in the repo are
 > **local-only duplicates** and are NOT deployed.

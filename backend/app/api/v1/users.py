@@ -14,6 +14,7 @@ from app.core.store import store as db
 from app.core.security import hash_password, verify_password, create_access_token, create_refresh_token, decode_token
 from app.services.email_service import EmailService, email_delivery_configured
 from app.core.rate_limit import allow as rate_allow, reset as rate_reset, client_ip as rate_ip
+from app.core.db_executor import run_db
 
 logger = logging.getLogger(__name__)
 
@@ -40,47 +41,15 @@ def _validate_student_email(email: str) -> Optional[str]:
     return None
 
 
-def _generate_otp() -> str:
-    """A 6-digit numeric code."""
-    return f"{secrets.randbelow(1_000_000):06d}"
-
-
-async def _find_user_for_reset(identifier: str) -> Optional[dict]:
-    """Resolve a username OR email to a user record (email preferred when it
-    looks like one, since usernames are case-insensitive too)."""
-    identifier = (identifier or "").strip()
-    if not identifier:
-        return None
-    user = None
-    if "@" in identifier:
-        user = await asyncio.to_thread(db.get_user_by_email, identifier)
-    if not user:
-        user = await asyncio.to_thread(db.get_user_by_username, identifier)
-    return user
-
-
-async def _send_reset_otp(user: dict) -> None:
-    """Generate + store a fresh OTP for this user and email it.
-    The code is only ever delivered by email — never returned to the client.
-    Admin accounts carry a placeholder DB email (admin@detomsite.local) because
-    DEFAULT_SUPER_ADMIN_EMAIL is usually already claimed by another role's
-    account, so admin reset codes go straight to DEFAULT_SUPER_ADMIN_EMAIL."""
-    otp = _generate_otp()
-    await asyncio.to_thread(db.create_password_reset, user["username"], otp, 1)
-    admin_email = (settings.DEFAULT_SUPER_ADMIN_EMAIL or "").strip()
-    to_email = (
-        admin_email
-        if user.get("role") == "admin" and admin_email
-        else (user.get("email") or f"{user['username']}@campus.local")
-    )
-    # Return whether the code actually LEFT the server. The caller reports
-    # success to the user, so this must be the real delivery result rather than
-    # a hard-coded True (see the unconfigured branch of _send_smtp).
-    return await EmailService.send_otp_email(
-        to_email,
-        otp,
-        purpose="password reset",
-    )
+# Thin re-exports of the shared password-reset service (one flow for every
+# portal — see app/services/password_reset_service.py). Kept here so the
+# existing imports/tests keep working.
+from app.services.password_reset_service import (  # noqa: E402,F401
+    GENERIC_SENT_MESSAGE,
+    find_user_for_reset as _find_user_for_reset,
+    generate_otp as _generate_otp,
+    send_reset_otp as _send_reset_otp,
+)
 
 
 # ─── Schemas ───
@@ -145,7 +114,10 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     user_id = payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=401, detail="Invalid token payload")
-    user = db.get_user_by_id(int(user_id))
+    # All store methods are synchronous (psycopg2/SQLite). Never run them on
+    # FastAPI's event loop: a slow pool checkout or database query otherwise
+    # stalls every request handled by that worker.
+    user = await run_db(db.get_user_by_id, int(user_id))
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     if user["role"] != "student":
@@ -163,8 +135,12 @@ async def register(data: UserRegisterRequest):
     if domain_error:
         raise HTTPException(status_code=400, detail=domain_error)
 
-    password_hash = hash_password(data.password)
-    user, conflict = db.register_user(
+    # bcrypt is intentionally CPU-expensive. Keep both hashing and the sync
+    # store call off the event loop so one registration cannot pause unrelated
+    # reads and polling requests on the same worker.
+    password_hash = await asyncio.to_thread(hash_password, data.password)
+    user, conflict = await asyncio.to_thread(
+        db.register_user,
         username=data.username,
         password_hash=password_hash,
         name=data.name,
@@ -179,7 +155,7 @@ async def register(data: UserRegisterRequest):
         raise HTTPException(status_code=409, detail="This email is already registered. Try signing in instead.")
     # Record registration for admin notification
     try:
-        db.record_registration(user)
+        await run_db(db.record_registration, user)
     except Exception as e:
         logger.warning(f"Could not record registration: {e}")
 
@@ -187,7 +163,7 @@ async def register(data: UserRegisterRequest):
 
 
 # ─── Forgot password — single emailed OTP ───
-# Step 1: request a reset with your username/email → a 6-digit OTP is emailed.
+# Step 1: request a reset with your username/email → a 4-digit OTP is emailed.
 # Step 2: enter that OTP + your new password → the code is verified and the
 # password is updated in the DB.
 # The code is sent ONCE and is never shown in the UI or API response.
@@ -200,30 +176,21 @@ class ForgotPasswordRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     identifier: str = Field(..., min_length=2, max_length=120)
     otp: str = Field(..., min_length=4, max_length=10)
-    new_password: str = Field(..., min_length=4, max_length=128)
+    new_password: str = Field(..., min_length=8, max_length=128)
 
 
 @router.post("/forgot-password")
 async def forgot_password(data: ForgotPasswordRequest):
-    """Send the single 6-digit OTP to the account's registered email.
-    The response never reveals whether an account exists (account enumeration
-    protection) — the code is only ever delivered by email, never shown in
-    the UI or returned in the API response.
+    """Student password recovery — send the 4-digit OTP to the registered email.
 
-    PENTEST/RELIABILITY FIX. This used to answer "a 6-digit code was sent to
-    your registered email" even when the deployment had NO mail provider at all
-    — the code was only written to the server log, so the user waited for an
-    email that could never arrive, and the API insisted it had worked. That is
-    the whole reason forgot-password looked broken with nothing to fix.
-
-    When no provider is configured we now say so with a 503. That reveals
-    nothing about the account: it is a property of the SERVER, so an unknown
-    identifier gets the identical answer.
+    Role-locked: only ``student`` accounts are served here. Shopkeeper/admin
+    identifiers get the same generic answer (no enumeration oracle) — they
+    must use their own portal's /forgot-password route.
     """
     if not email_delivery_configured():
         logger.error(
-            "forgot-password requested but no email provider is configured "
-            "(set RESEND_API_KEY or SMTP_HOST) — the reset code cannot be sent"
+            "student forgot-password requested but no email provider is configured "
+            "(set SMTP_HOST or RESEND_API_KEY) — the reset code cannot be sent"
         )
         raise HTTPException(
             status_code=503,
@@ -234,9 +201,10 @@ async def forgot_password(data: ForgotPasswordRequest):
         )
 
     user = await _find_user_for_reset(data.identifier)
-    if not user:
-        # Same response either way — don't leak which usernames exist.
-        return {"message": "If that account exists, a verification code was sent to its email.", "step": 1}
+    if not user or user.get("role") != "student":
+        # Same response either way — don't leak which usernames exist or which
+        # portal they belong to.
+        return {"message": GENERIC_SENT_MESSAGE, "step": 1}
 
     delivered = await _send_reset_otp(user)
     if not delivered:
@@ -247,7 +215,7 @@ async def forgot_password(data: ForgotPasswordRequest):
             detail="We could not send the reset email. Please try again shortly.",
         )
     return {
-        "message": "A 6-digit code was sent to your registered email. Enter it below to set a new password.",
+        "message": "A 4-digit code was sent to your registered email. Enter it below to set a new password.",
         "step": 1,
         "expires_minutes": settings.RESET_OTP_EXPIRE_MINUTES,
     }
@@ -255,24 +223,19 @@ async def forgot_password(data: ForgotPasswordRequest):
 
 @router.post("/reset-password")
 async def reset_password(data: ResetPasswordRequest):
-    """Validate the emailed code and set the new password (updates the DB)."""
+    """Validate the emailed OTP and set the new password (student accounts)."""
+    from app.services.password_reset_service import verify_otp_and_reset
+
     user = await _find_user_for_reset(data.identifier)
-    if not user:
+    if not user or user.get("role") != "student":
         raise HTTPException(status_code=400, detail="Invalid code. Please try again.")
 
-    reset = await asyncio.to_thread(db.get_password_reset, user["username"], data.otp.strip(), 1)
-    if not reset:
-        # Count the wrong guess — after 5 the code locks out (brute-force guard).
-        await asyncio.to_thread(db.bump_password_reset_attempts, user["username"])
-        raise HTTPException(status_code=400, detail="Invalid or expired code. Please request a new one.")
+    password_hash = await asyncio.to_thread(hash_password, data.new_password)
+    ok, error = await verify_otp_and_reset(data.identifier, data.otp, password_hash)
+    if not ok:
+        status = 500 if error.startswith("Could not ") else 400
+        raise HTTPException(status_code=status, detail=error)
 
-    password_hash = hash_password(data.new_password)
-    updated = await asyncio.to_thread(db.update_user_password, user["username"], password_hash)
-    if not updated:
-        raise HTTPException(status_code=500, detail="Could not update the password. Please try again.")
-
-    await asyncio.to_thread(db.invalidate_password_resets, user["username"])
-    logger.info(f"Password reset completed for user: {user['username']}")
     return {"message": "Password updated successfully! You can now sign in with your new password."}
 
 
@@ -295,7 +258,7 @@ async def forgot_username(data: ForgotUsernameRequest):
     a placeholder DB email, so their reminder is routed to
     DEFAULT_SUPER_ADMIN_EMAIL like the password-reset flow."""
     email = (data.email or "").strip()
-    user = await asyncio.to_thread(db.get_user_by_email, email) if email else None
+    user = await run_db(db.get_user_by_email, email) if email else None
     if user:
         admin_email = (settings.DEFAULT_SUPER_ADMIN_EMAIL or "").strip()
         to_email = (
@@ -322,12 +285,15 @@ async def login(data: UserLoginRequest, request: Request):
     if not rate_allow("login", f"{data.username}:{ip}", max_attempts=40, window_sec=300):
         raise HTTPException(status_code=429, detail="Too many sign-in attempts — please wait a few minutes and try again.")
 
-    user = db.get_user_by_username(data.username)
+    user = await run_db(db.get_user_by_username, data.username)
     # PENTEST FIX: identical message for "no such user" and "wrong password",
     # and the password is checked BEFORE the role hint — otherwise the distinct
     # 401/403 replies let an attacker enumerate which usernames exist.
     bad_credentials = "Invalid username or password."
-    if not user or not verify_password(data.password, user["password_hash"]):
+    valid_password = bool(user) and await asyncio.to_thread(
+        verify_password, data.password, user["password_hash"] if user else ""
+    )
+    if not valid_password:
         raise HTTPException(status_code=401, detail=bad_credentials)
     if user["role"] != "student":
         raise HTTPException(status_code=403, detail=f"This account is a {user['role']} account — please sign in from the {user['role']} portal instead.")
@@ -357,12 +323,16 @@ async def login(data: UserLoginRequest, request: Request):
 @router.get("/dashboard")
 async def dashboard(current_user: dict = Depends(get_current_user)):
     """Get student dashboard with approved shops and orders."""
-    shops = db.list_shops(public_only=True)
-    all_orders = db.list_orders()
-    # Filter orders belonging to this user (by name match for simplicity)
-    my_orders = [o for o in all_orders if o.get("student_name", "").lower() == current_user["name"].lower()]
-    active_orders = [o for o in my_orders if o["status"] not in ("Completed", "Cancelled")]
-    total_spent = sum(o["total"] for o in my_orders)
+    shops, my_orders = await asyncio.gather(
+        run_db(db.list_shops, public_only=True),
+        asyncio.to_thread(
+            db.list_orders_by_user_id,
+            str(current_user.get("id", "")),
+            student_name=current_user.get("name"),
+        ),
+    )
+    active_orders = [o for o in my_orders if o.get("status") not in ("Completed", "Cancelled")]
+    total_spent = sum(o.get("total", 0) for o in my_orders)
 
     return {
         "user": current_user,
@@ -380,22 +350,23 @@ async def dashboard(current_user: dict = Depends(get_current_user)):
 @router.get("/shops")
 async def list_shops():
     """List all approved shops visible to students."""
-    shops = db.list_shops(public_only=True)
-    return shops
+    return await run_db(db.list_shops, public_only=True)
 
 
 @router.get("/orders")
 async def student_orders(current_user: dict = Depends(get_current_user)):
     """Get student's orders."""
-    all_orders = db.list_orders()
-    my_orders = [o for o in all_orders if o.get("student_name", "").lower() == current_user["name"].lower()]
-    return my_orders
+    return await asyncio.to_thread(
+        db.list_orders_by_user_id,
+        str(current_user.get("id", "")),
+        student_name=current_user.get("name"),
+    )
 
 
 @router.post("/reviews")
 async def create_review(data: ReviewCreate, current_user: dict = Depends(get_current_user)):
     """Create a review for a shop — saved to the reviews table."""
-    review = db.create_review({
+    review = await run_db(db.create_review, {
         "user_id": current_user["id"],
         "username": current_user["username"],
         "student_name": current_user["name"],
@@ -411,7 +382,7 @@ async def create_review(data: ReviewCreate, current_user: dict = Depends(get_cur
 @router.get("/reviews")
 async def list_reviews(current_user: dict = Depends(get_current_user)):
     """Get reviews by this student."""
-    return db.list_reviews_by_user(current_user["id"])
+    return await run_db(db.list_reviews_by_user, current_user["id"])
 
 
 @router.get("/profile")
@@ -423,4 +394,21 @@ async def profile(current_user: dict = Depends(get_current_user)):
 @router.put("/profile")
 async def update_profile(data: dict, current_user: dict = Depends(get_current_user)):
     """Update student profile."""
-    return {"message": "Profile updated", "user": current_user}
+    allowed = {"name", "email", "phone"}
+    updates = {
+        key: str(value).strip()
+        for key, value in data.items()
+        if key in allowed and value is not None
+    }
+    if any(len(value) > 120 for value in updates.values()):
+        raise HTTPException(status_code=422, detail="Profile fields are too long")
+    updated = await asyncio.to_thread(
+        db.update_user_profile,
+        current_user["id"],
+        name=updates.get("name"),
+        email=updates.get("email"),
+        phone=updates.get("phone"),
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"message": "Profile updated", "user": updated}

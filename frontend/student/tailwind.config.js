@@ -3,6 +3,14 @@ export default {
   content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
   theme: {
     extend: {
+      borderRadius: {
+        'sm': '6px',
+        'btn': '8px',
+        'input': '8px',
+        'card': '12px',
+        'panel': '16px',
+        'pill': '9999px',
+      },
       colors: {
         primary: {
           DEFAULT: '#15803D',
@@ -43,14 +51,6 @@ export default {
         'dropdown': '0 8px 24px rgba(15, 23, 42, 0.12)',
         'toast': '0 8px 24px rgba(15, 23, 42, 0.12)',
       },
-      borderRadius: {
-        'sm': '6px',
-        'btn': '8px',
-        'input': '8px',
-        'card': '12px',
-        'panel': '16px',
-        'pill': '9999px',
-      },
       spacing: {
         '18': '4.5rem',
         '88': '22rem',
@@ -71,6 +71,8 @@ export default {
       animation: {
         'fade-in': 'fadeIn 0.2s ease-out forwards',
         'slide-up': 'slideUp 0.2s ease-out forwards',
+        'pulse-subtle': 'pulseSubtle 2s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+        'shimmer': 'shimmer 1.5s infinite',
       },
       keyframes: {
         fadeIn: {
@@ -80,6 +82,13 @@ export default {
         slideUp: {
           from: { opacity: '0', transform: 'translateY(4px)' },
           to: { opacity: '1', transform: 'translateY(0)' },
+        },
+        pulseSubtle: {
+          '0%, 100%': { opacity: '1', transform: 'scale(1)' },
+          '50%': { opacity: '0.6', transform: 'scale(0.96)' },
+        },
+        shimmer: {
+          '100%': { transform: 'translateX(100%)' },
         },
       },
     },

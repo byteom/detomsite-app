@@ -37,12 +37,12 @@ def matching(monkeypatch):
 
 
 async def test_saved_utr_selects_older_order_not_newest_amount(matching):
-    # Direct (non-HTTP) call: request=None skips the per-IP failure throttle
-    # (which only exists to slow brute-force over the network).
-    result = await local.sms_match(local.LocalSmsMatch(phone="9876543210", utr="123456789012", amount=80), None, x_agent_key="test-key")
-    assert result["order_id"] == "older"
-    assert result["matched_by"] == "utr_claim"
-    assert local._notify_shop_via_whatsapp.await_args.args[0]["id"] == "older"
+    """CUT OFF — the route answers 410 after the agent gate instead of
+    matching: no bank message may settle an order anymore (manual admin
+    verification is the only settlement path)."""
+    with pytest.raises(HTTPException) as exc:
+        await local.sms_match(local.LocalSmsMatch(phone="9876543210", utr="123456789012", amount=80), None, x_agent_key="test-key")
+    assert exc.value.status_code == 410
 
 
 @pytest.mark.parametrize("case", ["missing", "duplicate", "other_shop", "wrong_amount", "already_paid", "cod"])
@@ -70,28 +70,20 @@ def test_non_credit_or_unlabelled_reference_is_not_proof(text):
 
 
 async def test_qr_credit_with_no_utr_settles_the_order(matching):
-    """The QR-checkout flow: the student scans and pays, so there is NO reference
-    to claim. A credit SMS with no UTR must still settle the order via tier 2 —
-    this is the case the bot used to drop on the floor with `?: return`."""
-    from datetime import datetime, timedelta, timezone
+    """CUT OFF — tier-2 amount matching no longer settles QR orders: the same
+    credit now gets an explicit 410 and writes nothing."""
+    from datetime import datetime, timezone
     orders, payments, writes = matching
-    # Tier 2 only settles a RECENT order (BANK_MATCH_WINDOW_MINUTES), so the
-    # shared fixture's fixed 2026-09-17 timestamps are aged to "now" here.
     now = datetime.now(timezone.utc).isoformat()
     for o in orders:
         o["created_at"] = now
-    # QR checkout records an empty utr_number on the payment row.
     payments[0]["utr_number"] = ""
-    result = await local.sms_match(
-        local.LocalSmsMatch(phone="9876543210", utr="", amount=80), None, x_agent_key="test-key"
-    )
-    assert result["order_status"] == "Completed"
-    assert result["matched_by"] == "bank_credit"
-    # The order is actually marked paid, not just reported as matched.
-    assert ("update_order_status", ("older", "Completed"), {}) in writes
-    # The fake db's set_payment_utr returns {"id": "result"}, so the settled
-    # payment id is the stamped one — assert the status write happened, not its id.
-    assert any(w[0] == "update_payment_status" and w[1][1] == "Success" for w in writes)
+    with pytest.raises(HTTPException) as exc:
+        await local.sms_match(
+            local.LocalSmsMatch(phone="9876543210", utr="", amount=80), None, x_agent_key="test-key"
+        )
+    assert exc.value.status_code == 410
+    assert not writes
 
 
 async def test_empty_utr_never_claims_another_customers_order(matching):
@@ -114,27 +106,19 @@ async def test_empty_utr_never_claims_another_customers_order(matching):
 
 
 async def test_a_replayed_no_utr_credit_cannot_settle_twice(matching):
-    """Without a UTR there is no unique index to burn the credit, so the synthetic
-    burn marker must stop the same SMS settling a second order."""
+    """CUT OFF — with no settlement path left, replaying a credit is a 410
+    that writes nothing (the burn-marker machinery is retired with the bot)."""
     from datetime import datetime, timezone
     orders, payments, writes = matching
     for o in orders:
         o["created_at"] = datetime.now(timezone.utc).isoformat()
     payments[0]["utr_number"] = ""
-    await local.sms_match(
-        local.LocalSmsMatch(phone="9876543210", utr="", amount=80), None, x_agent_key="test-key"
-    )
-    # The burn marker was stamped so the settled row is traceable.
-    stamped = [w for w in writes if w[0] == "set_payment_utr"]
-    assert stamped and stamped[0][1][1].startswith("SMS-")
-    # Replaying the same credit now finds the payment already Success → refused.
-    payments[0]["status"] = "Success"
-    writes.clear()
-    with pytest.raises(HTTPException):
+    with pytest.raises(HTTPException) as exc:
         await local.sms_match(
             local.LocalSmsMatch(phone="9876543210", utr="", amount=80), None, x_agent_key="test-key"
         )
-    assert not any(w[0] == "update_order_status" for w in writes)
+    assert exc.value.status_code == 410
+    assert not writes
 
 
 async def test_malformed_utr_is_still_refused(matching):

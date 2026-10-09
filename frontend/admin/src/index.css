@@ -1,31 +1,43 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  --primary: #15803D;
-  --primary-dark: #166534;
-  --primary-light: #DCFCE7;
-  --gold: #D4A017;
-  --gold-light: #FEF3C7;
-  --gold-dark: #A16207;
-  --bg: #F8FAFC;
-  --surface: #FFFFFF;
-  --text-primary: #111827;
-  --text-secondary: #64748B;
+  --admin-radius: 0px;
+
+  /* LIGHT THEME: Clean, high-contrast, professional enterprise UI */
+  --bg-page: #F4F6F4;
+  --bg-surface: #FFFFFF;
+  --bg-surface-hover: #F0F4F1;
+  --bg-surface-subtle: #F8FAF8;
+  --border-main: #CBD5E1;
+  --border-subtle: #E2E8F0;
+  --text-heading: #0F172A;
+  --text-body: #1E293B;
+  --text-muted: #475569;
+  --text-dim: #64748B;
+  --brand-green: #15803D;
+  --brand-emerald: #10B981;
+  color-scheme: light;
+}
+
+.dark {
+  /* DARK THEME: Rich obsidian-slate with emerald accent */
+  --bg-page: #090D0B;
+  --bg-surface: #111713;
+  --bg-surface-hover: #161F1A;
+  --bg-surface-subtle: #141C16;
+  --border-main: #1E2B22;
+  --border-subtle: #152219;
+  --text-heading: #F8FAFC;
+  --text-body: #E2E8F0;
   --text-muted: #94A3B8;
-  --border: #E2E8F0;
-  --divider: #F1F5F9;
-  --success: #16A34A;
-  --success-bg: #DCFCE7;
-  --warning: #D97706;
-  --warning-bg: #FEF3C7;
-  --error: #DC2626;
-  --error-bg: #FEE2E2;
-  --info: #2563EB;
-  --info-bg: #DBEAFE;
+  --text-dim: #64748B;
+  --brand-green: #15803D;
+  --brand-emerald: #10B981;
+  color-scheme: dark;
 }
 
 * {
@@ -34,56 +46,318 @@
   box-sizing: border-box;
 }
 
+/* Centralized rectangular token enforcement for the UI */
+button,
+input,
+select,
+textarea,
+.card,
+.badge,
+.modal,
+[class*="rounded"] {
+  border-radius: var(--admin-radius, 0px) !important;
+}
+
 html {
   scroll-behavior: smooth;
+  background-color: var(--bg-page);
 }
 
 body {
   font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background: var(--bg);
-  color: var(--text-primary);
+  background-color: var(--bg-page);
+  color: var(--text-body);
   min-height: 100vh;
+}
+
+/* Base typography defaults guarantee full readability in both light & dark modes */
+h1, h2, h3, h4, h5, h6 {
+  color: var(--text-heading);
+}
+
+/* Global Form Controls Styling: Dropdowns, Dates, Inputs, Textareas */
+select {
+  background-color: var(--bg-surface);
+  color: var(--text-heading);
+  border-color: var(--border-main);
+}
+
+select option {
+  background-color: var(--bg-surface);
+  color: var(--text-heading);
+}
+
+input,
+textarea {
+  background-color: var(--bg-surface);
+  color: var(--text-heading);
+  border-color: var(--border-main);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-dim);
+}
+
+/* Ensure native date, time, and datetime-local pickers adapt icons & calendars to theme */
+input[type="date"],
+input[type="time"],
+input[type="datetime-local"] {
+  background-color: var(--bg-surface);
+  color: var(--text-heading);
+}
+
+.dark input[type="date"],
+.dark input[type="time"],
+.dark input[type="datetime-local"] {
+  color-scheme: dark;
+}
+
+:root:not(.dark) input[type="date"],
+:root:not(.dark) input[type="time"],
+:root:not(.dark) input[type="datetime-local"],
+.light input[type="date"],
+.light input[type="time"],
+.light input[type="datetime-local"] {
+  color-scheme: light;
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator,
+input[type="time"]::-webkit-calendar-picker-indicator,
+input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+  cursor: pointer;
+  opacity: 0.8;
+  transition: opacity 0.15s ease;
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator:hover,
+input[type="time"]::-webkit-calendar-picker-indicator:hover,
+input[type="datetime-local"]::-webkit-calendar-picker-indicator:hover {
+  opacity: 1;
+}
+
+.dark input[type="date"]::-webkit-calendar-picker-indicator,
+.dark input[type="time"]::-webkit-calendar-picker-indicator,
+.dark input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+  filter: invert(0.9) brightness(1.2);
+}
+
+:root:not(.dark) input[type="date"]::-webkit-calendar-picker-indicator,
+:root:not(.dark) input[type="time"]::-webkit-calendar-picker-indicator,
+:root:not(.dark) input[type="datetime-local"]::-webkit-calendar-picker-indicator,
+.light input[type="date"]::-webkit-calendar-picker-indicator,
+.light input[type="time"]::-webkit-calendar-picker-indicator,
+.light input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+  filter: invert(0.2);
 }
 
 #root {
   min-height: 100vh;
+  background-color: var(--bg-page);
 }
 
-::selection {
-  background: var(--primary-light);
-  color: var(--primary-dark);
-}
-
+/* Custom scrollbars for desktop */
 ::-webkit-scrollbar {
   width: 6px;
+  height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: var(--bg);
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #CBD5E1;
-  border-radius: 3px;
+  background: rgba(148, 163, 184, 0.25);
+  border-radius: 0px;
 }
 
-button {
-  transition: all 150ms ease-out;
-  cursor: pointer;
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.45);
 }
 
-button:active {
-  transform: scale(0.98);
+/* Mobile no-scrollbar utility - scrollable without showing scrollbars */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
 }
 
-input, select, textarea {
-  transition: border-color 150ms ease-out, box-shadow 150ms ease-out;
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
 }
 
-input:focus, select:focus, textarea:focus {
+/* Input focus states with emerald glow */
+input:focus,
+select:focus,
+textarea:focus {
   outline: none;
-  border-color: var(--primary) !important;
-  box-shadow: 0 0 0 3px rgba(21, 128, 61, 0.12);
+  border-color: #10B981 !important;
+  box-shadow: 0 0 0 1px #10B981 !important;
 }
+
+/* Monospace tabular numbers for tables, prices, IDs */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ==========================================================================
+   VIBRANT HIGH-CONTRAST SOLID BADGES & CHIPS
+   Engineered for 100% legibility & visual clarity in both Light & Dark modes.
+   Replaces murky alpha overlays with rich, colorful, WCAG AAA compliant palettes.
+   ========================================================================== */
+
+.badge-solid-base {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  border-width: 1px;
+  border-style: solid;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  font-weight: 700;
+  white-space: nowrap;
+  line-height: 1.25;
+  transition: all 0.15s ease;
+}
+
+/* 1. SUCCESS / STUDENT / COMPLETED (Mint Green) */
+.badge-solid-success {
+  background-color: #DCFCE7 !important;
+  border-color: #4ADE80 !important;
+  color: #14532D !important;
+}
+.dark .badge-solid-success {
+  background-color: #064E3B !important;
+  border-color: #059669 !important;
+  color: #D1FAE5 !important;
+}
+
+/* 2. INFO / SHOPKEEPER / ACCEPTED (Royal Sapphire Blue) */
+.badge-solid-info {
+  background-color: #DBEAFE !important;
+  border-color: #60A5FA !important;
+  color: #1E3A8A !important;
+}
+.dark .badge-solid-info {
+  background-color: #172554 !important;
+  border-color: #2563EB !important;
+  color: #DBEAFE !important;
+}
+
+/* 3. GOLD / COD / PENDING SETTLEMENT (Warm Honey Gold) */
+.badge-solid-gold {
+  background-color: #FEF3C7 !important;
+  border-color: #F59E0B !important;
+  color: #78350F !important;
+}
+.dark .badge-solid-gold {
+  background-color: #451A03 !important;
+  border-color: #D97706 !important;
+  color: #FEF3C7 !important;
+}
+
+/* 4. WARNING / PENDING ACCEPTANCE (Vivid Tangerine Flame) */
+.badge-solid-warning,
+.badge-solid-orange {
+  background-color: #FFEDD5 !important;
+  border-color: #FB923C !important;
+  color: #7C2D12 !important;
+}
+.dark .badge-solid-warning,
+.dark .badge-solid-orange {
+  background-color: #431407 !important;
+  border-color: #EA580C !important;
+  color: #FFEDD5 !important;
+}
+
+/* 5. PURPLE / ADMIN / SUPER-ADMIN (Royal Violet & Lilac) */
+.badge-solid-purple {
+  background-color: #F3E8FF !important;
+  border-color: #C084FC !important;
+  color: #581C87 !important;
+}
+.dark .badge-solid-purple {
+  background-color: #2E1065 !important;
+  border-color: #7E22CE !important;
+  color: #F3E8FF !important;
+}
+
+/* 6. CYAN / UPI / ONLINE PAYMENT (Electric Ice Cyan) */
+.badge-solid-cyan {
+  background-color: #E0F2FE !important;
+  border-color: #38BDF8 !important;
+  color: #0C4A6E !important;
+}
+.dark .badge-solid-cyan {
+  background-color: #082F49 !important;
+  border-color: #0284C7 !important;
+  color: #E0F2FE !important;
+}
+
+/* 7. ERROR / REJECTED / CANCELLED (Ruby Crimson) */
+.badge-solid-error {
+  background-color: #FEE2E2 !important;
+  border-color: #F87171 !important;
+  color: #7F1D1D !important;
+}
+.dark .badge-solid-error {
+  background-color: #450A0A !important;
+  border-color: #DC2626 !important;
+  color: #FEE2E2 !important;
+}
+
+/* 8. DEFAULT / STAT COUNTER (Solid Clean Slate) */
+.badge-solid-default {
+  background-color: #F1F5F9 !important;
+  border-color: #CBD5E1 !important;
+  color: #0F172A !important;
+}
+.dark .badge-solid-default {
+  background-color: #1E293B !important;
+  border-color: #334155 !important;
+  color: #F8FAFC !important;
+}
+
+/* 9. NEUTRAL (Subtle Slate) */
+.badge-solid-neutral {
+  background-color: #F8FAFC !important;
+  border-color: #E2E8F0 !important;
+  color: #475569 !important;
+}
+.dark .badge-solid-neutral {
+  background-color: #0F172A !important;
+  border-color: #1E293B !important;
+  color: #94A3B8 !important;
+}
+
+/* Dots inside badges */
+.badge-solid-success .badge-dot { background-color: #16A34A !important; }
+.dark .badge-solid-success .badge-dot { background-color: #34D399 !important; }
+
+.badge-solid-info .badge-dot { background-color: #2563EB !important; }
+.dark .badge-solid-info .badge-dot { background-color: #60A5FA !important; }
+
+.badge-solid-gold .badge-dot { background-color: #D97706 !important; }
+.dark .badge-solid-gold .badge-dot { background-color: #FBBF24 !important; }
+
+.badge-solid-warning .badge-dot,
+.badge-solid-orange .badge-dot { background-color: #EA580C !important; }
+.dark .badge-solid-warning .badge-dot,
+.dark .badge-solid-orange .badge-dot { background-color: #FB923C !important; }
+
+.badge-solid-purple .badge-dot { background-color: #9333EA !important; }
+.dark .badge-solid-purple .badge-dot { background-color: #C084FC !important; }
+
+.badge-solid-cyan .badge-dot { background-color: #0284C7 !important; }
+.dark .badge-solid-cyan .badge-dot { background-color: #38BDF8 !important; }
+
+.badge-solid-error .badge-dot { background-color: #DC2626 !important; }
+.dark .badge-solid-error .badge-dot { background-color: #F87171 !important; }
+
+.badge-solid-default .badge-dot { background-color: #64748B !important; }
+.dark .badge-solid-default .badge-dot { background-color: #94A3B8 !important; }
+
+.badge-solid-neutral .badge-dot { background-color: #94A3B8 !important; }
+.dark .badge-solid-neutral .badge-dot { background-color: #64748B !important; }
+

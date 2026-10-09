@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import api from '../../services/api'
 import { saveLocalSession } from '../../utils/session'
 import { syncProfileToSupabase } from '../../services/supabase'
+import { getErrorMessage } from '../../utils/helpers'
 
 /* Password field with a show/hide toggle, styled for the dark glassy card. */
 function PasswordInputGlass({ value, onChange, placeholder = '••••••' }: { value: string; onChange: (v: string) => void; placeholder?: string }) {
@@ -65,8 +66,8 @@ export function AdminLogin() {
       }
 
       navigate('/admin-dashboard')
-    } catch (err: any) {
-      setError(err?.response?.data?.detail || 'Invalid admin credentials')
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Request failed'))
     } finally {
       setLoading(false)
     }

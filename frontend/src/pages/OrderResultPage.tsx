@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import QRCode from 'qrcode'
 import api from '../services/api'
-import { LocalParentOrder, LocalPaymentSettings } from '../types/localApi'
+import { LocalParentOrder, LocalPaymentSettings, PaymentProofStatus, PAYMENT_PROOF_MAX_MB, PAYMENT_PROOF_TYPES } from '../types/localApi'
 import { usePolling } from '../hooks/usePolling'
 import { same } from '../utils/same'
 
@@ -87,6 +87,15 @@ export function OrderResultPage() {
   const [loading, setLoading] = useState(true)
   const [paymentPending, setPaymentPending] = useState(false)
   const [pendingDetail, setPendingDetail] = useState('')
+  // Manual-proof lifecycle. Verification is MANUAL by an admin — this page
+  // never flips to paid by itself; it polls the proof state instead.
+  const [proofStatus, setProofStatus] = useState<PaymentProofStatus>('PENDING_PAYMENT')
+  const [rejectReason, setRejectReason] = useState('')
+  const [utr, setUtr] = useState('')
+  const [shot, setShot] = useState<File | null>(null)
+  const [shotPreview, setShotPreview] = useState('')
+  const [proofErr, setProofErr] = useState('')
+  const [proofBusy, setProofBusy] = useState(false)
 
   useEffect(() => {
     const flag = sessionStorage.getItem('payment_pending')
@@ -100,11 +109,22 @@ export function OrderResultPage() {
       .then(r => setOrder(cur => same(cur, r.data) ? cur : r.data))
       .catch(() => setOrder(null))
       .finally(() => setLoading(false))
+    // Proof state (UTR on file is never echoed back — only the lifecycle).
+    api.get(`/local/orders/${orderId}/payment`)
+      .then(r => {
+        if (r.data?.proof_status) setProofStatus(r.data.proof_status)
+        setRejectReason(String(r.data?.payment_rejection_reason || ''))
+      })
+      .catch(() => {})
   }, [orderId])
 
-  // Poll every 5s while this tab is visible so the student sees the order get
-  // auto-accepted; background tabs pause and refresh instantly on switch-back.
-  usePolling(load, 5000, [orderId])
+  // Poll adaptively: 5s only while the order is unsettled (Pending/Confirmed),
+  // 30s once it reaches a steady state — a Delivered order re-polled every 5s
+  // forever was pure load. Background tabs pause and refresh on switch-back.
+  // The proof poll rides along: verification is manual, so the page flips to
+  // approved only when the admin decides.
+  const orderSettled = order ? !['Pending', 'Confirmed', 'Accepted'].includes(String(order.status)) : false
+  usePolling(load, orderSettled ? 30000 : 8000, [orderId, orderSettled])
 
   /* The UTR paste/recovery box was removed with the UTR verification method.
      The payment settings below power the "Scan for better option" pay button
@@ -139,6 +159,62 @@ export function OrderResultPage() {
 
   const parentStyle = order ? statusStyles[order.status] || statusStyles.Pending : statusStyles.Pending
 
+  const pickShot = (f: File | undefined) => {
+    setProofErr('')
+    if (!f) return
+    if (!PAYMENT_PROOF_TYPES.includes(f.type)) {
+      setProofErr('Please choose a JPEG, PNG or WEBP screenshot.')
+      return
+    }
+    if (f.size > PAYMENT_PROOF_MAX_MB * 1024 * 1024) {
+      setProofErr(`Screenshot must be ${PAYMENT_PROOF_MAX_MB} MB or smaller.`)
+      return
+    }
+    setShot(f)
+    setShotPreview(URL.createObjectURL(f))
+  }
+
+  const submitProof = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setProofErr('')
+    const ref = utr.trim().toUpperCase()
+    if (!/^[A-Z0-9]{6,40}$/.test(ref)) {
+      setProofErr('Enter the UTR / transaction number from your UPI app (letters and digits, 6–40 characters).')
+      return
+    }
+    if (!shot) {
+      setProofErr('A payment screenshot is required.')
+      return
+    }
+    setProofBusy(true)
+    try {
+      const form = new FormData()
+      form.append('order_id', orderId)
+      form.append('utr_number', ref)
+      form.append('screenshot', shot)
+      await api.post('/local/payments/proof', form, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 60000,
+      } as any)
+      setUtr('')
+      setShot(null)
+      setShotPreview('')
+      load()
+    } catch (err: any) {
+      const status = err?.response?.status
+      setProofErr(
+        err?.response?.data?.detail ||
+          (status === 409
+            ? 'This proof was already submitted.'
+            : 'Could not submit the proof. Please try again.')
+      )
+    } finally {
+      setProofBusy(false)
+    }
+  }
+
+  const showProofForm = !!order && !!awaitingPayment && proofStatus !== 'PAYMENT_PROOF_SUBMITTED' && proofStatus !== 'PAYMENT_APPROVED'
+
   return (
     <div className="min-h-screen bg-white">
       <div className="mx-auto max-w-3xl px-4 py-6">
@@ -150,7 +226,7 @@ export function OrderResultPage() {
               <div className="mb-5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-left text-sm text-amber-700">
                 <p className="font-bold">⚠️ Your order was placed, but the payment record didn't save.</p>
                 {pendingDetail && <p className="mt-1 text-xs">{pendingDetail}</p>}
-                <p className="mt-1">No problem — your order is safe. If you already paid in your UPI app, send the UTR shown there to the shop so the admin can record it; otherwise complete the payment with the button below.</p>
+                <p className="mt-1">No problem — your order is safe. If you already paid in your UPI app, submit the UTR + screenshot below so an admin can verify it; otherwise complete the payment with the QR.</p>
               </div>
             )}
             <p className="text-xs font-bold uppercase tracking-wider text-gray-500">Order Result</p>
@@ -218,6 +294,72 @@ export function OrderResultPage() {
                   </p>
                 )}
               </div>
+            )}
+
+            {proofStatus === 'PAYMENT_PROOF_SUBMITTED' && awaitingPayment && (
+              <div className="mt-4 rounded-card border border-emerald-200 bg-emerald-50/60 p-4 text-left">
+                <p className="text-sm font-bold text-primary">✓ Payment proof submitted successfully. Your order is waiting for admin verification.</p>
+                <p className="mt-0.5 text-[11px] leading-relaxed text-primary">
+                  The kitchen starts cooking as soon as an admin verifies your payment — no further action needed.
+                </p>
+              </div>
+            )}
+
+            {proofStatus === 'PAYMENT_REJECTED' && awaitingPayment && (
+              <div className="mt-4 rounded-card border border-red-200 bg-red-50 p-4 text-left">
+                <p className="text-sm font-bold text-red-700">
+                  Your payment proof was rejected{rejectReason ? `: ${rejectReason}` : '.'}
+                </p>
+                <p className="mt-0.5 text-[11px] leading-relaxed text-red-600">
+                  Please check your payment and submit a fresh UTR + screenshot below.
+                </p>
+              </div>
+            )}
+
+            {showProofForm && (
+              <form onSubmit={submitProof} className="mt-4 rounded-card border border-gray-200 bg-gray-50/60 p-4 text-left">
+                <p className="text-sm font-bold text-primary-dark">Already paid? Submit payment proof</p>
+                <label className="mt-3 block text-[11px] font-bold text-gray-500">
+                  UTR / Transaction number (from your UPI app)
+                </label>
+                <input
+                  type="text"
+                  value={utr}
+                  onChange={e => setUtr(e.target.value)}
+                  placeholder="12-digit UTR (e.g. 423456789012)"
+                  autoComplete="off"
+                  className="mt-1 w-full rounded-btn border border-gray-200 bg-white px-3 py-2 font-mono text-xs outline-none focus:border-primary"
+                />
+                <label className="mt-3 block text-[11px] font-bold text-gray-500">
+                  Payment screenshot (JPEG / PNG / WEBP, max {PAYMENT_PROOF_MAX_MB} MB)
+                </label>
+                <label className="mt-1 flex cursor-pointer items-center justify-center gap-2 rounded-btn border-2 border-dashed border-gray-300 bg-white px-3 py-3 text-xs font-bold text-gray-600 hover:border-primary">
+                  <span>{shot ? shot.name : 'Choose screenshot from gallery'}</span>
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    className="hidden"
+                    onChange={e => {
+                      const f = e.target.files?.[0]
+                      pickShot(f)
+                    }}
+                  />
+                </label>
+                {shotPreview && (
+                  <img src={shotPreview} alt="Payment screenshot preview" className="mt-2 max-h-48 rounded-btn border border-gray-200 object-contain" />
+                )}
+                {proofErr && <p className="mt-2 text-xs font-bold text-red-600">{proofErr}</p>}
+                <button
+                  type="submit"
+                  disabled={proofBusy}
+                  className="mt-3 w-full rounded-btn bg-primary px-4 py-2.5 text-sm font-bold text-white hover:bg-primary-dark disabled:opacity-50"
+                >
+                  {proofBusy ? 'Submitting…' : 'Submit Payment Proof'}
+                </button>
+                <p className="mt-2 text-center text-[11px] font-medium text-gray-400">
+                  An admin verifies every proof by hand before the kitchen starts cooking.
+                </p>
+              </form>
             )}
 
             <div className="mt-6 flex justify-center gap-3">

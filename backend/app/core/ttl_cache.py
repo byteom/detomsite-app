@@ -53,6 +53,31 @@ def set(key: str, value: Any, ttl: float) -> None:
         _store[key] = (time.monotonic() + ttl, value)
 
 
+def pop(key: str) -> None:
+    """Evict a specific entry on mutation."""
+    with _lock:
+        _store.pop(key, None)
+
+
+def clear_prefix(*prefixes: str) -> int:
+    """Evict every entry whose key starts with any of ``prefixes``.
+
+    Scoped alternative to :func:`clear` for the write path: a write to
+    orders must drop the order/menu/shop entries, but there is no reason for
+    it to also drop ``payment-settings`` or ``student-notice`` and force
+    every portal to re-pay a cold WAN read for data the write never touched.
+    Returns the number of entries dropped (for logs/tests).
+    """
+    if not prefixes:
+        return 0
+    dropped = 0
+    with _lock:
+        for key in [k for k in _store if k.startswith(prefixes)]:
+            _store.pop(key, None)
+            dropped += 1
+    return dropped
+
+
 def clear() -> None:
     """Drop every entry — call this after any write to cached resources."""
     with _lock:

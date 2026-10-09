@@ -16,5 +16,5 @@
     "noUnusedParameters": false,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src", "mobile"]
+  "include": ["src", "mobile", "vite.config.ts"]
 }

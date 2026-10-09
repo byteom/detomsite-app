@@ -27,8 +27,8 @@ function buildUpiUri(pa: string, pn: string, amount: number, note: string) {
  * The amount is priced from the LIVE product list rather than from the prices the
  * cart captured: the server re-prices every order from the product table and
  * ignores whatever total the client sends, so a stale cart price would otherwise
- * encode the wrong amount in the QR and the bank-SMS matcher would reject the
- * real payment as ambiguous. Server fees are all zero, so the live product-price
+ * encode the wrong amount in the QR and the admin could not match the real
+ * payment against the bill. Server fees are all zero, so the live product-price
  * sum IS the order total. If a vendor changed a price, the student is stopped
  * here and told rather than charged the difference after the fact. */
 export default function PayPage() {
@@ -61,29 +61,58 @@ export default function PayPage() {
   const groupKey = groups.map(g => `${g.shop_id}:${g.items.map(i => i.product_id).join('|')}`).join('~')
   useEffect(() => {
     if (!groups.length) { setLoading(false); return }
-    Promise.all(groups.map(g =>
-      Promise.all([
-        api.get<LocalProduct[]>('/local/products', { params: { shop_id: g.shop_id } }),
-        api.get<LocalShop>(`/local/shops/${g.shop_id}`),
-      ]).then(([pr, sr]) => ({ shopId: g.shop_id, products: pr.data, shop: sr.data })),
-    ))
-      .then(results => {
-        const prices: Record<string, number> = {}
-        let anyMissing = false
-        for (const g of groups) {
-          const result = results.find(r => r.shopId === g.shop_id)
-          for (const item of g.items) {
-            const product = result?.products.find(p => p.id === item.product_id)
-            if (!product || !product.available) { anyMissing = true; continue }
-            prices[item.product_id] = Number(product.price) * item.quantity
-          }
+    // ONE aggregated request (shops + per-shop products + payment settings)
+    // instead of 1 + 2N. Falls back to the old fan-out on old backends.
+    const ids = groups.map(g => g.shop_id).filter(Boolean).join(',')
+    setLoading(true)
+    api.get<{
+      shops: LocalShop[]; products: Record<string, LocalProduct[]>;
+      payment_settings: LocalPaymentSettings;
+    }>(`/local/checkout-data?shop_ids=${encodeURIComponent(ids)}`).then(r => {
+      if (r.data.payment_settings) setPs(r.data.payment_settings)
+      const results = (r.data.shops || []).map(s => ({
+        shopId: s.id, shop: s,
+        products: (r.data.products || {})[s.id] || [],
+      }))
+      const prices: Record<string, number> = {}
+      let anyMissing = false
+      for (const g of groups) {
+        const result = results.find(rr => rr.shopId === g.shop_id)
+        for (const item of g.items) {
+          const product = result?.products.find(p => p.id === item.product_id)
+          if (!product || !product.available) { anyMissing = true; continue }
+          prices[item.product_id] = Number(product.price) * item.quantity
         }
-        if (anyMissing) setError('Something in your cart is no longer available. Go back to the cart and remove it, then try again.')
-        setLive(prices)
-        setShop(results[0]?.shop ?? null)
-      })
-      .catch(() => setError('Could not load the live prices for your cart. Check your connection and try again.'))
-      .finally(() => setLoading(false))
+      }
+      if (anyMissing) setError('Something in your cart is no longer available. Go back to the cart and remove it, then try again.')
+      setLive(prices)
+      setShop(results[0]?.shop ?? null)
+      setLoading(false)
+    }).catch(() => {
+      Promise.all(groups.map(g =>
+        Promise.all([
+          api.get<LocalProduct[]>('/local/products', { params: { shop_id: g.shop_id } }),
+          api.get<LocalShop>(`/local/shops/${g.shop_id}`),
+        ]).then(([pr, sr]) => ({ shopId: g.shop_id, products: pr.data, shop: sr.data })),
+      ))
+        .then(results => {
+          const prices: Record<string, number> = {}
+          let anyMissing = false
+          for (const g of groups) {
+            const result = results.find(r => r.shopId === g.shop_id)
+            for (const item of g.items) {
+              const product = result?.products.find(p => p.id === item.product_id)
+              if (!product || !product.available) { anyMissing = true; continue }
+              prices[item.product_id] = Number(product.price) * item.quantity
+            }
+          }
+          if (anyMissing) setError('Something in your cart is no longer available. Go back to the cart and remove it, then try again.')
+          setLive(prices)
+          setShop(results[0]?.shop ?? null)
+        })
+        .catch(() => setError('Could not load the live prices for your cart. Check your connection and try again.'))
+        .finally(() => setLoading(false))
+    })
   }, [groupKey])
 
   const amount = useMemo(
@@ -133,9 +162,11 @@ export default function PayPage() {
         delivery_slot: slot,
         payment_method: method === 'cod' ? 'COD' : 'UTR',
       })
-      /* Record the payment row so the admin/bot has an amount to verify against.
-         A failure here does NOT mean the order failed — the order already exists,
-         so it is never re-submitted (that produced duplicate orders). */
+      /* Record the payment row so the admin has an amount to verify the manual
+         UPI proof against. A failure here does NOT mean the order failed — the
+         order already exists, so it is never re-submitted (that produced
+         duplicate orders). After placing the order the student submits the UTR
+         + screenshot on the order page for manual admin verification. */
       try {
         await api.post('/local/payments', {
           order_id: order.data.id,

@@ -18,7 +18,7 @@
  */
 // jsdom is CommonJS — pull the named pieces off the default export.
 import jsdomPkg from 'jsdom'
-const { JSDOM, VirtualConsole, requestInterceptor } = jsdomPkg
+const { JSDOM, VirtualConsole, ResourceLoader } = jsdomPkg
 
 const API = 'http://127.0.0.1:9/api/v1'   // never reachable: the mock intercepts
 let failures = []
@@ -58,6 +58,7 @@ const ROUTES = {
   '/users/reviews': [],
   '/users/profile': { id: 1, name: 'Test Student' },
   '/local/summary': { total_orders: 1 },
+  '/local/search': { query: '', shops: [SHOP], products: [PRODUCT], total: 2 },
 }
 const payView = (id) => ({
   order_id: id, order_status: 'Pending Payment', payment_method: 'UPI', amount: 160,
@@ -83,26 +84,53 @@ function resolve(path) {
   return { ok: false, status: 404, body: { detail: 'Not Found' } }
 }
 
-/**
- * Answer the API at jsdom's own network layer.
- *
- * Intercepting `window.fetch` is NOT enough: the bundle is built for the server,
- * so axios picks Node's http adapter rather than fetch/XHR. Routing jsdom's
- * resource requests into a synthetic Response is the only way the app's OWN
- * networking path gets exercised — anything else would silently test the app's
- * *fallback* rendering instead of its real one.
- */
-const apiInterceptor = requestInterceptor(async (request) => {
-  // Strip the origin AND the /api/v1 prefix so paths match the keys in ROUTES.
-  let p = String(request.url).replace(/^https?:\/\/[^/]+/, '')
-  p = p.replace(/^\/api\/v1/, '')
-  const { ok, status = 200, body } = resolve(p.split('?')[0])
-  HIT.add(p.split('?')[0])
-  return new Response(JSON.stringify(body), {
-    status: ok ? 200 : status,
-    headers: { 'Content-Type': 'application/json' },
-  })
-})
+import http from 'node:http'
+import https from 'node:https'
+import { PassThrough } from 'node:stream'
+
+function interceptRequest(orig, args) {
+  let [url, options, cb] = args
+  let u = typeof url === 'string' ? url : (options?.path || url?.path || '')
+  if (typeof options === 'function') {
+    cb = options
+    options = {}
+  }
+  if (u.includes('/api/v1') || u.startsWith('/local/') || u.startsWith('/users/') || u.startsWith('/payments/')) {
+    let p = u.replace(/^https?:\/\/[^/]+/, '').replace(/^\/api\/v1/, '')
+    const pathOnly = p.split('?')[0]
+    const { ok, status = 200, body } = resolve(pathOnly)
+    HIT.add(pathOnly)
+    const res = new PassThrough()
+    res.statusCode = ok ? 200 : status
+    res.headers = { 'content-type': 'application/json' }
+    res.rawHeaders = ['content-type', 'application/json']
+    const req = new PassThrough()
+    req.setHeader = () => {}
+    req.getHeader = () => {}
+    req.setTimeout = () => req
+    req.abort = () => {}
+    req.destroy = () => {}
+    req.end = function () {
+      process.nextTick(() => {
+        if (cb) cb(res)
+        res.end(JSON.stringify(body))
+      })
+      return req
+    }
+    return req
+  }
+  return orig.apply(this, args)
+}
+
+const origHttpRequest = http.request
+http.request = function (...args) {
+  return interceptRequest.call(this, origHttpRequest, args)
+}
+
+const origHttpsRequest = https.request
+https.request = function (...args) {
+  return interceptRequest.call(this, origHttpsRequest, args)
+}
 
 /** Build a fresh jsdom window wired to the mock API + a chosen localStorage. */
 let bootSeq = 0
@@ -117,7 +145,6 @@ async function boot(route, storage) {
     pretendToBeVisual: true,
     runScripts: 'outside-only',
     virtualConsole: vc,
-    resources: { interceptors: [apiInterceptor] },
   })
   const { window } = dom
 

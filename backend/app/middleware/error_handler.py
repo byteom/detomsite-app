@@ -9,13 +9,11 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from app.core.config import settings
 import logging
+import time
 import uuid
 
 logger = logging.getLogger(__name__)
 
-# TEMPORARY diagnostic switch, default OFF. Enabled for one deploy to identify
-# the class of a production-only 500, then removed. It reveals the exception
-# TYPE NAME only — never the message, which can contain SQL or credentials.
 # TEMPORARY diagnostic switch, default OFF. Enabled for one deploy to identify
 # the class of a production-only 500, then removed. It reveals the exception
 # TYPE NAME only — never the message, which can contain SQL or credentials.
@@ -88,6 +86,20 @@ class ErrorHandlingMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
             return response
         except Exception as e:
+            # Client disconnect / aborted request (e.g. user navigated away or closed tab)
+            if isinstance(e, RuntimeError) and "No response returned" in str(e):
+                logger.info(
+                    f"Client closed connection before response - Request ID: {request_id}, "
+                    f"Path: {request.url.path}"
+                )
+                return JSONResponse(
+                    status_code=499,
+                    content={
+                        "detail": "Client closed connection.",
+                        "request_id": request_id,
+                    },
+                )
+
             # PENTEST FIX: a body of {"x": NaN} or {"x": Infinity} is not valid
             # JSON, but Python's json.loads accepts those bare literals as an
             # extension, so the value flowed into the response. Re-serialising a
@@ -129,14 +141,12 @@ class ErrorHandlingMiddleware(BaseHTTPMiddleware):
                     headers={"Retry-After": "2"},
                 )
 
-            # TEMPORARY DIAGNOSTIC (will be removed once identified): expose only
-            # the exception CLASS NAME — never its message, which can carry SQL
-            # fragments and connection strings.
+            # Determine error message safely based on environment
             if _EXPOSE_ERROR_CLASS:
                 error_message = f"{type(e).__name__}"
-
-            # Don't expose internal errors in production
-            if not settings.DEBUG and not _EXPOSE_ERROR_CLASS:
+            elif settings.DEBUG:
+                error_message = str(e)
+            else:
                 error_message = "Internal Server Error"
 
             return JSONResponse(
@@ -149,15 +159,51 @@ class ErrorHandlingMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    """Middleware for logging requests"""
+    """Middleware for logging requests with Server-Timing breakdown"""
     
     async def dispatch(self, request: Request, call_next):
         """Log request and response"""
-        logger.info(f"{request.method} {request.url.path}")
-        
+        from app.core.timing import init_request_timing, get_request_timing
+        started = time.perf_counter()
+        init_request_timing()
         response = await call_next(request)
+        duration_ms = (time.perf_counter() - started) * 1000
+
+        # Build detailed Server-Timing breakdown
+        timings = get_request_timing() or {}
+        parts = [f"total;dur={duration_ms:.1f}"]
         
-        logger.info(f"Response status: {response.status_code}")
+        known_time = sum(timings.get(k, 0.0) for k in ("cache", "db_conn", "db_query"))
+        py_proc = max(0.0, duration_ms - known_time)
+        if py_proc > 0.05 and known_time > 0:
+            timings.setdefault("py_proc", py_proc)
+
+        for stage in ("cache", "db_conn", "db_query", "py_proc", "serialization"):
+            if stage in timings:
+                parts.append(f"{stage};dur={timings[stage]:.1f}")
+        for k, v in timings.items():
+            if k not in ("cache", "db_conn", "db_query", "py_proc", "serialization", "total"):
+                parts.append(f"{k};dur={v:.1f}")
+
+        response.headers["Server-Timing"] = ", ".join(parts)
+        request_id = getattr(request.state, "request_id", "-")
+        logger.info(
+            "%s %s -> %s in %.1fms request_id=%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+            request_id,
+        )
+        if duration_ms >= 1000:
+            logger.warning(
+                "slow_request path=%s method=%s duration_ms=%.1f status=%s request_id=%s",
+                request.url.path,
+                request.method,
+                duration_ms,
+                response.status_code,
+                request_id,
+            )
         return response
 
 

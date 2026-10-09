@@ -45,13 +45,16 @@ async def keep_alive_loop():
 
     logger.info(f"keep-alive: warm-up cron active every {KEEP_ALIVE_INTERVAL_SECONDS // 60} min → {base}")
     while True:
-        for path in KEEP_ALIVE_PATHS:
-            try:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    response = await client.get(f"{base}{path}")
-                logger.info(f"keep-alive: {path} → {response.status_code}")
-            except Exception as exc:
-                logger.warning(f"keep-alive: {path} error -> {exc}")
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                for path in KEEP_ALIVE_PATHS:
+                    try:
+                        response = await client.get(f"{base}{path}")
+                        logger.info(f"keep-alive: {path} → {response.status_code}")
+                    except Exception as exc:
+                        logger.warning(f"keep-alive: {path} error -> {exc}")
+        except Exception as exc:
+            logger.warning(f"keep-alive client session error -> {exc}")
         await asyncio.sleep(KEEP_ALIVE_INTERVAL_SECONDS)
 
 # Initialize Sentry if DSN is provided — sample 10% of traces (not 100%)
@@ -64,7 +67,8 @@ if sentry_sdk and settings.SENTRY_DSN:
 
 # ─── Simple in-memory rate limiter ───
 # Protects auth endpoints from brute-force attacks. No external deps needed.
-_rate_limit_store: dict[str, list[float]] = defaultdict(list)
+_rate_limit_store: dict[str, list[float]] = {}
+_last_rate_limit_cleanup: float = 0.0
 _RATE_LIMIT_WINDOW = 60  # seconds
 # Cap per real client IP (not per Vercel proxy IP), tuned for a campus behind
 # a shared NAT: generous enough that a lunch-rush login flash is never blocked,
@@ -73,13 +77,27 @@ _RATE_LIMIT_WINDOW = 60  # seconds
 _RATE_LIMIT_MAX = 60
 
 
+def _prune_rate_limit_store(now: float) -> None:
+    """Periodically purge all expired keys to prevent memory leak."""
+    global _last_rate_limit_cleanup
+    if now - _last_rate_limit_cleanup < 300 and len(_rate_limit_store) < 1000:
+        return
+    _last_rate_limit_cleanup = now
+    cutoff = now - _RATE_LIMIT_WINDOW
+    expired_keys = [k for k, timestamps in _rate_limit_store.items() if not timestamps or timestamps[-1] < cutoff]
+    for k in expired_keys:
+        _rate_limit_store.pop(k, None)
+
+
 async def rate_limit_middleware(request: Request, call_next):
     """Rate-limit sensitive endpoints (login, register, forgot-password/username)."""
     path = request.url.path
     sensitive_prefixes = ("/auth/login", "/auth/register", "/users/login",
-                          "/users/register", "/vendor/login", "/vendor/register",
-                          "/admin/login", "/users/forgot-password",
-                          "/users/forgot-username", "/users/reset-password")
+                           "/users/register", "/vendor/login", "/vendor/register",
+                           "/admin/login", "/users/forgot-password",
+                           "/users/forgot-username", "/users/reset-password",
+                           "/vendor/forgot-password", "/vendor/reset-password",
+                           "/admin/forgot-password", "/admin/reset-password")
     if not any(path.endswith(p) for p in sensitive_prefixes):
         return await call_next(request)
 
@@ -96,15 +114,19 @@ async def rate_limit_middleware(request: Request, call_next):
 
     client_ip = resolve_client_ip(request)
     now = time.time()
+    _prune_rate_limit_store(now)
     key = f"{client_ip}:{path}"
-    # Prune old entries
-    _rate_limit_store[key] = [t for t in _rate_limit_store[key] if now - t < _RATE_LIMIT_WINDOW]
-    if len(_rate_limit_store[key]) >= _RATE_LIMIT_MAX:
+    cutoff = now - _RATE_LIMIT_WINDOW
+    existing = _rate_limit_store.get(key)
+    valid = [t for t in existing if t > cutoff] if existing else []
+    if len(valid) >= _RATE_LIMIT_MAX:
+        _rate_limit_store[key] = valid
         return JSONResponse(
             status_code=429,
             content={"detail": "Too many requests. Please try again later."}
         )
-    _rate_limit_store[key].append(now)
+    valid.append(now)
+    _rate_limit_store[key] = valid
     return await call_next(request)
 
 
@@ -126,6 +148,27 @@ async def lifespan(app: FastAPI):
         logger.error("Supabase store not reachable at startup — serving API anyway; requests will retry the connection per-request.")
     else:
         logger.info("Supabase Postgres store initialized")
+        # Pre-warm a few pool connections. Each fresh connection costs a
+        # DNS + TCP + TLS handshake to Supabase; without this the first
+        # visitor after a (re)start pays those serially inside their own
+        # page-mount burst (measured seconds). Three warm connections cover a
+        # typical burst head; the pool grows to DB_POOL_MAX on demand after.
+        # Never blocks startup: a hiccup here just means the first requests
+        # warm the pool themselves, exactly as before.
+        try:
+            from app.core import supabase_db
+            from app.core.db_executor import run_db as _run_db
+
+            def _prewarm() -> None:
+                pool = supabase_db._get_pool()
+                held = [pool.getconn() for _ in range(3)]
+                for conn in held:
+                    supabase_db._release(conn)
+
+            await _run_db(_prewarm)
+            logger.info("DB pool pre-warmed (3 connections)")
+        except Exception as e:
+            logger.warning(f"DB pool pre-warm skipped ({e})")
 
     # Shared read cache. When no external Redis is configured, run one inside
     # this process (unix socket, no network, no credential) so the shared layer
@@ -144,7 +187,8 @@ async def lifespan(app: FastAPI):
 
     keep_alive_task = asyncio.create_task(keep_alive_loop())
     auto_delivery_task = asyncio.create_task(auto_delivery_loop())
-    
+    pool_ping_task = asyncio.create_task(pool_keepalive_loop())
+
     yield
 
     # Shutdown — cancel background tasks so the process can exit cleanly.
@@ -154,6 +198,7 @@ async def lifespan(app: FastAPI):
         logger.debug(f"Embedded cache shutdown notice: {e}")
     keep_alive_task.cancel()
     auto_delivery_task.cancel()
+    pool_ping_task.cancel()
     try:
         await keep_alive_task
     except asyncio.CancelledError:
@@ -166,6 +211,43 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down DETOMSITE application")
 
 
+# ─── DB pool keep-alive ───
+async def pool_keepalive_loop():
+    """Ping pooled connections every 25 s so the pooler never sees them idle.
+
+    Measured: a fresh TLS + pooler session assignment costs ~0.55 s, and
+    concurrent fresh sessions serialize (up to ~1.7 s) — so every burst after
+    an idle stretch paid seconds before running a single query. One cheap
+    ``SELECT 1`` per cycle is real query activity (unlike TCP keepalives,
+    which poolers ignore for idle timeouts) and keeps the warm sessions the
+    pre-warm created. Fully best-effort: any failure just logs.
+    """
+    from app.core.db_executor import run_db as _run_db
+
+    await asyncio.sleep(25)
+    while True:
+        try:
+            from app.core import supabase_db
+
+            def _ping() -> None:
+                pool = supabase_db._get_pool()
+                if hasattr(pool, "ping_all"):
+                    pool.ping_all()
+                else:
+                    for _ in range(3):
+                        conn = pool.getconn()
+                        try:
+                            with conn.cursor() as cur:
+                                cur.execute("SELECT 1")
+                        finally:
+                            supabase_db._release(conn)
+
+            await _run_db(_ping)
+        except Exception as e:
+            logger.debug(f"pool keep-alive ping skipped ({e})")
+        await asyncio.sleep(25)
+
+
 # ─── 30-minute auto-delivery background job ───
 async def auto_delivery_loop():
     """Every 60 seconds, auto-complete sub-orders delivered more than 30 minutes
@@ -175,9 +257,8 @@ async def auto_delivery_loop():
         await asyncio.sleep(60)
         try:
             from app.core.store import store
-            def _run():
-                return store.auto_complete_expired_deliveries()
-            count = await asyncio.to_thread(_run)
+            from app.core.db_executor import run_db as _run_db
+            count = await _run_db(store.auto_complete_expired_deliveries)
             if count:
                 logger.info(f"auto_delivery_loop: auto-completed {count} sub-order(s)")
         except Exception as e:
@@ -239,29 +320,110 @@ app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
 # Drop every read-cache layer after any successful write, so cached portals
-# (admin/shopkeeper lists) never show stale rows once an action lands. The clear
-# is awaited: the response would otherwise race the invalidation, and on a
-# serverless host the instance can freeze the moment the response is sent.
+# (admin/shopkeeper lists) never show stale rows once an action lands. The
+# write path pays ZERO shared-cache round trips: the in-process layer is
+# dropped synchronously (this instance is fresh immediately) and the Redis /
+# Postgres copies expire on their own short TTLs (5–30 s). The old code
+# awaited a bounded shared clear (Redis SCAN + Postgres DELETE) on EVERY
+# POST/PATCH/DELETE — on a slow or unreachable shared cache that added up to
+# 250 ms of user-facing latency to the exact requests a user is waiting on
+# (order placement, payment, profile save) for at most seconds of cross-
+# instance staleness in return.
 from app.core import embedded_redis, read_cache, redis_cache, shared_cache, ttl_cache
+
+
+_NOOP_WRITE_PATHS = (
+    "/login", "/auth/login", "/users/login", "/vendor/login", "/admin/login",
+    "/users/forgot-password", "/users/forgot-username", "/users/reset-password",
+    "/users/verify-reset-otp", "/vendor/forgot-password", "/vendor/reset-password",
+    "/admin/forgot-password", "/admin/reset-password",
+    "/local/session", "/local/push/subscribe",
+)
 
 
 async def cache_invalidation_middleware(request: Request, call_next):
     response = await call_next(request)
     if request.method in ("POST", "PUT", "PATCH", "DELETE") and response.status_code < 400:
-        # Every cached portal (admin/shopkeeper lists) must stop serving the old
-        # rows once an action lands — otherwise a confirmed order keeps showing
-        # as "pending" until the TTL runs out.
-        #
-        # This used to `await read_cache.clear()` UNBOUNDED, so every order
-        # placement, payment and profile write paid for a Redis round trip AND a
-        # Postgres round trip before the response could go out. `clear_bounded`
-        # drops this instance's copy instantly (so the write's own instance is
-        # already fresh) and gives the shared layers a 0.25 s budget; every shared
-        # entry has a TTL anyway, so blowing the budget degrades to "at most a few
-        # more seconds of staleness on another instance" instead of "the user's
-        # request hangs on a slow cache".
-        await read_cache.clear_bounded()
+        path = request.url.path
+        # Auth, login, session and push subscription endpoints mutate no domain data
+        if any(path.endswith(p) for p in _NOOP_WRITE_PATHS):
+            return response
+
+        await read_cache.clear()
     return response
+
+
+# Write path substring → cache key prefixes it can stale.
+# First match wins; needles are distinctive path segments so ordering only
+# matters for genuinely nested paths (none currently share a needle).
+_WRITE_EVICT_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # Placing/cancelling/confirming an order moves stock, per-shop counters,
+    # batch tokens, payments and every bell. Untouched: payment-settings,
+    # student-notice, user profiles, complaints/refunds queues, feedback.
+    ("/local/orders", ("orders", "checkout", "shops", "shop:", "shop:id:",
+                       "products", "products:", "menu-summary", "search",
+                       "payments", "notifications", "admin-", "admin:",
+                       "batch", "home-feed", "summary", "settlements",
+                       "products-stock", "refunds")),
+    # Menu edits move the menu, search, checkout prices and vendor stock view.
+    ("/local/products", ("products", "products:", "menu-summary", "search",
+                         "checkout", "products-stock", "home-feed")),
+    ("/vendor", ("products", "products:", "menu-summary", "search",
+                 "checkout", "shops", "shop:", "shop:id:", "orders",
+                 "home-feed", "products-stock", "admin-", "admin:")),
+    # Shop create/toggle moves the shop list, detail, search and checkout.
+    ("/local/shops", ("shops", "shop:", "shop:id:", "search", "checkout",
+                      "home-feed", "summary", "menu-summary")),
+    # Money movement moves payments, orders, checkout and bells.
+    ("/local/payments", ("payments", "orders", "checkout", "notifications",
+                        "admin-", "admin:", "settlements")),
+    ("/local/utr", ("payments", "orders", "checkout", "notifications",
+                    "admin-", "admin:")),
+    ("/local/verify", ("payments", "orders", "checkout", "notifications",
+                       "admin-", "admin:")),
+    ("/local/razorpay", ("payments", "orders", "checkout", "notifications",
+                         "admin-", "admin:")),
+    ("/local/manual-utr", ("payments", "orders", "checkout", "notifications",
+                           "admin-", "admin:")),
+    ("/local/create-razorpay", ("payments", "orders", "checkout",
+                               "notifications", "admin-", "admin:")),
+    ("/local/payment-settings", ("payment-settings", "checkout", "home-feed")),
+    ("/local/student-notice", ("student-notice", "home-feed")),
+    ("/local/notifications", ("notifications", "admin-", "admin:")),
+    ("/local/order-confirmations", ("notifications", "admin-", "admin:")),
+    ("/local/complaints", ("complaints", "admin-", "admin:")),
+    ("/local/refunds", ("refunds", "orders", "admin-", "admin:")),
+    ("/local/settlements", ("settlements", "admin-", "admin:", "summary")),
+    ("/local/dues", ("settlements", "admin-", "admin:", "summary")),
+    ("/local/menu-change-requests", ("menu-change-requests", "admin-",
+                                    "admin:")),
+    ("/local/feedback", ("admin-feedback",)),
+    ("/local/reviews", ("admin-", "admin:")),
+    ("/local/tickets", ("admin-", "admin:")),
+    ("/local/announcements", ("admin-", "admin:")),
+    ("/local/feature-flags", ("admin-", "admin:")),
+    # Bank-SMS webhooks confirm orders (status/payments/bells all move).
+    ("/local/sms", ("orders", "checkout", "shops", "shop:", "products",
+                    "products:", "payments", "notifications", "admin-",
+                    "admin:", "batch", "home-feed", "summary")),
+    ("/local/whatsapp", ("notifications", "admin-", "admin:")),
+    # Auth/push/subscribe paths have no audited mapping on purpose: they are
+    # rare, so they fall through to the safe full clear below.
+    ("/users", ("user:", "admin-", "admin:")),
+    ("/admin", ("admin-", "admin:", "shops", "shop:", "shop:id:", "products",
+                "products:", "orders", "menu-summary", "search", "checkout",
+                "home-feed", "summary", "complaints", "refunds",
+                "settlements", "notifications")),
+)
+
+
+def _evict_prefixes_for(path: str) -> tuple[str, ...] | None:
+    """Return the cache prefixes a write to ``path`` can stale, or None when
+    the path has no audited mapping (caller falls back to a full clear)."""
+    for needle, prefixes in _WRITE_EVICT_MAP:
+        if needle in path:
+            return prefixes
+    return None
 
 
 app.add_middleware(BaseHTTPMiddleware, dispatch=cache_invalidation_middleware)
@@ -273,9 +435,9 @@ from app.middleware.error_handler import ErrorHandlingMiddleware, LoggingMiddlew
 
 # Add middleware (order matters — last added = first executed)
 app.add_middleware(SecurityHeadersMiddleware)
-app.add_middleware(ErrorHandlingMiddleware)
-app.add_middleware(LoggingMiddleware)
 app.add_middleware(BaseHTTPMiddleware, dispatch=rate_limit_middleware)
+app.add_middleware(LoggingMiddleware)
+app.add_middleware(ErrorHandlingMiddleware)
 
 app.include_router(
     local.router,

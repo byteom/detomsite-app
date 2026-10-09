@@ -4,6 +4,7 @@ import api from '../../services/api'
 import { saveLocalSession } from '../../utils/session'
 import { syncProfileToSupabase } from '../../services/supabase'
 import { PasswordInput } from '../../components/PasswordInput'
+import { getErrorMessage } from '../../utils/helpers'
 
 export function UserLogin() {
   const navigate = useNavigate()
@@ -48,8 +49,8 @@ export function UserLogin() {
       }
 
       navigate('/customer-dashboard')
-    } catch (err: any) {
-      setError(err?.response?.data?.detail || 'Login failed')
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Request failed'))
     } finally {
       setLoading(false)
     }

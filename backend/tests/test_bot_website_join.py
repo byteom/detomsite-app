@@ -392,9 +392,9 @@ async def test_payment_status_endpoint_is_owner_only(client):
 
 
 async def test_saving_a_reference_is_reflected_in_the_payment_portal(client):
-    """The student's "add the reference" step is what makes the bot's tier-1
-    match possible — the portal must immediately show it as on file, and must
-    never hand the reference itself back to the browser."""
+    """CUT OFF — the UTR-only endpoint answers 410; the portal's proof status
+    is what now reflects a saved proof, and it must never hand the reference
+    itself back to the browser."""
     shop = _shop("9000000021")
     order = _uporder(shop, 64)
     db.create_payment(order["id"], 64, "Manual UTR", "")
@@ -404,23 +404,24 @@ async def test_saving_a_reference_is_reflected_in_the_payment_portal(client):
 
     before = (await client.get(f"/api/v1/local/orders/{order['id']}/payment", headers=headers)).json()
     assert before["utr_saved"] is False
+    assert before["proof_status"] == "PENDING_PAYMENT"
 
     saved = await client.post("/api/v1/local/payments/utr", headers=headers,
                               json={"order_id": order["id"], "utr_number": "998877665544"})
-    assert saved.status_code == 200, saved.text
+    assert saved.status_code == 410, saved.text
 
     after = (await client.get(f"/api/v1/local/orders/{order['id']}/payment", headers=headers)).json()
-    assert after["utr_saved"] is True
+    assert after["utr_saved"] is False
     assert "998877665544" not in str(after)
 
-    # A saved reference must NOT by itself settle the order — only bank evidence
-    # can do that. The order is still awaiting payment.
+    # Nothing settled the order — it is still awaiting payment.
     assert after["payment_status"] != "Success"
     assert db.get_order(order["id"])["status"] == "Pending Payment"
 
 
 async def test_agent_key_still_gates_the_match_route(client, monkeypatch):
-    """Adding tier 2 must not weaken the agent gate on the HTTP route."""
+    """CUT OFF — the agent gate still runs first (401s preserved); a valid key
+    now gets the explicit 410 instead of a matching attempt."""
     from app.api.v1 import local as local_mod
 
     monkeypatch.setattr(local_mod.settings, "SMS_FORWARD_KEY", "sekret")
@@ -433,9 +434,7 @@ async def test_agent_key_still_gates_the_match_route(client, monkeypatch):
     assert wrong.status_code == 401
 
     good = await client.post("/api/v1/local/sms/match", json=body, headers={"X-Agent-Key": "sekret"})
-    # The key is accepted; the failure is now a *matching* failure (unknown
-    # shop), not an auth failure.
-    assert good.status_code == 404, good.text
+    assert good.status_code == 410, good.text
 
 
 async def test_private_api_responses_are_not_cacheable(client):

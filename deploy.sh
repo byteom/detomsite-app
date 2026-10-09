@@ -195,6 +195,12 @@ MIG_DIR="supabase/migrations"
 mkdir -p "$MIG_DIR"
 MIG_FILE="$MIG_DIR/$(date +%s)_seed.sql"
 cp backend/supabase/schema.sql "$MIG_FILE"
+# Apply reviewed non-payment performance migrations in the same initial
+# database migration. Each statement is idempotent, so re-deploys remain safe.
+for performance_migration in backend/supabase/migrations/*.sql; do
+  [[ -f "$performance_migration" ]] || continue
+  cat "$performance_migration" >> "$MIG_FILE"
+done
 if supabase link --project-ref "$PROJECT_REF" --password "$DB_PASSWORD" >/dev/null 2>&1; then
   supabase db push --project-ref "$PROJECT_REF" >/dev/null 2>&1 \
     || { rm -f "$MIG_FILE"; fail "Could not load tables. Run manually: supabase db push --project-ref $PROJECT_REF"; }

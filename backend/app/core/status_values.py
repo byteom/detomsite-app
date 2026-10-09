@@ -45,6 +45,27 @@ VendorOrderStatus = Literal[
 # payments.status — written by checkout, the cancel flow and admin verification.
 PaymentStatus = Literal["Pending", "Success", "Failed", "Cancelled", "Rejected"]
 
+# Manual UPI payment-proof lifecycle (stored in payments.proof_status and
+# parent_orders.payment_proof_status). The legacy payments.status column is
+# kept in sync by save/verify_payment_proof so older readers keep working:
+#   PENDING_PAYMENT         -> "Pending"
+#   PAYMENT_PROOF_SUBMITTED -> "Pending Verification"
+#   PAYMENT_APPROVED        -> "Success"
+#   PAYMENT_REJECTED        -> "Rejected"
+PaymentProofStatus = Literal[
+    "PENDING_PAYMENT",
+    "PAYMENT_PROOF_SUBMITTED",
+    "PAYMENT_APPROVED",
+    "PAYMENT_REJECTED",
+]
+
+PROOF_STATUS_TO_LEGACY: dict[str, str] = {
+    "PENDING_PAYMENT": "Pending",
+    "PAYMENT_PROOF_SUBMITTED": "Pending Verification",
+    "PAYMENT_APPROVED": "Success",
+    "PAYMENT_REJECTED": "Rejected",
+}
+
 # share_payments.status — the vendor's ₹10-per-order ledger.
 SharePaymentStatus = Literal["Pending", "Completed", "Rejected"]
 

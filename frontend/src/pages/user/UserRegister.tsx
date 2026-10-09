@@ -4,6 +4,7 @@ import api from '../../services/api'
 import { syncProfileToSupabase } from '../../services/supabase'
 import { PhoneInput, isValidMobile } from '../../components/PhoneInput'
 import { PasswordInput } from '../../components/PasswordInput'
+import { getErrorMessage } from '../../utils/helpers'
 
 export function UserRegister() {
   const navigate = useNavigate()
@@ -64,8 +65,8 @@ export function UserRegister() {
 
       // Redirect to user login page on success
       navigate('/user/login?registered=true')
-    } catch (err: any) {
-      setError(err?.response?.data?.detail || 'Registration failed. Try a different username.')
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Request failed'))
     } finally {
       setLoading(false)
     }

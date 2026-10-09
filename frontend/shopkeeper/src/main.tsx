@@ -2,6 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
 import ErrorBoundary from './components/ErrorBoundary'
+import { ThemeProvider } from './context/ThemeContext'
 import './index.css'
 
 /* A deploy replaces the hashed JS chunk names, so a tab that was open across a
@@ -35,7 +36,9 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
     {/* Nothing rendered above this can blank the page: any render throw lands on
         a readable recovery screen with Try again / Reload instead. */}
     <ErrorBoundary app="Shopkeeper Portal">
-      <App />
+      <ThemeProvider>
+        <App />
+      </ThemeProvider>
     </ErrorBoundary>
   </React.StrictMode>,
 )

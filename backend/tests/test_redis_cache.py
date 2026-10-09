@@ -667,12 +667,19 @@ async def test_orders_endpoint_skips_the_database_after_the_first_poll(
 
     queries = []
     real_list_orders = db.list_orders
+    real_list_by_user = getattr(db, "list_orders_by_user_id", real_list_orders)
 
     def counting_list_orders(*args, **kwargs):
         queries.append(1)
         return real_list_orders(*args, **kwargs)
 
+    def counting_list_by_user(*args, **kwargs):
+        queries.append(1)
+        return real_list_by_user(*args, **kwargs)
+
     monkeypatch.setattr(db, "list_orders", counting_list_orders)
+    if hasattr(db, "list_orders_by_user_id"):
+        monkeypatch.setattr(db, "list_orders_by_user_id", counting_list_by_user)
 
     first = await client.get("/api/v1/local/orders", headers=headers)
     assert first.status_code == 200

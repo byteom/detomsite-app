@@ -10,7 +10,8 @@ import {
   shopStatusText,
 } from '../types/localApi'
 import { getLocalSession } from '../utils/session'
-import { addProductToCart } from '../utils/cart'
+import { addProductToCart, cartShopConflict, replaceCartWithProduct } from '../utils/cart'
+import { ConfirmDialog } from '../components/ConfirmDialog'
 import { getShopImage } from '../utils/shopImages'
 
 /* Combo items are free text (one per line, commas also work) — split them for
@@ -38,6 +39,8 @@ export function Home() {
   const [batch, setBatch] = useState<BatchInfo | null>(null)
   const [search, setSearch] = useState('')
   const [activeCategory, setActiveCategory] = useState<string | null>(null)
+  // Cross-shop add awaiting user confirm (one kitchen per cart).
+  const [pendingReplace, setPendingReplace] = useState<{ product: LocalProduct; shop: LocalShop } | null>(null)
 
   // --- Category definitions for Combos & Deals ---
   const CATEGORY_GROUPS = useMemo(() => [
@@ -47,25 +50,49 @@ export function Home() {
   ], [])
 
   useEffect(() => {
-    apiCached.get<LocalShop[]>('/local/shops', { public_only: true }, 10000)
-      .then(setShops).catch(() => setShops([]))
-    apiCached.get<LocalProduct[]>('/local/products', undefined, 10000).then(setProducts).catch(() => setProducts([]))
-    apiCached.get<LocalAnnouncement[]>('/local/announcements', undefined, 10000).then(setAnnouncements).catch(() => setAnnouncements([]))
-    apiCached.get<LocalStudentNotice>('/local/student-notice', undefined, 30000).then(setNotice).catch(() => setNotice(null))
-    apiCached.get<BatchInfo>('/local/batch', undefined, 10000).then(setBatch).catch(() => setBatch(null))
+    // One aggregated request (shops + products + announcements + notice +
+    // batch) instead of 5 parallel ones — 1 pool checkout, 1 cache entry, and
+    // no per-endpoint cold-start stacking. Falls back to the old fan-out only
+    // if the aggregated route is unavailable (old backend during rollout).
+    apiCached.get<{
+      shops: LocalShop[]; products: LocalProduct[];
+      announcements: LocalAnnouncement[]; notice: LocalStudentNotice | null;
+      batch: BatchInfo | null;
+    }>('/local/home-feed', undefined, 30000).then(feed => {
+      setShops(feed.shops || []); setProducts(feed.products || [])
+      setAnnouncements(feed.announcements || [])
+      setNotice(feed.notice || null); setBatch(feed.batch || null)
+    }).catch(() => {
+      apiCached.get<LocalShop[]>('/local/shops', { public_only: true }, 10000)
+        .then(setShops).catch(() => setShops([]))
+      apiCached.get<LocalProduct[]>('/local/products', undefined, 10000).then(setProducts).catch(() => setProducts([]))
+      apiCached.get<LocalAnnouncement[]>('/local/announcements', undefined, 10000).then(setAnnouncements).catch(() => setAnnouncements([]))
+      apiCached.get<LocalStudentNotice>('/local/student-notice', undefined, 30000).then(setNotice).catch(() => setNotice(null))
+      apiCached.get<BatchInfo>('/local/batch', undefined, 10000).then(setBatch).catch(() => setBatch(null))
+    })
   }, [])
 
   const query = search.trim().toLowerCase()
+
+  const productsByShop = useMemo(() => {
+    const grouped = new Map<string, LocalProduct[]>()
+    for (const product of products) {
+      const current = grouped.get(product.shop_id)
+      if (current) current.push(product)
+      else grouped.set(product.shop_id, [product])
+    }
+    return grouped
+  }, [products])
 
   // Closed shops stay invisible to students everywhere
   const filteredShops = useMemo(() => shops.filter(s => canOrderFromShop(s)).filter(s => {
     if (!query) return true
     const shopMatch = `${s.name} ${s.category} ${s.description}`.toLowerCase().includes(query)
-    const hasFoodMatch = products.some(p => p.shop_id === s.id && p.name.toLowerCase().includes(query))
+    const hasFoodMatch = (productsByShop.get(s.id) || []).some(p => p.name.toLowerCase().includes(query))
     return shopMatch || hasFoodMatch
-  }), [shops, products, query])
+  }), [shops, productsByShop, query])
 
-  const openShops = shops.filter(s => canOrderFromShop(s))
+  const openShops = useMemo(() => shops.filter(s => canOrderFromShop(s)), [shops])
   const openShopIds = useMemo(() => new Set(openShops.map(s => s.id)), [openShops])
   const featured = openShops.slice(0, 4)
 
@@ -99,7 +126,10 @@ export function Home() {
   const categoryProducts = activeCategory ? categoryFoods[activeCategory] || [] : []
 
   const handleAdd = (product: LocalProduct, shop: LocalShop) => {
-    addProductToCart(product, shop)
+    if (addProductToCart(product, shop) === 'confirm-required') {
+      // One kitchen per cart: ask before swapping kitchens.
+      setPendingReplace({ product, shop })
+    }
   }
 
   const clearCategoryFilter = () => setActiveCategory(null)
@@ -201,7 +231,7 @@ export function Home() {
             {featured.map(shop => (
               <Link key={shop.id} to={`/shop/${shop.id}`}
                 className="group overflow-hidden rounded-[24px] border border-primary-light/30 bg-white shadow-[0_10px_35px_rgba(15,118,110,0.08)] transition-all hover:-translate-y-1 hover:shadow-[0_16px_45px_rgba(15,118,110,0.16)]">
-                <img src={shop.shop_image || getShopImage(shop.category)} alt={`${shop.name} food`} className="h-28 w-full object-cover" onError={event => { event.currentTarget.src = getShopImage() }} />
+                <img loading="lazy" decoding="async" src={shop.shop_image || getShopImage(shop.category)} alt={`${shop.name} food`} className="h-28 w-full object-cover" onError={event => { event.currentTarget.src = getShopImage() }} />
                 <div className="p-4">
                   <div className="flex items-start justify-between gap-2">
                     <div><h3 className="font-bold text-primary-dark">{shop.name}</h3><p className="text-sm font-medium text-slate-500">{shop.category}</p></div>
@@ -359,7 +389,7 @@ export function Home() {
             {filteredShops.map(shop => (
               <Link key={shop.id} to={`/shop/${shop.id}`}
                 className="group overflow-hidden rounded-[24px] border border-primary-light/30 bg-white shadow-[0_10px_35px_rgba(15,118,110,0.08)] transition-all hover:-translate-y-1 hover:shadow-[0_16px_45px_rgba(15,118,110,0.16)]">
-                <img src={shop.shop_image || getShopImage(shop.category)} alt={`${shop.name} food`} className="h-28 w-full object-cover" onError={event => { event.currentTarget.src = getShopImage() }} />
+                <img loading="lazy" decoding="async" src={shop.shop_image || getShopImage(shop.category)} alt={`${shop.name} food`} className="h-28 w-full object-cover" onError={event => { event.currentTarget.src = getShopImage() }} />
                 <div className="p-4">
                   <div className="flex items-start justify-between gap-2">
                     <div><h3 className="font-bold text-primary-dark">{shop.name}</h3><p className="text-sm font-medium text-slate-500">{shop.category}</p></div>
@@ -383,6 +413,26 @@ export function Home() {
           <Link to="/vendor/register" className="mt-3 inline-block rounded-btn bg-gold px-5 py-2.5 text-sm font-bold text-white transition-all hover:bg-gold">Register your shop -&gt;</Link>
         </div>
       </div>
+
+      {/* One kitchen per cart: confirm before swapping kitchens. */}
+      <ConfirmDialog
+        open={pendingReplace !== null}
+        title="Replace cart?"
+        message={
+          pendingReplace ? (
+            <span>
+              Your cart has items from <b>{cartShopConflict(pendingReplace.shop.id).currentShopName}</b>.
+              Adding from <b>{pendingReplace.shop.name}</b> will clear those items first.
+            </span>
+          ) : null
+        }
+        confirmLabel="Replace cart"
+        onConfirm={() => {
+          if (pendingReplace) replaceCartWithProduct(pendingReplace.product, pendingReplace.shop)
+          setPendingReplace(null)
+        }}
+        onCancel={() => setPendingReplace(null)}
+      />
     </div>
   )
 }

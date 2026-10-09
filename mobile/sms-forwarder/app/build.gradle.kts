@@ -39,4 +39,9 @@ dependencies {
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // Guaranteed SMS-proof delivery: SmsReceiver enqueues this when the
+    // goAsync window (<10s per Android BroadcastReceiver docs) is too short
+    // for a cold serverless backend. WorkManager persists across Doze/reboot
+    // and retries with exponential backoff + CONNECTED constraint.
+    implementation("androidx.work:work-runtime-ktx:2.9.0")
 }

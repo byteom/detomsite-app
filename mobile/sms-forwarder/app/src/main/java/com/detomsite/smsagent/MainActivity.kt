@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.view.View
 import android.widget.Toast
@@ -137,6 +138,21 @@ class MainActivity : AppCompatActivity() {
         ))
         binding.btnGrantSms.text = if (has) "Re-grant SMS permission" else "Grant SMS permission"
 
+        // Battery exemption (Doze/OEM killers suspend the SMS receiver +
+        // WorkManager retries without it). Per PowerManager docs:
+        // isIgnoringBatteryOptimizations() + ACTION_REQUEST_IGNORE_BATTERY_
+        // OPTIMIZATIONS intent puts the app on the power allowlist.
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            val exempt = pm.isIgnoringBatteryOptimizations(packageName)
+            if (!exempt) {
+                binding.tvPermStatus.append("\n⚠ Battery optimization ON — tap to exempt or proofs may be lost in Doze.")
+                binding.tvPermStatus.setOnClickListener { requestBatteryExemption() }
+            } else {
+                binding.tvPermStatus.setOnClickListener(null)
+            }
+        } catch (e: Exception) { /* best-effort UI only */ }
+
         // WhatsApp bot section.
         val enabled = binding.swWABot.isChecked
         val accOn = isAccessibilityEnabled()
@@ -168,6 +184,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun requestBatteryExemption() {
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (pm.isIgnoringBatteryOptimizations(packageName)) {
+                Toast.makeText(this, "Already exempt from battery optimization ✓", Toast.LENGTH_SHORT).show()
+                return
+            }
+            startActivity(
+                Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:$packageName"),
+                )
+            )
+        } catch (e: Exception) {
+            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        }
+    }
+
     private fun save() {
         // Store the NORMALISED url, not what was typed. Otherwise a user who
         // typed "detomsite-backend.vercel.app" (no scheme) saves a value that
@@ -179,13 +213,20 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Backend URL and Agent Key are required.", Toast.LENGTH_LONG).show()
             return
         }
+        // Validate with the SAME normalizer the receiver uses — a value that
+        // passes here posts identically at SMS time (no test-pass/real-fail drift).
+        val phone = SmsReceiver.normalizeIndianMobile(binding.etPhone.text.toString())
+        if (phone.isEmpty()) {
+            Toast.makeText(this, "Enter a valid 10-digit mobile number (starts 6-9).", Toast.LENGTH_LONG).show()
+            return
+        }
         // Show the exact value being stored, so a normalised URL is visible
         // rather than silently different from what was typed.
         binding.etBaseUrl.setText(url)
         prefs.edit()
             .putString("base_url", url)
             .putString("agent_key", key)
-            .putString("phone", binding.etPhone.text.toString().trim())
+            .putString("phone", phone)
             .putBoolean("enabled", binding.swEnabled.isChecked)
             .putBoolean("wa_bot_enabled", binding.swWABot.isChecked)
             .apply()
@@ -224,9 +265,10 @@ class MainActivity : AppCompatActivity() {
     private fun testConnection() {
         val url = normalizeBackendUrl(binding.etBaseUrl.text.toString())
         val key = binding.etAgentKey.text.toString().trim()
-        val phone = binding.etPhone.text.toString().trim()
+        // Same normalizer as the receiver: the tested value is the posted value.
+        val phone = SmsReceiver.normalizeIndianMobile(binding.etPhone.text.toString())
         if (url.isEmpty() || key.isEmpty() || phone.isEmpty()) {
-            showTestResult("Fill in Backend URL, Agent Key and Phone first.", false)
+            showTestResult("Fill in Backend URL, Agent Key and a valid 10-digit Phone first.", false)
             return
         }
         binding.btnTest.isEnabled = false
@@ -255,8 +297,10 @@ class MainActivity : AppCompatActivity() {
                     .header("X-Agent-Key", key)
                     .build()
                 val client = OkHttpClient.Builder()
+                    // Foreground user action (no goAsync budget): allow a cold
+                    // serverless start (7-14s) to answer before calling it offline.
                     .connectTimeout(10, TimeUnit.SECONDS)
-                    .readTimeout(10, TimeUnit.SECONDS)
+                    .readTimeout(20, TimeUnit.SECONDS)
                     .build()
                 client.newCall(request).execute().use { resp ->
                     val body = resp.body?.string().orEmpty()

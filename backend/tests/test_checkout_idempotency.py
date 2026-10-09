@@ -217,12 +217,21 @@ async def test_two_different_customers_are_still_refused(client, monkeypatch):
 
 # ─── 3. The student is never permanently locked out ───
 @pytest.mark.anyio
-async def test_student_can_submit_a_utr_to_unblock_themselves(client):
-    """A missing bank SMS is no longer a dead end.
+async def test_student_can_submit_a_utr_to_unblock_themselves(client, monkeypatch):
+    """CUT OFF — the old claim-confirm path answers 410. The replacement that
+    unblocks a student with no working SMS agent is the manual proof flow:
+    submit UTR + screenshot, which queues the order for admin verification
+    instead of depending on any bank message."""
+    from app.services import cloudinary_service
 
-    Without this, a student whose shop has no working SMS agent could pay and
-    still never unlock the button, with nothing to try.
-    """
+    monkeypatch.setattr(cloudinary_service, "is_configured", lambda: True)
+    monkeypatch.setattr(
+        cloudinary_service, "upload_image",
+        lambda data, *, folder, public_id: {
+            "secure_url": f"https://res.cloudinary.test/{folder}/{public_id}.png",
+            "public_id": f"{folder}/{public_id}", "format": "png", "bytes": len(data),
+        },
+    )
     token = await _student(client, "utr")
     headers = _headers(token)
     shop, product = _approved_shop_with_product(f"{_u('utr_v')}@example.com", "Utr Vendor")
@@ -230,16 +239,27 @@ async def test_student_can_submit_a_utr_to_unblock_themselves(client):
     order_id = created.json()["id"]
     db.create_payment(order_id, 100, "Manual UTR", "")
 
-    res = await client.post(
+    gone = await client.post(
         f"/api/v1/local/orders/{order_id}/confirm-payment",
         json={"utr_number": "412233445500"},
         headers=headers,
     )
-    assert res.status_code == 200, res.text
-    assert res.json()["utr_saved"] is True
+    assert gone.status_code == 410, gone.text
 
-    # A UTR on file, so the bank credit can now settle it EXACTLY (tier 1)
-    # rather than relying on an amount-only guess.
+    import io
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8), (0, 128, 0)).save(buf, format="PNG")
+    res = await client.post(
+        "/api/v1/local/payments/proof",
+        data={"order_id": order_id, "utr_number": "412233445500"},
+        files={"screenshot": ("proof.png", buf.getvalue(), "image/png")},
+        headers=headers,
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["proof_status"] == "PAYMENT_PROOF_SUBMITTED"
+
+    # Proof on file, order still awaits the admin (never auto-settled).
     assert db.get_payment_by_order_id(order_id)["utr_number"] == "412233445500"
 
 
@@ -319,7 +339,9 @@ async def test_cod_order_opens_a_settled_payment_row(client):
 
 @pytest.mark.anyio
 async def test_utr_confirmation_cannot_touch_someone_elses_order(client):
-    """Ownership is enforced on the manual path too."""
+    """CUT OFF — the claim-confirm path answers 410 for any authenticated
+    caller (auth still runs first, so anonymous callers get 401). Ownership of
+    the replacement proof flow is pinned in test_payment_pentest.py."""
     token_a = await _student(client, "victim", "Victim")
     token_b = await _student(client, "attacker", "Attacker")
     shop, product = _approved_shop_with_product(f"{_u('vic_v')}@example.com", "Vic Vendor")
@@ -331,12 +353,13 @@ async def test_utr_confirmation_cannot_touch_someone_elses_order(client):
         json={"utr_number": "412233445511"},
         headers=_headers(token_b),
     )
-    assert res.status_code in (403, 404), res.text
+    assert res.status_code == 410, res.text
 
 
 @pytest.mark.anyio
 async def test_utr_confirmation_rejects_junk(client):
-    """Junk never reaches the database."""
+    """CUT OFF — junk to the claim-confirm path gets the same explicit 410
+    (payload shape is still validated first: an oversized UTR is 422)."""
     token = await _student(client, "junk")
     headers = _headers(token)
     shop, product = _approved_shop_with_product(f"{_u('junk_v')}@example.com", "Junk Vendor")
@@ -347,7 +370,7 @@ async def test_utr_confirmation_rejects_junk(client):
         json={"utr_number": "'; DROP TABLE orders; --"},
         headers=headers,
     )
-    assert res.status_code == 422, res.text
+    assert res.status_code == 410, res.text
 
 
 @pytest.mark.anyio
