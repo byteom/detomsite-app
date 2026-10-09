@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     # Frontend / Supabase
     VITE_SUPABASE_URL: Optional[str] = None
     VITE_SUPABASE_ANON_KEY: Optional[str] = None
+    SUPABASE_URL: Optional[str] = None
+    SUPABASE_ANON_KEY: Optional[str] = None
+    SUPABASE_SERVICE_ROLE_KEY: Optional[str] = None
     
     # Server
     HOST: str = "0.0.0.0"

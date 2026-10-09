@@ -1,10 +1,5 @@
 from __future__ import annotations
 
-import sqlite3
-from pathlib import Path
-from typing import Any
-
-from app.core.config import settings
 from app.core.local_db.analytics import (
     get_admin_dashboard_stats,
     get_daily_stats,
@@ -20,7 +15,9 @@ from app.core.local_db.connection import (
     _NamedRowConnection,
     _NamedRowCursor,
     _column_exists,
+    _connect,
     _day_key,
+    _db_path,
     _insert_with_suffixed_id,
     _next_suffixed_id,
     _rows_to_dicts,
@@ -178,21 +175,3 @@ from app.core.local_db.users import (
     update_user_password,
     update_user_profile,
 )
-
-
-def _db_path(base_file: Path | str | None = None) -> Path:
-    path = Path(settings.LOCAL_DB_PATH)
-    if not path.is_absolute():
-        origin = Path(base_file) if base_file else Path(__file__)
-        path = (origin.resolve().parents[2] / path).resolve()
-    return path
-
-
-def _connect(base_file: Path | str | None = None) -> Any:
-    """Test-only SQLite connection (pytest). Production uses Supabase."""
-    connection = sqlite3.connect(_db_path(base_file), timeout=10)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=NORMAL")
-    connection.execute("PRAGMA busy_timeout=8000")
-    return connection

@@ -349,13 +349,7 @@ async def cache_invalidation_middleware(request: Request, call_next):
         if any(path.endswith(p) for p in _NOOP_WRITE_PATHS):
             return response
 
-        # Scoped eviction: only evict the cache key prefixes that the write target stales.
-        # This keeps the read cache warm across unrelated writes (orders, products, shops).
-        prefixes = _evict_prefixes_for(path)
-        if prefixes is not None:
-            read_cache.clear_matching(*prefixes)
-        else:
-            read_cache.clear_bg()
+        await read_cache.clear()
     return response
 
 

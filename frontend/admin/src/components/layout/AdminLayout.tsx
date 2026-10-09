@@ -31,20 +31,21 @@ export function AdminLayout({ children }: AdminLayoutProps) {
     })
   }
 
-  // Poll for pending notifications to keep badge in sync
+  // Poll for pending orders needing confirmation to keep sidebar badge in sync
   const checkPending = () => {
     if (document.visibilityState !== 'visible') return
-    dedupeGet('/admin/notifications')
+    dedupeGet('/admin/orders')
       .then((r: any) => {
-        const list = r.data || []
-        const count = list.filter(
-          (n: any) => n?.action === 'confirm_order' && n?.action_state === 'pending' && n?.order_id
-        ).length
+        const list = Array.isArray(r.data) ? r.data : []
+        const count = list.filter((o: any) => {
+          const s = String(o?.status || '').toLowerCase().trim()
+          return s === 'pending payment' || s === 'pending acceptance' || s === 'placed' || s === 'pending'
+        }).length
         setPendingApprovalsCount(count)
       })
       .catch(() => {})
   }
-  usePolling(checkPending, 20000, [])
+  usePolling(checkPending, 15000, [])
 
   const executeLogout = () => {
     localStorage.removeItem('admin_token')
@@ -91,7 +92,7 @@ export function AdminLayout({ children }: AdminLayoutProps) {
           onLogout={() => setShowLogoutConfirm(true)}
         />
 
-        <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto animate-fade-in text-[var(--text-body)]">
+        <main className="flex-1 p-3 sm:p-5 lg:p-6 w-full text-[var(--text-body)]">
           {children}
         </main>
       </div>

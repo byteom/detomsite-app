@@ -232,6 +232,14 @@ export function OrdersPage() {
                   <p className="text-xs text-slate-400">
                     📍 {o.delivery_location} · {o.delivery_slot} Slot
                   </p>
+
+                  {o.payment_method !== 'COD' &&
+                    ['Pending Payment', 'Pending Acceptance'].includes(o.status) && (
+                      <p className="text-[11px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 rounded-btn px-2.5 py-1.5">
+                        Awaiting UTR + screenshot — your order joins the kitchen queue
+                        only after proof is submitted and verified.
+                      </p>
+                    )}
                 </div>
 
                 {/* Footer with Actions */}
@@ -240,16 +248,18 @@ export function OrdersPage() {
                     Total: <span className="text-emerald-700">₹{o.total}</span>
                   </div>
 
-                  <div className="flex items-center gap-2">
-                    {/* Pay button for unpaid UPI */}
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {/* Pay / proof button for unpaid UPI — kitchen queue starts
+                        only after UTR + screenshot are submitted */}
                     {o.payment_method !== 'COD' &&
                       ['Pending Payment', 'Pending Acceptance'].includes(o.status) && (
                         <Link
                           to={`/pay/${o.id}`}
                           className="inline-flex items-center gap-1.5 rounded-btn bg-emerald-700 px-3.5 py-2 text-xs font-bold text-white shadow-sm hover:bg-emerald-800 transition-colors"
+                          title="Submit your UTR + payment screenshot — the kitchen starts only after proof is verified"
                         >
                           <CreditCard className="h-3.5 w-3.5" />
-                          <span>Pay ₹{o.total}</span>
+                          <span>Pay ₹{o.total} · Submit Proof</span>
                         </Link>
                       )}
 

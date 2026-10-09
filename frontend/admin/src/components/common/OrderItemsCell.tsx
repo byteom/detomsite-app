@@ -8,7 +8,7 @@ export function OrderItemsCell({ items }: { items?: string }) {
     .filter(Boolean)
 
   return (
-    <div className="group relative max-w-[280px]">
+    <div className="group relative max-w-[180px] lg:max-w-[240px] 2xl:max-w-[320px]">
       <p className="truncate text-[var(--text-body)] font-medium" title={text}>
         {text}
       </p>

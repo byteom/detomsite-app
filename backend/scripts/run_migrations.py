@@ -23,6 +23,7 @@ def run_supabase_migrations():
     try:
         from app.core import supabase_db
         conn = supabase_db._connect()
+        conn.autocommit = True
         with supabase_db._DBContext(conn) as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SELECT current_database(), current_user, version();")
@@ -36,18 +37,14 @@ def run_supabase_migrations():
                 print("\n[*] Executing schema migration batch...")
                 applied_count = 0
                 for idx, stmt in enumerate(supabase_db._MIGRATIONS, 1):
-                    cursor.execute("SAVEPOINT mig_step")
                     try:
                         cursor.execute(stmt)
-                        cursor.execute("RELEASE SAVEPOINT mig_step")
                         applied_count += 1
                         summary = stmt.strip().split("\n")[0][:70]
                         print(f"  [{idx:02d}/{len(supabase_db._MIGRATIONS):02d}] APPLIED/VERIFIED: {summary}")
                     except Exception as e:
-                        cursor.execute("ROLLBACK TO SAVEPOINT mig_step")
                         print(f"  [{idx:02d}/{len(supabase_db._MIGRATIONS):02d}] SKIPPED: {e}")
                 
-                connection.commit()
                 print(f"\n[+] Successfully verified and committed {applied_count} migrations.")
 
                 # Verify public.users columns

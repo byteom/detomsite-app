@@ -29,6 +29,7 @@ interface DataTableProps<T> {
   stickyHeader?: boolean
   rowClassName?: (item: T, index: number) => string
   onRowClick?: (item: T, index: number) => void
+  dense?: boolean
 }
 
 export function DataTable<T extends Record<string, any>>({
@@ -48,6 +49,7 @@ export function DataTable<T extends Record<string, any>>({
   stickyHeader = true,
   rowClassName,
   onRowClick,
+  dense = false,
 }: DataTableProps<T>) {
   const [search, setSearch] = useState('')
   const [sortKey, setSortKey] = useState<string | null>(null)
@@ -161,8 +163,8 @@ export function DataTable<T extends Record<string, any>>({
         </div>
       )}
 
-      {/* Table Container - smooth touch scrolling without ugly mobile scrollbar */}
-      <div className="overflow-x-auto no-scrollbar w-full">
+      {/* Table Container */}
+      <div className="overflow-x-auto w-full">
         <table className="w-full text-left text-xs border-collapse">
           <thead
             className={`${
@@ -184,7 +186,9 @@ export function DataTable<T extends Record<string, any>>({
                     key={col.key}
                     onClick={() => handleSort(col.key, col.sortable)}
                     style={{ width: col.width }}
-                    className={`px-4 py-3 select-none ${alignClass} ${
+                    className={`${
+                      dense ? 'px-2.5 sm:px-3 py-2' : 'px-3 py-2.5 sm:px-3.5 sm:py-3'
+                    } select-none whitespace-nowrap ${alignClass} ${
                       col.sortable ? 'cursor-pointer hover:text-[var(--text-heading)]' : ''
                     } ${col.className || ''}`}
                   >
@@ -220,7 +224,10 @@ export function DataTable<T extends Record<string, any>>({
               Array.from({ length: 5 }).map((_, rIdx) => (
                 <tr key={rIdx} className="animate-pulse">
                   {columns.map((c, cIdx) => (
-                    <td key={cIdx} className="px-4 py-3.5">
+                    <td
+                      key={cIdx}
+                      className={dense ? 'px-2.5 sm:px-3 py-2' : 'px-3 py-2.5 sm:px-3.5 sm:py-3'}
+                    >
                       <div className="h-3.5 bg-[var(--bg-surface-hover)] w-3/4" />
                     </td>
                   ))}
@@ -270,7 +277,9 @@ export function DataTable<T extends Record<string, any>>({
                       return (
                         <td
                           key={col.key}
-                          className={`px-4 py-3 align-middle ${alignClass} ${col.className || ''}`}
+                          className={`${
+                            dense ? 'px-2.5 sm:px-3 py-2' : 'px-3 py-2.5 sm:px-3.5 sm:py-2.5'
+                          } align-middle ${alignClass} ${col.className || ''}`}
                         >
                           {col.render ? col.render(item, index) : item[col.key] ?? '—'}
                         </td>

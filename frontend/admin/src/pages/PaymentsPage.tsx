@@ -255,7 +255,8 @@ export function PaymentsPage() {
       sortable: true,
       render: (q: any) => (
         <a
-          href={`/orders/${q.order_id}`}
+          href="/orders"
+          title="Open Orders desk — click the order to verify & confirm or reject"
           className="font-mono font-black text-xs text-emerald-700 dark:text-emerald-400 hover:underline"
         >
           #{q.order_token || q.order_id}
@@ -315,11 +316,12 @@ export function PaymentsPage() {
     },
     {
       key: 'actions',
-      header: 'Verify',
+      header: 'Order',
       align: 'right',
       render: (q: any) => (
         <a
-          href={`/orders/${q.order_id}`}
+          href="/orders"
+          title="Open Orders desk — click the order to verify & confirm or reject"
           className="inline-flex items-center gap-1 bg-emerald-700 dark:bg-emerald-600 text-white px-2.5 py-1 text-[11px] font-bold hover:bg-emerald-800"
         >
           Open <ExternalLink className="w-3 h-3" />

@@ -16,9 +16,10 @@ import { apiError, fmtTime, fmtCurrency } from '../utils/formatters'
 import { Button } from '../components/ui/Button'
 import { Badge } from '../components/ui/Badge'
 
-/* Admin payment-verification page. Opened directly from the Telegram
- * "VIEW ORDER" button — the admin must still be logged in (RequireAuth
- * redirects to /login otherwise); authentication is never bypassed. */
+/* DEPRECATED — verification now lives in the OrdersPage detail modal
+ * (Verify & Confirm / Reject with resubmit-or-cancel). This file is kept for
+ * reference only and is no longer routed (`/orders/:orderId` redirects to
+ * `/orders`). Do not link to it from new UI. */
 export function OrderVerifyPage() {
   const { orderId } = useParams<{ orderId: string }>()
   const [detail, setDetail] = useState<any | null>(null)
